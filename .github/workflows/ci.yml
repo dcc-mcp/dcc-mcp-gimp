@@ -52,8 +52,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          ./gimp.AppImage --appimage-extract-and-run --no-interface --no-data --no-splash > gimp.log 2>&1 &
+          ./gimp.AppImage --appimage-extract-and-run --no-interface --no-data --no-splash \
+            --batch-interpreter=python-fu-eval \
+            -b "(python-fu-dcc-mcp-gimp-bridge RUN-NONINTERACTIVE)" \
+            -b "from gi.repository import GLib; GLib.MainLoop().run()" \
+            > gimp.log 2>&1 &
           gimp_pid=$!
           trap 'kill "$gimp_pid" 2>/dev/null || true' EXIT
           python -m pip install -e ".[dev]"
           python tests/live_gimp_smoke.py
+      - name: Show GIMP log on failure
+        if: failure()
+        run: tail -200 gimp.log || true
