@@ -54,7 +54,6 @@ jobs:
           set -euo pipefail
           ./gimp.AppImage --appimage-extract-and-run --no-interface --no-data --no-splash \
             --batch-interpreter=python-fu-eval \
-            -b "(python-fu-dcc-mcp-gimp-bridge RUN-NONINTERACTIVE)" \
             -b "from gi.repository import GLib; GLib.MainLoop().run()" \
             > gimp.log 2>&1 &
           gimp_pid=$!
