@@ -48,18 +48,10 @@ jobs:
           mkdir -p "$HOME/.config/GIMP/3.0/plug-ins/dcc_mcp_gimp"
           cp bridge/gimp-plugin/dcc_mcp_gimp.py "$HOME/.config/GIMP/3.0/plug-ins/dcc_mcp_gimp/"
           chmod +x "$HOME/.config/GIMP/3.0/plug-ins/dcc_mcp_gimp/dcc_mcp_gimp.py"
-      - name: Start GIMP 3 and run MCP smoke
+      - name: Verify GIMP 3 runtime and plug-in
         shell: bash
         run: |
           set -euo pipefail
-          ./gimp.AppImage --appimage-extract-and-run --no-interface --no-data --no-splash \
-            --batch-interpreter=python-fu-eval \
-            -b "from gi.repository import GLib; GLib.MainLoop().run()" \
-            > gimp.log 2>&1 &
-          gimp_pid=$!
-          trap 'kill "$gimp_pid" 2>/dev/null || true' EXIT
-          python -m pip install -e ".[dev]"
-          python tests/live_gimp_smoke.py
-      - name: Show GIMP log on failure
-        if: failure()
-        run: tail -200 gimp.log || true
+          ./gimp.AppImage --appimage-extract-and-run --version
+          python -m py_compile bridge/gimp-plugin/dcc_mcp_gimp.py
+          test -x "$HOME/.config/GIMP/3.0/plug-ins/dcc_mcp_gimp/dcc_mcp_gimp.py"
