@@ -94,7 +94,7 @@ class DccMcpGimp(Gimp.PlugIn):
         return procedure
 
     @staticmethod
-    def _run(procedure, run_mode, image, drawables, config, plugin):
+    def _run(procedure, run_mode, config, plugin):
         server = _Server(("127.0.0.1", PORT), _Handler)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         procedure.persistent_ready()
