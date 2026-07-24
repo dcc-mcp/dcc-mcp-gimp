@@ -19,3 +19,39 @@ jobs:
       - run: python -m ruff check src tests tools
       - run: python tools/lint_skills.py
       - run: python -m build && python -m twine check dist/*
+
+  gimp3-smoke:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install GIMP runtime dependencies
+        run: sudo apt-get update && sudo apt-get install -y curl ca-certificates
+      - name: Download official GIMP 3 AppImage
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=3.0.8-1
+          base=https://download.gimp.org/gimp/v3.0/linux
+          curl -fsSL "$base/GIMP-${version}-x86_64.AppImage" -o gimp.AppImage
+          curl -fsSL "$base/SHA256SUMS" | grep "GIMP-${version}-x86_64.AppImage" > gimp.sha256
+          sha256sum -c gimp.sha256
+          chmod +x gimp.AppImage
+      - name: Install the GIMP plug-in
+        run: |
+          mkdir -p "$HOME/.config/GIMP/3.0/plug-ins/dcc-mcp-gimp"
+          cp bridge/gimp-plugin/dcc_mcp_gimp.py "$HOME/.config/GIMP/3.0/plug-ins/dcc-mcp-gimp/"
+          chmod +x "$HOME/.config/GIMP/3.0/plug-ins/dcc-mcp-gimp/dcc_mcp_gimp.py"
+      - name: Start GIMP 3 and run MCP smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./gimp.AppImage --appimage-extract-and-run --no-interface --no-data --no-splash > gimp.log 2>&1 &
+          gimp_pid=$!
+          trap 'kill "$gimp_pid" 2>/dev/null || true' EXIT
+          python -m pip install -e ".[dev]"
+          python tests/live_gimp_smoke.py
