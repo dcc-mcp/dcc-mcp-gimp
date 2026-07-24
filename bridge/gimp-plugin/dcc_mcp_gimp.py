@@ -99,6 +99,7 @@ class DccMcpGimp(Gimp.PlugIn):
         threading.Thread(target=server.serve_forever, daemon=True).start()
         procedure.persistent_ready()
         plugin.persistent_enable()
+        GLib.MainLoop().run()
         return procedure.new_return_values(Gimp.PDBStatusType.SUCCESS, None)
 
 
