@@ -37,9 +37,11 @@ jobs:
           set -euo pipefail
           version=3.0.8-1
           base=https://download.gimp.org/gimp/v3.0/linux
-          curl -fsSL "$base/GIMP-${version}-x86_64.AppImage" -o gimp.AppImage
-          curl -fsSL "$base/SHA256SUMS" | grep "GIMP-${version}-x86_64.AppImage" > gimp.sha256
+          asset="GIMP-${version}-x86_64.AppImage"
+          curl -fsSL "$base/$asset" -o "$asset"
+          curl -fsSL "$base/SHA256SUMS" | grep "$asset" > gimp.sha256
           sha256sum -c gimp.sha256
+          mv "$asset" gimp.AppImage
           chmod +x gimp.AppImage
       - name: Install the GIMP plug-in
         run: |
