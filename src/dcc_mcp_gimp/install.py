@@ -16,7 +16,7 @@ def default_plugin_dir() -> Path:
 
 
 def install(destination: Path | None = None) -> Path:
-    target = (destination or default_plugin_dir()).expanduser().resolve() / "dcc-mcp-gimp"
+    target = (destination or default_plugin_dir()).expanduser().resolve() / "dcc_mcp_gimp"
     target.mkdir(parents=True, exist_ok=True)
     source = Path(__file__).resolve().parent / "gimp_plugin" / "dcc_mcp_gimp.py"
     if not source.is_file():
