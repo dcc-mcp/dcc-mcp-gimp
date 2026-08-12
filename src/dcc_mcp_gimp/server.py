@@ -7,7 +7,7 @@ import signal
 import sys
 import threading
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from dcc_mcp_core import DccServerOptions
 from dcc_mcp_core.server_base import DccServerBase
@@ -21,7 +21,7 @@ _server: Optional["GimpMcpServer"] = None
 class GimpMcpServer(DccServerBase):
     """GIMP 3 adapter using its Python plug-in bridge."""
 
-    def __init__(self, port: int = DEFAULT_PORT) -> None:
+    def __init__(self, port: int = DEFAULT_PORT, **kwargs: Any) -> None:
         os.environ.setdefault("DCC_MCP_PYTHON_EXECUTABLE", sys.executable)
         options = DccServerOptions.from_env(
             "gimp",
@@ -29,6 +29,10 @@ class GimpMcpServer(DccServerBase):
             port=port,
             server_name="dcc-mcp-gimp",
             server_version=__version__,
+            adapter_version=__version__,
+            instance_type="gui",
+            standalone_main_thread=False,
+            **kwargs,
         )
         super().__init__(options=options)
 

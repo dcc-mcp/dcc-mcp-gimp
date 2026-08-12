@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.0
+
+- Add 16 typed image, layer, XCF save, export, and bridge-owned cleanup tools.
+- Authenticate loopback requests and bound connections, payloads, queue depth,
+  traversal, paths, file sizes, pixels, and command duration.
+- Marshal every GIMP host call through the GLib main thread and reject arbitrary
+  Python, Script-Fu, action, and PDB-procedure execution.
+- Add transactional plug-in installation, doctor diagnostics, Python 3.9
+  compatibility coverage, artifact digests, and a full real-host smoke chain.
+
 ## [0.2.0](https://github.com/dcc-mcp/dcc-mcp-gimp/compare/v0.1.0...v0.2.0) (2026-07-24)
 
 
