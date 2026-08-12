@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "dcc-mcp-gimp"
-version = "0.2.0"
+version = "0.3.0"
 description = "GIMP 3 adapter for the DCC Model Context Protocol"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -14,7 +14,13 @@ keywords = ["gimp", "image-editing", "mcp", "dcc", "automation"]
 dependencies = ["dcc-mcp-core>=0.19.38,<1.0.0"]
 
 [project.optional-dependencies]
-dev = ["build>=1.2", "pytest>=8", "ruff>=0.8", "twine>=6"]
+dev = [
+  "build>=1.2",
+  "pytest>=8",
+  "ruff>=0.8",
+  "twine>=6.2,<7; python_version < '3.10'",
+  "twine>=7; python_version >= '3.10'",
+]
 
 [project.urls]
 Homepage = "https://github.com/dcc-mcp/dcc-mcp-gimp"
@@ -24,6 +30,7 @@ Issues = "https://github.com/dcc-mcp/dcc-mcp-gimp/issues"
 [project.scripts]
 dcc-mcp-gimp = "dcc_mcp_gimp.server:main"
 dcc-mcp-gimp-install = "dcc_mcp_gimp.install:main"
+dcc-mcp-gimp-doctor = "dcc_mcp_gimp.install:doctor_main"
 
 [project.entry-points."dcc_mcp.adapters"]
 gimp = "dcc_mcp_gimp:GimpMcpServer"

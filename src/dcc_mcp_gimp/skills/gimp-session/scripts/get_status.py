@@ -1,12 +1,8 @@
-from dcc_mcp_core.skill import run_main, skill_entry, skill_success
+from dcc_mcp_core.skill import run_main
 
-from dcc_mcp_gimp.bridge import get_bridge
+from dcc_mcp_gimp.skill_tools import bridge_main
 
-
-@skill_entry
-def main(**_kwargs):
-    return skill_success("GIMP bridge is ready.", **get_bridge().call("gimp.get_status"))
-
+main = bridge_main("gimp.get_status", "GIMP bridge is ready.")
 
 if __name__ == "__main__":
     run_main(main)

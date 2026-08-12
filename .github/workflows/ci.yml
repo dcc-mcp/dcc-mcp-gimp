@@ -9,16 +9,22 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.12"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
       - run: python -m pip install -e '.[dev]'
       - run: python -m pytest
       - run: python -m ruff check src tests tools
       - run: python tools/lint_skills.py
       - run: python -m build && python -m twine check dist/*
+      - run: dcc-mcp-gimp-install --destination "$RUNNER_TEMP/gimp-plugins"
+      - run: dcc-mcp-gimp-doctor --destination "$RUNNER_TEMP/gimp-plugins"
 
   gimp3-smoke:
     needs: test
