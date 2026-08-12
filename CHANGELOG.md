@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/dcc-mcp/dcc-mcp-gimp/compare/v0.2.0...v0.3.0) (2026-08-12)
+
+
+### Features
+
+* ship production-ready GIMP authoring ([#2](https://github.com/dcc-mcp/dcc-mcp-gimp/issues/2)) ([8310688](https://github.com/dcc-mcp/dcc-mcp-gimp/commit/83106889832dc685190231b2b34bc03651a74a83))
+
 ## 0.3.0
 
 - Add 16 typed image, layer, XCF save, export, and bridge-owned cleanup tools.
