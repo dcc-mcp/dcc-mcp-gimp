@@ -7,7 +7,7 @@ import signal
 import sys
 import threading
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 from dcc_mcp_core import DccServerOptions
 from dcc_mcp_core.server_base import DccServerBase
@@ -54,7 +54,13 @@ def stop_server() -> None:
         _server = None
 
 
-def main() -> None:
+def main(argv: Optional[Sequence[str]] = None) -> None:
+    resolved = list(sys.argv[1:] if argv is None else argv)
+    if resolved and resolved[0] in {"install", "status", "verify", "uninstall", "upgrade"}:
+        from .install import main as install_main
+
+        install_main(resolved)
+        return
     stopped = threading.Event()
     signal.signal(signal.SIGINT, lambda *_: stopped.set())
     if hasattr(signal, "SIGTERM"):

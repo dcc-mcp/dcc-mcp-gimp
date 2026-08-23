@@ -1,3 +1,4 @@
+import builtins
 import json
 import runpy
 import socket
@@ -94,3 +95,42 @@ def test_runtime_bounds_main_thread_queue(runtime):
     finally:
         for _index in range(runtime["MAX_PENDING_COMMANDS"]):
             semaphore.release()
+
+
+def test_runtime_captures_bridge_bootstrap_failure(runtime, tmp_path, monkeypatch):
+    errors = tmp_path / "bootstrap-errors.jsonl"
+    monkeypatch.setenv("DCC_MCP_GIMP_BOOTSTRAP_ERRORS", str(errors))
+    run = runtime["DccMcpGimp"]._run
+
+    def fail_token_load():
+        raise RuntimeError("token bootstrap failed")
+
+    monkeypatch.setitem(run.__globals__, "_load_or_create_token", fail_token_load)
+
+    with pytest.raises(RuntimeError, match="token bootstrap failed"):
+        run(None, None, None, None)
+
+    record = json.loads(errors.read_text(encoding="utf-8").splitlines()[-1])
+    assert record["stage"] == "bridge-startup"
+    assert record["error_type"] == "RuntimeError"
+    assert record["message"] == "token bootstrap failed"
+
+
+def test_plugin_captures_gi_import_failure(tmp_path, monkeypatch):
+    errors = tmp_path / "bootstrap-errors.jsonl"
+    monkeypatch.setenv("DCC_MCP_GIMP_BOOTSTRAP_ERRORS", str(errors))
+    original_import = builtins.__import__
+
+    def block_gi(name, *args, **kwargs):
+        if name == "gi":
+            raise ImportError("GIMP GI bindings unavailable")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", block_gi)
+
+    with pytest.raises(ImportError, match="GIMP GI bindings unavailable"):
+        runpy.run_path(str(PLUGIN))
+
+    record = json.loads(errors.read_text(encoding="utf-8").splitlines()[-1])
+    assert record["stage"] == "gi-import"
+    assert record["error_type"] == "ImportError"

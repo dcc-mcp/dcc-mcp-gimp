@@ -1,108 +1,194 @@
-"""Install and diagnose the GIMP 3 persistent Python plug-in."""
+"""Public CLI orchestration for the GIMP Install SOP v1 lifecycle."""
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
-import shutil
-import tempfile
-import time
+import sys
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional, Sequence
 
-_PLUGIN_NAME = "dcc_mcp_gimp"
-
-
-def default_plugin_dir() -> Path:
-    if os.name == "nt":
-        root = Path(os.environ.get("APPDATA", Path.home() / "AppData/Roaming"))
-        return root / "GIMP/3.0/plug-ins"
-    root = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
-    return root / "GIMP/3.0/plug-ins"
-
-
-def _source_file() -> Path:
-    bundled = Path(__file__).resolve().parent / "gimp_plugin" / ("%s.py" % _PLUGIN_NAME)
-    if bundled.is_file():
-        return bundled
-    source = (
-        Path(__file__).resolve().parents[2] / "bridge" / "gimp-plugin" / ("%s.py" % _PLUGIN_NAME)
-    )
-    if source.is_file():
-        return source
-    raise FileNotFoundError("Bundled GIMP plug-in not found: %s" % bundled)
-
-
-def install(destination: Optional[Path] = None) -> Path:
-    root = (destination or default_plugin_dir()).expanduser().resolve()
-    root.mkdir(parents=True, exist_ok=True)
-    target = root / _PLUGIN_NAME
-    source = _source_file()
-    suffix = "%d-%d" % (os.getpid(), time.time_ns())
-    backup = root / (".%s.backup-%s" % (_PLUGIN_NAME, suffix))
-
-    with tempfile.TemporaryDirectory(prefix=".dcc-mcp-gimp-install-", dir=str(root)) as temp:
-        staged = Path(temp) / _PLUGIN_NAME
-        staged.mkdir()
-        script = staged / source.name
-        shutil.copy2(source, script)
-        if os.name != "nt":
-            script.chmod(0o755)
-        moved_existing = False
-        try:
-            if target.exists():
-                os.replace(str(target), str(backup))
-                moved_existing = True
-            os.replace(str(staged), str(target))
-        except BaseException:
-            if target.exists():
-                shutil.rmtree(target)
-            if moved_existing and backup.exists():
-                os.replace(str(backup), str(target))
-            raise
-        else:
-            if backup.exists():
-                shutil.rmtree(backup)
-    return target
+from .__version__ import __version__
+from .install_contract import (
+    _VERBS,
+    EXIT_OK,
+    EXIT_PREFLIGHT,
+    EXIT_REQUIRES_RESTART,
+    EXIT_VERIFY,
+    SCHEMA_VERSION,
+    InstallFailure,
+)
+from .install_contract import (
+    EXIT_ACQUIRE as EXIT_ACQUIRE,
+)
+from .install_contract import (
+    EXIT_INSTALL as EXIT_INSTALL,
+)
+from .install_contract import (
+    MIN_CORE_VERSION as MIN_CORE_VERSION,
+)
+from .install_contract import (
+    RECEIPT_RELATIVE_PATH as RECEIPT_RELATIVE_PATH,
+)
+from .install_files import (
+    _execute_uninstall,
+    _replace_plugin,
+    install,
+)
+from .install_files import (
+    _files_manifest as _files_manifest,
+)
+from .install_files import (
+    _manifest_digest as _manifest_digest,
+)
+from .install_files import (
+    _write_json_atomic as _write_json_atomic,
+)
+from .install_host import default_plugin_dir as default_plugin_dir
+from .install_lifecycle import _next_steps, doctor, plan, verify_install
 
 
-def doctor(destination: Optional[Path] = None) -> dict[str, object]:
-    root = (destination or default_plugin_dir()).expanduser().resolve()
-    script = root / _PLUGIN_NAME / ("%s.py" % _PLUGIN_NAME)
-    roots = [
-        str(Path(item).expanduser().resolve())
-        for item in os.environ.get("DCC_MCP_GIMP_ALLOWED_ROOTS", "").split(os.pathsep)
-        if item.strip()
-    ]
-    token_file = (
-        Path(
-            os.environ.get(
-                "DCC_MCP_GIMP_BRIDGE_TOKEN_FILE",
-                Path.home().joinpath(".dcc-mcp", "gimp-bridge-token"),
-            )
-        )
-        .expanduser()
-        .resolve()
-    )
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Install and verify DCC-MCP GIMP")
+    subparsers = parser.add_subparsers(dest="verb", required=True)
+    for verb in sorted(_VERBS):
+        command = subparsers.add_parser(verb)
+        command.add_argument("--dcc-path", type=Path)
+        command.add_argument("--python", type=Path)
+        command.add_argument("--destination", type=Path, help=argparse.SUPPRESS)
+        command.add_argument("--json", action="store_true", dest="as_json")
+        command.add_argument("--yes", action="store_true")
+        command.add_argument("--dry-run", action="store_true")
+        command.add_argument("--ready-timeout", type=float, default=0.0, help=argparse.SUPPRESS)
+    return parser
+
+
+def _failure_verification(failure: InstallFailure) -> dict[str, Any]:
     return {
-        "ready": script.is_file(),
-        "destination": str(root),
-        "plugin_script": str(script),
-        "plugin_script_exists": script.is_file(),
-        "allowed_roots": roots,
-        "file_access_enabled": bool(roots),
-        "token_file": str(token_file),
-        "token_file_exists": token_file.is_file(),
-        "restart_required_after_install": True,
+        "directly_usable": False,
+        "failure_stage": failure.stage,
+        "failure_reason": failure.reason,
     }
 
 
-def main() -> None:
+def run(argv: Sequence[str]) -> tuple[dict[str, Any], int, bool]:
+    args = _parser().parse_args(list(argv))
+    try:
+        report = plan(args.verb, args.destination, args.python, args.dcc_path)
+    except InstallFailure as failure:
+        return (
+            {
+                "schema_version": SCHEMA_VERSION,
+                "status": "failed",
+                "dcc_type": "gimp",
+                "verb": args.verb,
+                "adapter_version": __version__,
+                "core_version": None,
+                "steps": [
+                    {"id": failure.stage, "status": "failed", "reason": failure.reason}
+                ],
+                "next_steps": [],
+                "receipt_path": None,
+                "verify": _failure_verification(failure),
+            },
+            failure.exit_code,
+            args.as_json,
+        )
+    if args.verb == "status":
+        report["status"] = report["installation_state"]
+        report["steps"][-1]["status"] = report["status"]
+        code = EXIT_OK if report["status"] in {"fresh", "current"} else EXIT_VERIFY
+        return report, code, args.as_json
+    if args.verb in {"install", "upgrade"}:
+        if args.dry_run or not args.yes:
+            return report, EXIT_OK, args.as_json
+        if args.verb == "upgrade" and report["installation_state"] == "fresh":
+            failure = InstallFailure(EXIT_PREFLIGHT, "upgrade", "Nothing is installed; use install")
+            report.update(status="failed", verify=_failure_verification(failure))
+            return report, failure.exit_code, args.as_json
+        try:
+            target = _replace_plugin(Path(report["destination"]), report)
+            report["steps"][-1] = {
+                "id": args.verb,
+                "status": "ok",
+                "path": str(target),
+            }
+            report["verify"] = verify_install(
+                Path(report["destination"]),
+                Path(report["python"]),
+                args.ready_timeout,
+            )
+        except InstallFailure as failure:
+            report["status"] = (
+                "requires_restart"
+                if failure.exit_code == EXIT_REQUIRES_RESTART
+                else "failed"
+            )
+            report["verify"] = _failure_verification(failure)
+            return report, failure.exit_code, args.as_json
+        if report["verify"]["directly_usable"]:
+            report["status"] = "ok"
+            return report, EXIT_OK, args.as_json
+        report["next_steps"] = _next_steps(report)
+        if report["verify"]["failure_stage"] == "readiness":
+            report["status"] = "requires_restart"
+            return report, EXIT_REQUIRES_RESTART, args.as_json
+        report["status"] = "failed"
+        return report, EXIT_VERIFY, args.as_json
+    if args.verb == "uninstall":
+        if args.dry_run or not args.yes:
+            return report, EXIT_OK, args.as_json
+        try:
+            report, code = _execute_uninstall(report)
+        except InstallFailure as failure:
+            report["status"] = (
+                "requires_restart"
+                if failure.exit_code == EXIT_REQUIRES_RESTART
+                else "failed"
+            )
+            report["verify"] = _failure_verification(failure)
+            return report, failure.exit_code, args.as_json
+        return report, code, args.as_json
+    if args.verb == "verify":
+        report["verify"] = verify_install(
+            Path(report["destination"]),
+            Path(report["python"]),
+            args.ready_timeout,
+        )
+        report["status"] = "ok" if report["verify"]["directly_usable"] else "failed"
+        if report["status"] == "failed":
+            report["next_steps"] = _next_steps(report)
+        code = EXIT_OK if report["status"] == "ok" else EXIT_VERIFY
+        return report, code, args.as_json
+    return report, EXIT_OK, args.as_json
+
+
+def _print_report(report: dict[str, Any], as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(report, sort_keys=True, separators=(",", ":")))
+        return
+    print("DCC-MCP GIMP %s: %s" % (report.get("verb"), report.get("status")))
+    if report.get("destination"):
+        print("Profile: %s" % report["destination"])
+    verification = report.get("verify") or {}
+    if verification.get("failure_reason"):
+        print("Verification: %s" % verification["failure_reason"])
+    for step in report.get("next_steps", []):
+        print("Next: %s" % step["description"])
+
+
+def main(argv: Optional[Sequence[str]] = None) -> None:
+    resolved = list(sys.argv[1:] if argv is None else argv)
+    if resolved and resolved[0] in _VERBS:
+        report, code, as_json = run(resolved)
+        _print_report(report, as_json)
+        if code:
+            raise SystemExit(code)
+        return
     parser = argparse.ArgumentParser(description="Install or inspect the DCC-MCP GIMP plug-in")
     parser.add_argument("--destination", type=Path, help="Override the GIMP plug-ins directory")
     parser.add_argument("--doctor", action="store_true", help="Print installation status as JSON")
-    args = parser.parse_args()
+    args = parser.parse_args(resolved)
     if args.doctor:
         result = doctor(args.destination)
         print(json.dumps(result, ensure_ascii=False, indent=2))

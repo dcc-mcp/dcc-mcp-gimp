@@ -13,14 +13,44 @@ import socketserver
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
-import gi
 
-gi.require_version("Gegl", "0.4")
-gi.require_version("Gimp", "3.0")
-from gi.repository import Gegl, Gimp, Gio, GLib  # noqa: E402
+def _bootstrap_error_path() -> Path:
+    configured = os.environ.get("DCC_MCP_GIMP_BOOTSTRAP_ERRORS")
+    if configured:
+        return Path(configured).expanduser().resolve()
+    return Path.home().joinpath(".dcc-mcp", "gimp-bootstrap-errors.jsonl").resolve()
+
+
+def _capture_bootstrap_error(stage: str, error: BaseException) -> None:
+    path = _bootstrap_error_path()
+    record = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "stage": stage,
+        "error_type": type(error).__name__,
+        "message": str(error),
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+    except OSError:
+        pass
+
+
+try:
+    import gi
+
+    gi.require_version("Gegl", "0.4")
+    gi.require_version("Gimp", "3.0")
+    from gi.repository import Gegl, Gimp, Gio, GLib  # noqa: E402
+except BaseException as exc:
+    _capture_bootstrap_error("gi-import", exc)
+    raise
+
 
 VERSION = "0.3.0"  # x-release-please-version
 BRIDGE_HOST = "127.0.0.1"
@@ -643,6 +673,14 @@ class DccMcpGimp(Gimp.PlugIn):
 
     @staticmethod
     def _run(procedure: Any, run_mode: Any, config: Any, plugin: Any) -> Any:
+        try:
+            return DccMcpGimp._run_bridge(procedure, run_mode, config, plugin)
+        except BaseException as exc:
+            _capture_bootstrap_error("bridge-startup", exc)
+            raise
+
+    @staticmethod
+    def _run_bridge(procedure: Any, run_mode: Any, config: Any, plugin: Any) -> Any:
         del run_mode, config
         global _bridge_token
         _bridge_token = _load_or_create_token()
