@@ -7,11 +7,12 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
         python-version: ["3.9", "3.12"]
     steps:
       - uses: actions/checkout@v4
@@ -19,12 +20,12 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: python -m pip install -e '.[dev]'
+      - name: Install SOP plan, receipt, rollback, and uninstall smoke
+        run: python -m pytest tests/test_install.py -q
       - run: python -m pytest
       - run: python -m ruff check src tests tools
       - run: python tools/lint_skills.py
       - run: python -m build && python -m twine check dist/*
-      - run: dcc-mcp-gimp-install --destination "$RUNNER_TEMP/gimp-plugins"
-      - run: dcc-mcp-gimp-doctor --destination "$RUNNER_TEMP/gimp-plugins"
 
   gimp3-smoke:
     needs: test

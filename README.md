@@ -23,9 +23,14 @@ Script-Fu, action, or PDB-procedure execution.
 
 ## Install
 
+See the canonical [Install SOP v1 guide](install.md) for agent-first plan,
+status, verification, upgrade, uninstall, receipts, exit codes, and platform
+troubleshooting.
+
 ```bash
 pip install dcc-mcp-gimp
-dcc-mcp-gimp-install
+dcc-mcp-gimp install --yes --json --dcc-path /path/to/gimp-3.0 --python /path/to/python
+dcc-mcp-gimp verify --json --dcc-path /path/to/gimp-3.0 --python /path/to/python
 dcc-mcp-gimp-doctor
 ```
 
