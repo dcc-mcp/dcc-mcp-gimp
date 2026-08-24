@@ -11,7 +11,7 @@ metadata:
   dcc-mcp:
     dcc: gimp
     layer: domain
-    version: "0.3.0"  # x-release-please-version
+    version: "0.4.0"  # x-release-please-version
     search-hint: "GIMP image editor image layer XCF PNG export authoring"
     tags: "gimp,image-editing,layers,export"
     tools: tools.yaml

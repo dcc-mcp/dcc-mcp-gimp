@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.4.0](https://github.com/dcc-mcp/dcc-mcp-gimp/compare/v0.3.0...v0.4.0) (2026-08-24)
+
+
+### Features
+
+* adopt GIMP Install SOP v1 ([7b368ec](https://github.com/dcc-mcp/dcc-mcp-gimp/commit/7b368ec1b57c92f7a60eaa6e589f6d87242f87b6))
+
+
+### Bug Fixes
+
+* harden GIMP install lifecycle ([45b5798](https://github.com/dcc-mcp/dcc-mcp-gimp/commit/45b5798026e421df4a28eff219eb4809cc94fb76))
+
 ## [0.3.0](https://github.com/dcc-mcp/dcc-mcp-gimp/compare/v0.2.0...v0.3.0) (2026-08-12)
 
 
