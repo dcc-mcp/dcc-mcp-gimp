@@ -90,6 +90,108 @@ _owned_displays: dict[int, Any] = {}
 _bridge_token = ""
 
 
+def _process_start_identity(pid: int) -> Optional[str]:
+    """Capture the parent creation identity once so a reused PID cannot attest readiness."""
+    if pid <= 0:
+        return None
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetProcessTimes.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+        ]
+        kernel32.GetProcessTimes.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        handle = kernel32.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return None
+        try:
+            creation = wintypes.FILETIME()
+            exit_time = wintypes.FILETIME()
+            kernel = wintypes.FILETIME()
+            user = wintypes.FILETIME()
+            if not kernel32.GetProcessTimes(
+                handle,
+                ctypes.byref(creation),
+                ctypes.byref(exit_time),
+                ctypes.byref(kernel),
+                ctypes.byref(user),
+            ):
+                return None
+            value = (int(creation.dwHighDateTime) << 32) | int(creation.dwLowDateTime)
+            return "windows-filetime:%d" % value
+        finally:
+            kernel32.CloseHandle(handle)
+    if sys.platform == "darwin":
+        import ctypes
+
+        class _ProcBsdInfo(ctypes.Structure):
+            _fields_ = [
+                ("pbi_flags", ctypes.c_uint32),
+                ("pbi_status", ctypes.c_uint32),
+                ("pbi_xstatus", ctypes.c_uint32),
+                ("pbi_pid", ctypes.c_uint32),
+                ("pbi_ppid", ctypes.c_uint32),
+                ("pbi_uid", ctypes.c_uint32),
+                ("pbi_gid", ctypes.c_uint32),
+                ("pbi_ruid", ctypes.c_uint32),
+                ("pbi_rgid", ctypes.c_uint32),
+                ("pbi_svuid", ctypes.c_uint32),
+                ("pbi_svgid", ctypes.c_uint32),
+                ("rfu_1", ctypes.c_uint32),
+                ("pbi_comm", ctypes.c_char * 16),
+                ("pbi_name", ctypes.c_char * 32),
+                ("pbi_nfiles", ctypes.c_uint32),
+                ("pbi_pgid", ctypes.c_uint32),
+                ("pbi_pjobc", ctypes.c_uint32),
+                ("e_tdev", ctypes.c_uint32),
+                ("e_tpgid", ctypes.c_uint32),
+                ("pbi_nice", ctypes.c_int32),
+                ("pbi_start_tvsec", ctypes.c_uint64),
+                ("pbi_start_tvusec", ctypes.c_uint64),
+            ]
+
+        try:
+            libproc = ctypes.CDLL("/usr/lib/libproc.dylib")
+            libproc.proc_pidinfo.argtypes = [
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_uint64,
+                ctypes.c_void_p,
+                ctypes.c_int,
+            ]
+            libproc.proc_pidinfo.restype = ctypes.c_int
+            info = _ProcBsdInfo()
+            size = ctypes.sizeof(info)
+            returned = libproc.proc_pidinfo(int(pid), 3, 0, ctypes.byref(info), size)
+        except (OSError, AttributeError):
+            return None
+        if returned != size or info.pbi_start_tvsec <= 0:
+            return None
+        return "darwin-timeval:%d:%d" % (info.pbi_start_tvsec, info.pbi_start_tvusec)
+    try:
+        process_stat = Path("/proc/%d/stat" % pid).read_text(encoding="utf-8")
+        closing = process_stat.rfind(") ")
+        start_ticks = process_stat[closing + 2 :].split()[19]
+        boot_id = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+    except (IndexError, OSError, ValueError):
+        return None
+    return "linux:%s:%s" % (boot_id, start_ticks)
+
+
+_gimp_pid = os.getppid()
+_gimp_start_identity = _process_start_identity(_gimp_pid)
+
+
 def _split_roots(value: str) -> tuple[Path, ...]:
     return tuple(
         Path(item.strip()).expanduser().resolve()
@@ -360,7 +462,8 @@ def _execute_command(method: str, params: Mapping[str, Any]) -> Any:
             "bridge_host": BRIDGE_HOST,
             "bridge_port": BRIDGE_PORT,
             "authenticated": True,
-            "gimp_pid": os.getppid(),
+            "gimp_pid": _gimp_pid,
+            "gimp_start_identity": _gimp_start_identity,
             "plugin_pid": os.getpid(),
             "plugin_module_path": str(Path(__file__).resolve()),
             "main_thread_id": threading.get_ident(),

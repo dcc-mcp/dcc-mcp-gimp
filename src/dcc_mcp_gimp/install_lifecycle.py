@@ -120,6 +120,9 @@ def _runtime_identity_failure(
         return "Ready GIMP process path differs from the selected executable"
     if before is None or before != after:
         return "Ready GIMP process start identity is unavailable or changed"
+    captured_start = context.get("gimp_start_identity")
+    if not isinstance(captured_start, str) or captured_start != before:
+        return "GIMP plug-in captured start identity differs from the selected process"
     return None
 
 
@@ -253,8 +256,13 @@ def _next_steps(report: dict[str, Any]) -> list[dict[str, Any]]:
     launch = [str(report["dcc_path"])]
     if str(report["dcc_path"]).lower().endswith(".appimage"):
         launch.append("--appimage-extract-and-run")
+    launch.append("--new-instance")
+    selected_python = str(report["python"])
+    start_adapter = [selected_python, "-m", "dcc_mcp_gimp"]
     verify = [
-        "dcc-mcp-gimp",
+        selected_python,
+        "-m",
+        "dcc_mcp_gimp",
         "verify",
         "--json",
         "--dcc-path",
@@ -272,14 +280,19 @@ def _next_steps(report: dict[str, Any]) -> list[dict[str, Any]]:
         {
             "id": "start-selected-gimp",
             "description": (
-                "Start the selected GIMP build, then invoke its registered "
-                "python-fu-dcc-mcp-gimp-bridge persistent procedure."
+                "Start a new selected GIMP instance; its no-argument persistent bridge "
+                "procedure starts automatically."
             ),
             "command": launch,
             "why": (
-                "GIMP discovers the receipted plug-in at startup; procedure invocation "
-                "remains an explicit host action."
+                "A new process discovers the receipted plug-in without reusing a foreign instance."
             ),
+        },
+        {
+            "id": "start-selected-adapter",
+            "description": "Start the adapter with the exact selected Python interpreter.",
+            "command": start_adapter,
+            "why": "The adapter must register before the exact readiness probe can run.",
         },
         {
             "id": "verify-selected-gimp",

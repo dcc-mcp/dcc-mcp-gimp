@@ -143,7 +143,14 @@ def run(argv: Sequence[str]) -> tuple[dict[str, Any], int, bool]:
             report["verify"] = _failure_verification(failure)
             return report, failure.exit_code, args.as_json
         if report["verify"]["directly_usable"]:
-            transaction.commit()
+            try:
+                transaction.commit()
+            except InstallFailure as failure:
+                report["status"] = (
+                    "requires_restart" if failure.exit_code == EXIT_REQUIRES_RESTART else "failed"
+                )
+                report["verify"] = _failure_verification(failure)
+                return report, failure.exit_code, args.as_json
             report["status"] = "ok"
             return report, EXIT_OK, args.as_json
         report["next_steps"] = _next_steps(report)
@@ -153,7 +160,14 @@ def run(argv: Sequence[str]) -> tuple[dict[str, Any], int, bool]:
             report["previous_install_restored"] = True
             return report, EXIT_VERIFY, args.as_json
         if report["verify"]["failure_stage"] in {"readiness", "readiness_identity"}:
-            transaction.commit()
+            try:
+                transaction.commit()
+            except InstallFailure as failure:
+                report["status"] = (
+                    "requires_restart" if failure.exit_code == EXIT_REQUIRES_RESTART else "failed"
+                )
+                report["verify"] = _failure_verification(failure)
+                return report, failure.exit_code, args.as_json
             report["status"] = "requires_restart"
             return report, EXIT_REQUIRES_RESTART, args.as_json
         transaction.rollback()

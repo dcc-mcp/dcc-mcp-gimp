@@ -8,12 +8,13 @@ import json
 import os
 import re
 import shutil
+import stat
 import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping, Optional, Sequence
+from typing import Any, Mapping, Optional
 
 from dcc_mcp_core.install_lifecycle import inspect_install_root, safe_remove_tree
 
@@ -200,6 +201,59 @@ def _cleanup_tree(path: Path) -> dict[str, Any]:
     return result if isinstance(result, dict) else {"success": False, "requires_restart": False}
 
 
+def _recovery_manifest(root: Path) -> dict[str, Any]:
+    """Describe recovery bytes and POSIX modes without following links."""
+    try:
+        directories, files, links = _owned_root_manifest(root)
+        if links:
+            raise InstallFailure(EXIT_INSTALL, "recovery", "Managed recovery contains links")
+        total = sum(int(record["size"]) for record in files)
+        if total > _MAX_SNAPSHOT_BYTES:
+            raise InstallFailure(EXIT_INSTALL, "recovery", "Managed recovery is too large")
+        return {
+            "root_mode": stat.S_IMODE(root.stat(follow_symlinks=False).st_mode),
+            "directories": [
+                {
+                    "path": relative,
+                    "mode": stat.S_IMODE((root / relative).stat(follow_symlinks=False).st_mode),
+                }
+                for relative in directories
+            ],
+            "files": [
+                {
+                    **record,
+                    "mode": stat.S_IMODE(
+                        (root / str(record["path"])).stat(follow_symlinks=False).st_mode
+                    ),
+                }
+                for record in files
+            ],
+            "links": [],
+        }
+    except InstallFailure:
+        raise
+    except OSError as exc:
+        raise InstallFailure(
+            EXIT_INSTALL, "recovery", "Managed recovery could not be inspected"
+        ) from exc
+
+
+def _copy_validated_recovery(source: Path, recovery: Path) -> dict[str, Any]:
+    """Create a separate recovery tree and prove that its bytes and modes match."""
+    expected = _recovery_manifest(source)
+    try:
+        shutil.copytree(source, recovery, symlinks=True, copy_function=shutil.copy2)
+    except OSError as exc:
+        _cleanup_tree(recovery)
+        raise InstallFailure(
+            EXIT_INSTALL, "recovery", "Recovery snapshot could not be created"
+        ) from exc
+    if _recovery_manifest(recovery) != expected:
+        _cleanup_tree(recovery)
+        raise InstallFailure(EXIT_INSTALL, "recovery", "Recovery snapshot validation failed")
+    return expected
+
+
 def _replace_plugin(root: Path) -> Path:
     """Replace only the legacy copy; the lifecycle uses a receipted transaction."""
     root.mkdir(parents=True, exist_ok=True)
@@ -335,8 +389,12 @@ class InstallTransaction:
     receipt_path: Path
     backup: Path
     old_receipt: Optional[bytes]
+    old_receipt_mode: Optional[int]
     previous_moved: bool
+    previous_manifest: Optional[dict[str, Any]]
     replacement_moved: bool = False
+    recovery: Optional[Path] = None
+    recovery_manifest: Optional[dict[str, Any]] = None
     closed: bool = False
 
     def rollback(self) -> bool:
@@ -344,17 +402,42 @@ class InstallTransaction:
             return self.previous_moved
         failed = self.root / (".%s.%s.failed" % (_PLUGIN_NAME, uuid.uuid4().hex))
         try:
-            if self.replacement_moved and self.target.exists():
+            if self.replacement_moved and (self.target.exists() or self.target.is_symlink()):
                 _replace_path(self.target, failed)
-            if self.previous_moved and self.backup.exists():
-                _replace_path(self.backup, self.target)
+            if self.previous_moved:
+                restore_source = None
+                for candidate in (self.recovery, self.backup):
+                    if candidate is None or not candidate.is_dir() or _is_link(candidate):
+                        continue
+                    if self.previous_manifest is not None:
+                        try:
+                            if _recovery_manifest(candidate) != self.previous_manifest:
+                                continue
+                        except (InstallFailure, OSError):
+                            continue
+                    restore_source = candidate
+                    break
+                if restore_source is None:
+                    raise InstallFailure(
+                        EXIT_INSTALL, "recovery", "No validated prior GIMP recovery remains"
+                    )
+                _replace_path(restore_source, self.target)
             if self.old_receipt is None:
                 self.receipt_path.unlink(missing_ok=True)
             else:
                 self.receipt_path.parent.mkdir(parents=True, exist_ok=True)
                 self.receipt_path.write_bytes(self.old_receipt)
+                if self.old_receipt_mode is not None:
+                    self.receipt_path.chmod(self.old_receipt_mode)
+            if self.previous_moved and self.previous_manifest is not None:
+                if _recovery_manifest(self.target) != self.previous_manifest:
+                    raise InstallFailure(
+                        EXIT_INSTALL, "recovery", "Restored GIMP recovery validation failed"
+                    )
             _cleanup_tree(failed)
             _cleanup_tree(self.backup)
+            if self.recovery is not None:
+                _cleanup_tree(self.recovery)
             self.closed = True
             return self.previous_moved
         except BaseException as exc:
@@ -365,12 +448,21 @@ class InstallTransaction:
     def commit(self) -> None:
         if self.closed:
             return
+        if self.previous_moved:
+            self.recovery = self.root / (".%s.%s.recovery" % (_PLUGIN_NAME, uuid.uuid4().hex))
+            try:
+                self.recovery_manifest = _copy_validated_recovery(self.backup, self.recovery)
+            except InstallFailure:
+                self.rollback()
+                raise
         cleanup = _cleanup_tree(self.backup)
         if not cleanup.get("success"):
             self.rollback()
             code = EXIT_REQUIRES_RESTART if cleanup.get("requires_restart") else EXIT_INSTALL
             raise InstallFailure(code, "cleanup", "Verified install backup cleanup failed")
         self.closed = True
+        if self.recovery is not None:
+            _cleanup_tree(self.recovery)
 
 
 def _begin_replace_plugin(root: Path, report: Mapping[str, Any]) -> InstallTransaction:
@@ -391,7 +483,22 @@ def _begin_replace_plugin(root: Path, report: Mapping[str, Any]) -> InstallTrans
     backup = root / (".%s.%s.backup" % (_PLUGIN_NAME, uuid.uuid4().hex))
     receipt_path = _receipt_path()
     old_receipt = receipt_path.read_bytes() if receipt_path.is_file() else None
-    transaction = InstallTransaction(root, target, receipt_path, backup, old_receipt, False)
+    old_receipt_mode = (
+        stat.S_IMODE(receipt_path.stat(follow_symlinks=False).st_mode)
+        if receipt_path.is_file()
+        else None
+    )
+    previous_manifest = _recovery_manifest(target) if target.is_dir() else None
+    transaction = InstallTransaction(
+        root=root,
+        target=target,
+        receipt_path=receipt_path,
+        backup=backup,
+        old_receipt=old_receipt,
+        old_receipt_mode=old_receipt_mode,
+        previous_moved=False,
+        previous_manifest=previous_manifest,
+    )
     try:
         if target.exists():
             _replace_path(target, backup)
@@ -438,24 +545,47 @@ def _installation_state(destination: Path) -> str:
     return "current" if installed_version == __version__ else "upgrade"
 
 
+@dataclass(frozen=True)
+class OwnedSnapshot:
+    root_mode: int
+    directory_modes: Mapping[str, int]
+    files: Mapping[str, bytes]
+    file_modes: Mapping[str, int]
+    receipt_bytes: bytes
+    receipt_mode: int
+
+
 def _capture_owned_bytes(
     target: Path, receipt_path: Path, receipt: Mapping[str, Any]
-) -> tuple[list[str], dict[str, bytes], bytes]:
+) -> OwnedSnapshot:
     ownership = receipt["ownership"]
-    directories = list(ownership["directories"])
+    directory_modes = {
+        str(relative): stat.S_IMODE((target / str(relative)).stat(follow_symlinks=False).st_mode)
+        for relative in ownership["directories"]
+    }
     files: dict[str, bytes] = {}
+    file_modes: dict[str, int] = {}
     total = receipt_path.stat().st_size
     for record in ownership["files"]:
         relative = str(record["path"])
-        data = (target / relative).read_bytes()
+        path = target / relative
+        data = path.read_bytes()
         total += len(data)
         files[relative] = data
+        file_modes[relative] = stat.S_IMODE(path.stat(follow_symlinks=False).st_mode)
     receipt_bytes = receipt_path.read_bytes()
     if total > _MAX_SNAPSHOT_BYTES:
         raise InstallFailure(
             EXIT_INSTALL, "uninstall", "Managed install is too large for bounded rollback"
         )
-    return directories, files, receipt_bytes
+    return OwnedSnapshot(
+        root_mode=stat.S_IMODE(target.stat(follow_symlinks=False).st_mode),
+        directory_modes=directory_modes,
+        files=files,
+        file_modes=file_modes,
+        receipt_bytes=receipt_bytes,
+        receipt_mode=stat.S_IMODE(receipt_path.stat(follow_symlinks=False).st_mode),
+    )
 
 
 def _restore_owned_bytes(
@@ -463,21 +593,30 @@ def _restore_owned_bytes(
     target: Path,
     receipt_path: Path,
     receipt: Mapping[str, Any],
-    directories: Sequence[str],
-    files: Mapping[str, bytes],
-    receipt_bytes: bytes,
+    snapshot: OwnedSnapshot,
 ) -> None:
     if target.exists() or target.is_symlink():
         _cleanup_tree(target)
     target.mkdir(parents=True, exist_ok=True)
-    for relative in sorted(directories, key=lambda value: (len(Path(value).parts), value)):
+    for relative in sorted(
+        snapshot.directory_modes, key=lambda value: (len(Path(value).parts), value)
+    ):
         (target / relative).mkdir()
-    for relative, data in files.items():
+    for relative, data in snapshot.files.items():
         path = target / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(data)
+        path.chmod(snapshot.file_modes[relative])
+    for relative in sorted(
+        snapshot.directory_modes,
+        key=lambda value: (len(Path(value).parts), value),
+        reverse=True,
+    ):
+        (target / relative).chmod(snapshot.directory_modes[relative])
+    target.chmod(snapshot.root_mode)
     receipt_path.parent.mkdir(parents=True, exist_ok=True)
-    receipt_path.write_bytes(receipt_bytes)
+    receipt_path.write_bytes(snapshot.receipt_bytes)
+    receipt_path.chmod(snapshot.receipt_mode)
     _validate_owned_install(destination, target, receipt_path, receipt)
 
 
@@ -502,7 +641,7 @@ def _execute_uninstall(report: dict[str, Any]) -> tuple[dict[str, Any], int]:
             "uninstall",
             str(lock_state.get("recommended_next_action", "GIMP restart required")),
         )
-    directories, files, receipt_bytes = _capture_owned_bytes(target, receipt_path, receipt)
+    owned_snapshot = _capture_owned_bytes(target, receipt_path, receipt)
     transaction = destination / (".dcc-mcp-gimp-uninstall-%s" % uuid.uuid4().hex)
     snapshot = transaction / "snapshot"
     quarantine = transaction / "quarantine"
@@ -512,8 +651,15 @@ def _execute_uninstall(report: dict[str, Any]) -> tuple[dict[str, Any], int]:
     quarantine_receipt = quarantine / "gimp.json"
     try:
         snapshot.mkdir(parents=True)
-        shutil.copytree(target, snapshot_target)
+        snapshot_manifest = _copy_validated_recovery(target, snapshot_target)
         shutil.copy2(receipt_path, snapshot_receipt)
+        if (
+            _recovery_manifest(snapshot_target) != snapshot_manifest
+            or snapshot_receipt.read_bytes() != owned_snapshot.receipt_bytes
+            or stat.S_IMODE(snapshot_receipt.stat(follow_symlinks=False).st_mode)
+            != owned_snapshot.receipt_mode
+        ):
+            raise InstallFailure(EXIT_INSTALL, "uninstall", "Uninstall recovery validation failed")
         _replace_path(target, quarantine_target)
         _replace_path(receipt_path, quarantine_receipt)
         removed = _cleanup_tree(quarantine)
@@ -533,9 +679,7 @@ def _execute_uninstall(report: dict[str, Any]) -> tuple[dict[str, Any], int]:
                 target,
                 receipt_path,
                 receipt,
-                directories,
-                files,
-                receipt_bytes,
+                owned_snapshot,
             )
         except BaseException as restore_error:
             raise InstallFailure(
