@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.1](https://github.com/dcc-mcp/dcc-mcp-gimp/compare/v0.4.0...v0.4.1) (2026-08-24)
+
+
+### Bug Fixes
+
+* preserve GIMP lifecycle recovery ([efe1561](https://github.com/dcc-mcp/dcc-mcp-gimp/commit/efe156130ffec3176f295f3412c6ffe2617a8d39))
+
 ## [0.4.0](https://github.com/dcc-mcp/dcc-mcp-gimp/compare/v0.3.0...v0.4.0) (2026-08-24)
 
 
