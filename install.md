@@ -31,7 +31,7 @@ before creating or changing a profile.
 | --- | --- |
 | GIMP | 3.x |
 | Python | 3.9+ |
-| `dcc-mcp-core` | 0.19.38 or newer, below 1.0 |
+| `dcc-mcp-core` | 0.19.91 or newer, below 1.0 |
 
 When `--python` is omitted, the installer checks for a Python executable next
 to GIMP and then falls back to the interpreter running the CLI. Set
@@ -100,6 +100,11 @@ Restart GIMP so it discovers the plug-in, invoke the registered persistent
 dcc-mcp-gimp
 ```
 
+The pinned 3.0.8-1 AppImage CI job verifies the official download checksum,
+host version command, packaged plug-in syntax, and executable bit. It does not load or register the plug-in, invoke the persistent procedure, start the
+bridge, or prove live readiness. Those remain explicit real-host acceptance
+boundaries.
+
 The plug-in and adapter authenticate through
 `~/.dcc-mcp/gimp-bridge-token`. Never copy that token into commands, logs, or
 issue reports.
@@ -116,7 +121,9 @@ Verification checks, in order:
 
 1. The installed file manifest and version against the receipt and wheel.
 2. Importability and version in the selected adapter interpreter.
-3. Live readiness through the shared `gimp_session__get_status` probe.
+3. Live readiness through the shared `gimp_session__get_status` probe, bound
+   to the exact adapter instance, GIMP PID/start identity and executable,
+   receipted plug-in module, version, and authenticated bridge endpoint.
 
 Only `verify.directly_usable: true` proves the adapter is ready. A failed
 report includes `failure_stage`, `failure_reason`, and structured

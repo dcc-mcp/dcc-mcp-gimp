@@ -54,6 +54,9 @@ def test_runtime_authenticated_server_round_trip(runtime):
         assert result["gimp_version"] == "3.0-test"
         assert result["command_count"] == 16
         assert result["authenticated"] is True
+        assert result["gimp_pid"] > 0
+        assert result["plugin_pid"] > 0
+        assert Path(result["plugin_module_path"]).resolve() == PLUGIN.resolve()
     finally:
         server.shutdown()
         server.server_close()
