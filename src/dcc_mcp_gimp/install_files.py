@@ -201,6 +201,11 @@ def _cleanup_tree(path: Path) -> dict[str, Any]:
     return result if isinstance(result, dict) else {"success": False, "requires_restart": False}
 
 
+def _path_mode(path: Path) -> int:
+    """Return a non-following mode on every supported Python, including 3.9."""
+    return stat.S_IMODE(os.stat(path, follow_symlinks=False).st_mode)
+
+
 def _recovery_manifest(root: Path) -> dict[str, Any]:
     """Describe recovery bytes and POSIX modes without following links."""
     try:
@@ -211,20 +216,18 @@ def _recovery_manifest(root: Path) -> dict[str, Any]:
         if total > _MAX_SNAPSHOT_BYTES:
             raise InstallFailure(EXIT_INSTALL, "recovery", "Managed recovery is too large")
         return {
-            "root_mode": stat.S_IMODE(root.stat(follow_symlinks=False).st_mode),
+            "root_mode": _path_mode(root),
             "directories": [
                 {
                     "path": relative,
-                    "mode": stat.S_IMODE((root / relative).stat(follow_symlinks=False).st_mode),
+                    "mode": _path_mode(root / relative),
                 }
                 for relative in directories
             ],
             "files": [
                 {
                     **record,
-                    "mode": stat.S_IMODE(
-                        (root / str(record["path"])).stat(follow_symlinks=False).st_mode
-                    ),
+                    "mode": _path_mode(root / str(record["path"])),
                 }
                 for record in files
             ],
@@ -483,11 +486,7 @@ def _begin_replace_plugin(root: Path, report: Mapping[str, Any]) -> InstallTrans
     backup = root / (".%s.%s.backup" % (_PLUGIN_NAME, uuid.uuid4().hex))
     receipt_path = _receipt_path()
     old_receipt = receipt_path.read_bytes() if receipt_path.is_file() else None
-    old_receipt_mode = (
-        stat.S_IMODE(receipt_path.stat(follow_symlinks=False).st_mode)
-        if receipt_path.is_file()
-        else None
-    )
+    old_receipt_mode = _path_mode(receipt_path) if receipt_path.is_file() else None
     previous_manifest = _recovery_manifest(target) if target.is_dir() else None
     transaction = InstallTransaction(
         root=root,
@@ -560,8 +559,7 @@ def _capture_owned_bytes(
 ) -> OwnedSnapshot:
     ownership = receipt["ownership"]
     directory_modes = {
-        str(relative): stat.S_IMODE((target / str(relative)).stat(follow_symlinks=False).st_mode)
-        for relative in ownership["directories"]
+        str(relative): _path_mode(target / str(relative)) for relative in ownership["directories"]
     }
     files: dict[str, bytes] = {}
     file_modes: dict[str, int] = {}
@@ -572,19 +570,19 @@ def _capture_owned_bytes(
         data = path.read_bytes()
         total += len(data)
         files[relative] = data
-        file_modes[relative] = stat.S_IMODE(path.stat(follow_symlinks=False).st_mode)
+        file_modes[relative] = _path_mode(path)
     receipt_bytes = receipt_path.read_bytes()
     if total > _MAX_SNAPSHOT_BYTES:
         raise InstallFailure(
             EXIT_INSTALL, "uninstall", "Managed install is too large for bounded rollback"
         )
     return OwnedSnapshot(
-        root_mode=stat.S_IMODE(target.stat(follow_symlinks=False).st_mode),
+        root_mode=_path_mode(target),
         directory_modes=directory_modes,
         files=files,
         file_modes=file_modes,
         receipt_bytes=receipt_bytes,
-        receipt_mode=stat.S_IMODE(receipt_path.stat(follow_symlinks=False).st_mode),
+        receipt_mode=_path_mode(receipt_path),
     )
 
 
@@ -656,8 +654,7 @@ def _execute_uninstall(report: dict[str, Any]) -> tuple[dict[str, Any], int]:
         if (
             _recovery_manifest(snapshot_target) != snapshot_manifest
             or snapshot_receipt.read_bytes() != owned_snapshot.receipt_bytes
-            or stat.S_IMODE(snapshot_receipt.stat(follow_symlinks=False).st_mode)
-            != owned_snapshot.receipt_mode
+            or _path_mode(snapshot_receipt) != owned_snapshot.receipt_mode
         ):
             raise InstallFailure(EXIT_INSTALL, "uninstall", "Uninstall recovery validation failed")
         _replace_path(target, quarantine_target)
