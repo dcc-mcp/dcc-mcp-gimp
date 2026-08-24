@@ -72,7 +72,9 @@ The JSON report uses schema version `1`. Exit codes are stable:
 
 Exit `50` after a first install means the staged files and receipt were
 committed, but live readiness still requires the host steps in
-`next_steps[]`. Do not treat installed files alone as usable.
+`next_steps[]`. Those steps launch a new selected GIMP instance, start the
+adapter with the exact selected Python interpreter, and run the context-bound
+verification command. Do not treat installed files alone as usable.
 
 ## Manual path
 
@@ -93,17 +95,21 @@ Windows and `:` on macOS or Linux:
 export DCC_MCP_GIMP_ALLOWED_ROOTS=/absolute/project/root
 ```
 
-Restart GIMP so it discovers the plug-in, invoke the registered persistent
-`python-fu-dcc-mcp-gimp-bridge` procedure, and start the adapter:
+Restart GIMP so it discovers the plug-in. The registered no-argument
+`python-fu-dcc-mcp-gimp-bridge` persistent procedure starts automatically.
+Use the exact commands returned in `next_steps[]`; they start a new selected
+host instance, start the adapter with the selected Python, and then verify it.
+The adapter command has this form:
 
 ```bash
 dcc-mcp-gimp
 ```
 
 The pinned 3.0.8-1 AppImage CI job verifies the official download checksum,
-host version command, packaged plug-in syntax, and executable bit. It does not load or register the plug-in, invoke the persistent procedure, start the
-bridge, or prove live readiness. Those remain explicit real-host acceptance
-boundaries.
+host version, packaged plug-in syntax, and executable bit.
+It does not load or register the plug-in. It does not exercise automatic
+persistent-procedure startup, start the bridge, or prove live readiness. Those
+remain explicit real-host acceptance boundaries.
 
 The plug-in and adapter authenticate through
 `~/.dcc-mcp/gimp-bridge-token`. Never copy that token into commands, logs, or
@@ -111,7 +117,8 @@ issue reports.
 
 ## Verify
 
-With GIMP, the persistent bridge procedure, and the adapter running:
+With GIMP, its automatically started persistent bridge, and the adapter
+running:
 
 ```bash
 dcc-mcp-gimp verify --json --dcc-path /path/to/gimp-3.0 --python /path/to/python
@@ -158,7 +165,8 @@ dcc-mcp-gimp uninstall --yes --json --dcc-path /path/to/gimp-3.0 --python /path/
 ```
 
 Uninstall refuses to remove an unreceipted plug-in and preserves unrelated
-files in the GIMP profile. Run `install --yes` first to repair ownership.
+files in the GIMP profile. Its validated recovery preserves owned bytes and
+POSIX modes if cleanup fails. Run `install --yes` first to repair ownership.
 
 ## Troubleshooting
 
@@ -196,7 +204,9 @@ captured error without exposing bridge credentials.
 
 ### Installed but not usable
 
-Start GIMP, invoke `python-fu-dcc-mcp-gimp-bridge`, start `dcc-mcp-gimp`, and
-run `verify --json` again. Inspect `verify.failure_stage`: `artifact` indicates
-files/receipt, `import` indicates the selected Python, and `readiness`
-indicates the live host/bridge/adapter path.
+Follow the returned commands to start a new selected GIMP instance, allow its
+no-argument persistent bridge to start automatically, start the adapter with
+the selected Python, and run `verify --json` again. Inspect
+`verify.failure_stage`: `artifact` indicates files/receipt, `import` indicates
+the selected Python, and `readiness` indicates the live host/bridge/adapter
+path.

@@ -47,10 +47,11 @@ explicit token may instead be supplied through `DCC_MCP_GIMP_BRIDGE_TOKEN` and
 must contain at least 32 characters. Token values are never returned by status
 or diagnostics.
 
-Restart GIMP after installation, then invoke the registered persistent
-`python-fu-dcc-mcp-gimp-bridge` procedure. The MCP endpoint defaults to
-`http://127.0.0.1:8767/mcp`; the plug-in bridge defaults to
-`127.0.0.1:3848`.
+Restart GIMP after installation. Its no-argument persistent
+`python-fu-dcc-mcp-gimp-bridge` procedure starts automatically. Follow the
+machine-executable `next_steps` to start the adapter with the selected Python
+and verify the exact host instance. The MCP endpoint defaults to
+`http://127.0.0.1:8767/mcp`; the plug-in bridge defaults to `127.0.0.1:3848`.
 
 ## Typed capabilities
 

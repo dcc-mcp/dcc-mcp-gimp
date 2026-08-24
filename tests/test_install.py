@@ -80,6 +80,7 @@ def lifecycle_env(tmp_path, monkeypatch):
                             "ready": True,
                             "authenticated": True,
                             "gimp_pid": 4242,
+                            "gimp_start_identity": "test-start-4242",
                             "plugin_pid": 4343,
                             "gimp_version": "3.0.8",
                             "adapter_version": __version__,
@@ -302,6 +303,38 @@ def test_standard_entrypoint_dispatches_lifecycle_verbs_without_starting_server(
     payload = json.loads(capsys.readouterr().out)
     assert raised.value.code == 10
     assert payload["dcc_type"] == "gimp"
+    assert payload["verb"] == "status"
+    assert payload["verify"]["failure_stage"] == "gimp"
+
+
+def test_exact_interpreter_module_entrypoint_dispatches_lifecycle_verbs(tmp_path):
+    repository = Path(__file__).resolve().parents[1]
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(repository / "src")
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "dcc_mcp_gimp",
+            "status",
+            "--json",
+            "--dcc-path",
+            str(tmp_path / "missing-gimp"),
+            "--python",
+            sys.executable,
+            "--destination",
+            str(tmp_path / "plugins"),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+        env=environment,
+    )
+
+    assert completed.returncode == 10, completed.stderr
+    payload = json.loads(completed.stdout)
     assert payload["verb"] == "status"
     assert payload["verify"]["failure_stage"] == "gimp"
 
@@ -548,14 +581,17 @@ def test_install_returns_executable_next_steps_until_live_readiness(lifecycle_en
         bool(step.get("command")) ^ bool(step.get("file_edit")) for step in report["next_steps"]
     )
     commands = [step["command"] for step in report["next_steps"] if "command" in step]
-    assert ["dcc-mcp-gimp"] not in commands
     assert not any("<" in token or ">" in token for command in commands for token in command)
-    verify_command = next(command for command in commands if "verify" in command)
+    selected_python = str(Path(sys.executable).resolve())
+    assert commands[0] == [str(lifecycle_env.host.resolve()), "--new-instance"]
+    assert commands[1] == [selected_python, "-m", "dcc_mcp_gimp"]
+    verify_command = commands[2]
+    assert verify_command[:5] == [selected_python, "-m", "dcc_mcp_gimp", "verify", "--json"]
     for value in (
         "--dcc-path",
         str(lifecycle_env.host.resolve()),
         "--python",
-        str(Path(sys.executable).resolve()),
+        selected_python,
         "--destination",
         str(lifecycle_env.plugins.resolve()),
     ):
@@ -839,3 +875,143 @@ def test_verify_rejects_pid_reuse_during_identity_check(lifecycle_env, monkeypat
     assert code == 40
     assert report["verify"]["failure_stage"] == "readiness_identity"
     assert "start identity" in report["verify"]["failure_reason"]
+
+
+def test_verify_rejects_parent_start_identity_captured_before_pid_reuse(lifecycle_env, monkeypatch):
+    from dcc_mcp_gimp.install import run
+
+    installed, code, _ = run(["install", "--yes", *lifecycle_env.common])
+    assert code == 0, installed
+    monkeypatch.setattr(
+        "dcc_mcp_gimp.install_lifecycle.wait_for_sidecar_ready",
+        lambda *_args, **_kwargs: {
+            "success": True,
+            "entry": {
+                "instance_id": "gimp-test-4242",
+                "adapter_version": __version__,
+                "mcp_url": "http://127.0.0.1:18812/mcp",
+            },
+            "probe": {
+                "result": {
+                    "structuredContent": {
+                        "success": True,
+                        "context": {
+                            "ready": True,
+                            "authenticated": True,
+                            "gimp_pid": 4242,
+                            "gimp_start_identity": "reused-before-verification",
+                            "plugin_pid": 4343,
+                            "gimp_version": "3.0.8",
+                            "adapter_version": __version__,
+                            "bridge_host": "127.0.0.1",
+                            "bridge_port": 3848,
+                            "plugin_module_path": str(
+                                (
+                                    lifecycle_env.plugins / "dcc_mcp_gimp" / "dcc_mcp_gimp.py"
+                                ).resolve()
+                            ),
+                        },
+                    }
+                }
+            },
+        },
+    )
+
+    report, code, _ = run(["verify", *lifecycle_env.common])
+
+    assert code == 40
+    assert report["verify"]["failure_stage"] == "readiness_identity"
+    assert "captured start identity" in report["verify"]["failure_reason"]
+
+
+def test_partial_verified_backup_cleanup_restores_from_validated_recovery(
+    lifecycle_env, monkeypatch
+):
+    from dcc_mcp_gimp import install_files
+    from dcc_mcp_gimp.install import _files_manifest, _manifest_digest, run
+
+    installed, code, _ = run(["install", "--yes", *lifecycle_env.common])
+    assert code == 0, installed
+    target = lifecycle_env.plugins / "dcc_mcp_gimp"
+    script = target / "dcc_mcp_gimp.py"
+    script.write_text(
+        script.read_text(encoding="utf-8").replace(
+            'VERSION = "%s"' % __version__, 'VERSION = "0.3.9"', 1
+        ),
+        encoding="utf-8",
+    )
+    receipt_path = lifecycle_env.root / ".dcc-mcp" / "receipts" / "gimp.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["adapter_version"] = "0.3.9"
+    receipt["files"] = _files_manifest(target)
+    receipt["ownership"]["files"] = receipt["files"]
+    receipt["package_digest"] = _manifest_digest(receipt["files"])
+    receipt_path.write_text(json.dumps(receipt, sort_keys=True), encoding="utf-8")
+    prior_files = {
+        path.relative_to(target).as_posix(): path.read_bytes()
+        for path in target.rglob("*")
+        if path.is_file()
+    }
+    prior_receipt = receipt_path.read_bytes()
+    original_cleanup = install_files._cleanup_tree
+    injected = False
+
+    def partially_remove_backup(path):
+        nonlocal injected
+        candidate = Path(path)
+        if not injected and candidate.name.endswith(".backup"):
+            injected = True
+            victim = next(candidate.rglob("*.py"))
+            victim.unlink()
+            return {"success": False, "requires_restart": False, "message": "injected"}
+        return original_cleanup(candidate)
+
+    monkeypatch.setattr(install_files, "_cleanup_tree", partially_remove_backup)
+
+    report, code, _ = run(["upgrade", "--yes", *lifecycle_env.common])
+
+    assert code == 30, report
+    assert injected is True
+    assert {
+        path.relative_to(target).as_posix(): path.read_bytes()
+        for path in target.rglob("*")
+        if path.is_file()
+    } == prior_files
+    assert receipt_path.read_bytes() == prior_receipt
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX mode preservation contract")
+def test_failed_uninstall_rollback_preserves_posix_modes(lifecycle_env, monkeypatch):
+    import stat
+
+    from dcc_mcp_gimp import install_files
+    from dcc_mcp_gimp.install import run
+
+    installed, code, _ = run(["install", "--yes", *lifecycle_env.common])
+    assert code == 0, installed
+    target = lifecycle_env.plugins / "dcc_mcp_gimp"
+    script = target / "dcc_mcp_gimp.py"
+    receipt_path = lifecycle_env.root / ".dcc-mcp" / "receipts" / "gimp.json"
+    target.chmod(0o711)
+    script.chmod(0o751)
+    receipt_path.chmod(0o640)
+    original_cleanup = install_files._cleanup_tree
+    injected = False
+
+    def fail_after_partial_quarantine_cleanup(path):
+        nonlocal injected
+        candidate = Path(path)
+        if not injected and candidate.name == "quarantine":
+            injected = True
+            next(candidate.rglob("*.py")).unlink()
+            return {"success": False, "requires_restart": False, "message": "injected"}
+        return original_cleanup(candidate)
+
+    monkeypatch.setattr(install_files, "_cleanup_tree", fail_after_partial_quarantine_cleanup)
+
+    report, code, _ = run(["uninstall", "--yes", *lifecycle_env.common])
+
+    assert code == 30, report
+    assert stat.S_IMODE(target.stat().st_mode) == 0o711
+    assert stat.S_IMODE(script.stat().st_mode) == 0o751
+    assert stat.S_IMODE(receipt_path.stat().st_mode) == 0o640

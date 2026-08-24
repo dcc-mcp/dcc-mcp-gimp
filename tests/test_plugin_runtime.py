@@ -43,6 +43,8 @@ def runtime(monkeypatch):
 
 
 def test_runtime_authenticated_server_round_trip(runtime):
+    from dcc_mcp_gimp.install_host import _process_start_identity
+
     runtime["_execute_command"].__globals__["_bridge_token"] = "x" * 32
     server = runtime["_Server"](("127.0.0.1", 0), runtime["_Handler"])
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -55,6 +57,9 @@ def test_runtime_authenticated_server_round_trip(runtime):
         assert result["command_count"] == 16
         assert result["authenticated"] is True
         assert result["gimp_pid"] > 0
+        assert isinstance(result["gimp_start_identity"], str)
+        assert result["gimp_start_identity"]
+        assert result["gimp_start_identity"] == _process_start_identity(result["gimp_pid"])
         assert result["plugin_pid"] > 0
         assert Path(result["plugin_module_path"]).resolve() == PLUGIN.resolve()
     finally:

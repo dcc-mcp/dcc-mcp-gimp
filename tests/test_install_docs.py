@@ -23,6 +23,8 @@ def test_install_sop_documents_the_public_agent_contract():
     for flag in ("--json", "--yes", "--dry-run", "--dcc-path", "--python"):
         assert flag in guide
     assert "https://raw.githubusercontent.com/dcc-mcp/dcc-mcp-gimp/main/install.md" in guide
+    assert "no-argument" in guide and "starts automatically" in guide
+    assert "invoke `python-fu-dcc-mcp-gimp-bridge`" not in guide
 
 
 def test_pinned_appimage_job_states_its_actual_boundary():
