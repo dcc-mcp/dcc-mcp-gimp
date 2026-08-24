@@ -8,6 +8,8 @@ import sys
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
+import dcc_mcp_core
+
 from .__version__ import __version__
 from .install_contract import (
     _VERBS,
@@ -31,8 +33,8 @@ from .install_contract import (
     RECEIPT_RELATIVE_PATH as RECEIPT_RELATIVE_PATH,
 )
 from .install_files import (
+    _begin_replace_plugin,
     _execute_uninstall,
-    _replace_plugin,
     install,
 )
 from .install_files import (
@@ -60,6 +62,8 @@ def _parser() -> argparse.ArgumentParser:
         command.add_argument("--yes", action="store_true")
         command.add_argument("--dry-run", action="store_true")
         command.add_argument("--ready-timeout", type=float, default=0.0, help=argparse.SUPPRESS)
+        command.add_argument("--instance-id", help=argparse.SUPPRESS)
+        command.add_argument("--host-pid", type=int, help=argparse.SUPPRESS)
     return parser
 
 
@@ -83,10 +87,8 @@ def run(argv: Sequence[str]) -> tuple[dict[str, Any], int, bool]:
                 "dcc_type": "gimp",
                 "verb": args.verb,
                 "adapter_version": __version__,
-                "core_version": None,
-                "steps": [
-                    {"id": failure.stage, "status": "failed", "reason": failure.reason}
-                ],
+                "core_version": str(getattr(dcc_mcp_core, "__version__", "unknown")),
+                "steps": [{"id": failure.stage, "status": "failed", "reason": failure.reason}],
                 "next_steps": [],
                 "receipt_path": None,
                 "verify": _failure_verification(failure),
@@ -95,9 +97,17 @@ def run(argv: Sequence[str]) -> tuple[dict[str, Any], int, bool]:
             args.as_json,
         )
     if args.verb == "status":
-        report["status"] = report["installation_state"]
+        report["status"] = (
+            "ok" if report["installation_state"] in {"fresh", "current"} else "partial"
+        )
         report["steps"][-1]["status"] = report["status"]
-        code = EXIT_OK if report["status"] in {"fresh", "current"} else EXIT_VERIFY
+        if report["status"] == "partial":
+            report["verify"] = {
+                "directly_usable": False,
+                "failure_stage": "receipt",
+                "failure_reason": "GIMP installation is %s" % report["installation_state"],
+            }
+        code = EXIT_OK if report["status"] == "ok" else EXIT_VERIFY
         return report, code, args.as_json
     if args.verb in {"install", "upgrade"}:
         if args.dry_run or not args.yes:
@@ -106,8 +116,10 @@ def run(argv: Sequence[str]) -> tuple[dict[str, Any], int, bool]:
             failure = InstallFailure(EXIT_PREFLIGHT, "upgrade", "Nothing is installed; use install")
             report.update(status="failed", verify=_failure_verification(failure))
             return report, failure.exit_code, args.as_json
+        transaction = None
         try:
-            target = _replace_plugin(Path(report["destination"]), report)
+            transaction = _begin_replace_plugin(Path(report["destination"]), report)
+            target = transaction.target
             report["steps"][-1] = {
                 "id": args.verb,
                 "status": "ok",
@@ -117,22 +129,34 @@ def run(argv: Sequence[str]) -> tuple[dict[str, Any], int, bool]:
                 Path(report["destination"]),
                 Path(report["python"]),
                 args.ready_timeout,
+                Path(report["dcc_path"]),
+                report["gimp_version"],
+                instance_id=args.instance_id,
+                host_pid=args.host_pid,
             )
         except InstallFailure as failure:
+            if transaction is not None and not transaction.closed:
+                transaction.rollback()
             report["status"] = (
-                "requires_restart"
-                if failure.exit_code == EXIT_REQUIRES_RESTART
-                else "failed"
+                "requires_restart" if failure.exit_code == EXIT_REQUIRES_RESTART else "failed"
             )
             report["verify"] = _failure_verification(failure)
             return report, failure.exit_code, args.as_json
         if report["verify"]["directly_usable"]:
+            transaction.commit()
             report["status"] = "ok"
             return report, EXIT_OK, args.as_json
         report["next_steps"] = _next_steps(report)
-        if report["verify"]["failure_stage"] == "readiness":
+        if transaction.previous_moved:
+            transaction.rollback()
+            report["status"] = "failed"
+            report["previous_install_restored"] = True
+            return report, EXIT_VERIFY, args.as_json
+        if report["verify"]["failure_stage"] in {"readiness", "readiness_identity"}:
+            transaction.commit()
             report["status"] = "requires_restart"
             return report, EXIT_REQUIRES_RESTART, args.as_json
+        transaction.rollback()
         report["status"] = "failed"
         return report, EXIT_VERIFY, args.as_json
     if args.verb == "uninstall":
@@ -142,9 +166,7 @@ def run(argv: Sequence[str]) -> tuple[dict[str, Any], int, bool]:
             report, code = _execute_uninstall(report)
         except InstallFailure as failure:
             report["status"] = (
-                "requires_restart"
-                if failure.exit_code == EXIT_REQUIRES_RESTART
-                else "failed"
+                "requires_restart" if failure.exit_code == EXIT_REQUIRES_RESTART else "failed"
             )
             report["verify"] = _failure_verification(failure)
             return report, failure.exit_code, args.as_json
@@ -154,6 +176,10 @@ def run(argv: Sequence[str]) -> tuple[dict[str, Any], int, bool]:
             Path(report["destination"]),
             Path(report["python"]),
             args.ready_timeout,
+            Path(report["dcc_path"]),
+            report["gimp_version"],
+            instance_id=args.instance_id,
+            host_pid=args.host_pid,
         )
         report["status"] = "ok" if report["verify"]["directly_usable"] else "failed"
         if report["status"] == "failed":

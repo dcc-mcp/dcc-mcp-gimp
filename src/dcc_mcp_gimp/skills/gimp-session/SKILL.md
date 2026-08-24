@@ -5,7 +5,7 @@ description: >-
   persistent plug-in bridge. Use for image/layer lifecycle, solid-color layers,
   XCF saves, deterministic exports, validation, and safe bridge-owned cleanup.
 license: MIT
-compatibility: "GIMP 3.0+; dcc-mcp-core 0.19+"
+compatibility: "GIMP 3.0+; dcc-mcp-core 0.19.91+"
 allowed-tools: "python"
 metadata:
   dcc-mcp:

@@ -4,23 +4,24 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
-from dcc_mcp_core.install_lifecycle import wait_for_sidecar_ready
+from dcc_mcp_core.install_lifecycle import query_runtime_state, wait_for_sidecar_ready
 
 from .__version__ import __version__
-from .install_contract import _PLUGIN_NAME, SCHEMA_VERSION
+from .install_contract import _PLUGIN_NAME, SCHEMA_VERSION, InstallFailure, _version_tuple
 from .install_files import (
-    _files_manifest,
     _installation_state,
-    _manifest_digest,
     _plugin_version,
     _read_receipt,
     _receipt_path,
+    _validate_owned_install,
 )
 from .install_host import (
     _bootstrap_error_summary,
     _gimp_version,
+    _process_executable_path,
+    _process_start_identity,
     _python_import_check,
     _resolve_gimp,
     _resolve_python,
@@ -28,8 +29,110 @@ from .install_host import (
     default_plugin_dir,
 )
 
+_READINESS_TOOL = "gimp_session__get_status"
 
-def verify_install(destination: Path, python: Path, timeout: float) -> dict[str, Any]:
+
+def _same_path(left: Path, right: Path) -> bool:
+    return os.path.normcase(str(left.resolve())) == os.path.normcase(str(right.resolve()))
+
+
+def _probe_context(readiness: Mapping[str, Any]) -> Optional[dict[str, Any]]:
+    probe = readiness.get("probe")
+    result = probe.get("result") if isinstance(probe, dict) else None
+    if not isinstance(result, dict):
+        return None
+    structured = result.get("structuredContent")
+    if structured is None:
+        structured = result.get("structured_content")
+    if not isinstance(structured, dict) or structured.get("success") is not True:
+        return None
+    context = structured.get("context")
+    return context if isinstance(context, dict) else None
+
+
+def _entry_adapter_version(entry: Mapping[str, Any]) -> object:
+    metadata = entry.get("metadata") if isinstance(entry.get("metadata"), dict) else {}
+    return entry.get("adapter_version") or metadata.get("adapter_version")
+
+
+def _runtime_identity_failure(
+    readiness: Mapping[str, Any],
+    *,
+    target: Path,
+    dcc_path: Path,
+    gimp_version: str,
+    instance_id: Optional[str],
+    host_pid: Optional[int],
+) -> Optional[str]:
+    entry = readiness.get("entry")
+    if not isinstance(entry, dict):
+        return "Ready response did not identify one GIMP adapter instance"
+    actual_instance = entry.get("instance_id")
+    if not isinstance(actual_instance, str) or not actual_instance.strip():
+        return "Ready response omitted the GIMP adapter instance id"
+    if instance_id is not None and actual_instance != instance_id:
+        return "Ready response belongs to a different GIMP adapter instance"
+    entry_adapter = _entry_adapter_version(entry)
+    if entry_adapter is not None and entry_adapter != __version__:
+        return "Ready response adapter version differs from this installation"
+
+    context = _probe_context(readiness)
+    if context is None:
+        return "Ready response omitted the authenticated GIMP structured payload"
+    if context.get("ready") is not True or context.get("authenticated") is not True:
+        return "GIMP bridge payload is not ready and authenticated"
+    if context.get("adapter_version") != __version__:
+        return "GIMP bridge adapter version differs from this installation"
+    if (
+        _version_tuple(context.get("gimp_version")) is None
+        or context.get("gimp_version") != gimp_version
+    ):
+        return "GIMP bridge version differs from the selected installation"
+    try:
+        actual_host_pid = int(context.get("gimp_pid"))
+        plugin_pid = int(context.get("plugin_pid"))
+        bridge_port = int(context.get("bridge_port"))
+    except (TypeError, ValueError):
+        return "GIMP bridge payload omitted its bounded process or endpoint identity"
+    if actual_host_pid <= 0 or plugin_pid <= 0 or bridge_port not in range(1, 65536):
+        return "GIMP bridge payload contains an invalid process or endpoint identity"
+    if host_pid is not None and actual_host_pid != host_pid:
+        return "GIMP bridge belongs to a different GIMP host PID"
+    expected_host = os.environ.get("DCC_MCP_GIMP_BRIDGE_HOST", "127.0.0.1")
+    try:
+        expected_port = int(os.environ.get("DCC_MCP_GIMP_BRIDGE_PORT", "3848"))
+    except ValueError:
+        return "Configured GIMP bridge port is invalid"
+    if context.get("bridge_host") != expected_host or bridge_port != expected_port:
+        return "GIMP bridge endpoint differs from the configured adapter endpoint"
+    module_value = context.get("plugin_module_path")
+    if not isinstance(module_value, str) or not module_value:
+        return "GIMP bridge payload omitted the installed plug-in module path"
+    try:
+        if not _same_path(Path(module_value), target / ("%s.py" % _PLUGIN_NAME)):
+            return "GIMP bridge module does not belong to the receipted installation"
+    except OSError:
+        return "GIMP bridge module path is invalid"
+    before = _process_start_identity(actual_host_pid)
+    process_path = _process_executable_path(actual_host_pid)
+    after = _process_start_identity(actual_host_pid)
+    if process_path is None or not _same_path(process_path, dcc_path):
+        return "Ready GIMP process path differs from the selected executable"
+    if before is None or before != after:
+        return "Ready GIMP process start identity is unavailable or changed"
+    return None
+
+
+def verify_install(
+    destination: Path,
+    python: Path,
+    timeout: float,
+    dcc_path: Path,
+    gimp_version: str,
+    *,
+    instance_id: Optional[str] = None,
+    host_pid: Optional[int] = None,
+) -> dict[str, Any]:
     target = destination / _PLUGIN_NAME
     receipt = _read_receipt()
     result: dict[str, Any] = {
@@ -43,77 +146,148 @@ def verify_install(destination: Path, python: Path, timeout: float) -> dict[str,
     if receipt is None or not target.is_dir():
         result.update(failure_stage="artifact", failure_reason="Plug-in or receipt is missing")
         return result
-    if (
-        Path(str(receipt.get("destination", ""))).resolve() != destination.resolve()
-        or Path(str(receipt.get("plugin_path", ""))).resolve() != target.resolve()
-    ):
-        result.update(
-            failure_stage="artifact",
-            failure_reason="Receipt path does not match profile",
-        )
+    try:
+        _validate_owned_install(destination, target, _receipt_path(), receipt)
+    except InstallFailure as exc:
+        result.update(failure_stage="artifact", failure_reason=str(exc))
         return result
-    files = _files_manifest(target)
-    actual_digest = _manifest_digest(files)
-    expected_digest = receipt.get("package_digest")
     installed_version = _plugin_version(target / ("%s.py" % _PLUGIN_NAME))
     result["artifact"] = {
-        "success": actual_digest == expected_digest and installed_version == __version__,
-        "expected_sha256": expected_digest,
-        "actual_sha256": actual_digest,
+        "success": installed_version == __version__,
         "installed_adapter_version": installed_version,
         "expected_adapter_version": __version__,
     }
     if not result["artifact"]["success"]:
         result.update(
-            failure_stage="artifact",
-            failure_reason="Plug-in differs from receipt or wheel",
+            failure_stage="artifact", failure_reason="Plug-in version differs from the wheel"
         )
         return result
     result["import"] = _python_import_check(python)
     if not result["import"].get("success"):
         result.update(failure_stage="import", failure_reason=result["import"].get("reason"))
         return result
-    readiness = wait_for_sidecar_ready(
+    expected_origins = {
+        "adapter_module_path": result["import"].get("adapter_module_path"),
+        "core_module_path": result["import"].get("core_module_path"),
+    }
+    if any(receipt.get(key) != value for key, value in expected_origins.items()):
+        result.update(
+            failure_stage="import",
+            failure_reason="Target interpreter module origins differ from the install receipt",
+        )
+        return result
+
+    errors = _bootstrap_error_summary()
+    latest = errors.get("latest")
+    installed_at = receipt.get("installed_at")
+    if (
+        isinstance(latest, dict)
+        and isinstance(latest.get("timestamp"), str)
+        and isinstance(installed_at, str)
+        and latest["timestamp"] >= installed_at
+    ):
+        result.update(
+            failure_stage="bootstrap",
+            failure_reason="GIMP recorded a plug-in bootstrap failure; inspect the doctor report",
+        )
+        return result
+    runtime = query_runtime_state(
+        os.environ.get("DCC_MCP_REGISTRY_DIR"),
         dcc_type="gimp",
-        timeout_secs=max(0.0, timeout),
-        probe_tool="gimp_session__get_status",
+        include_dead=False,
+    )
+    entries = [
+        entry
+        for entry in runtime.get("entries", [])
+        if isinstance(entry, dict) and entry.get("mcp_url")
+    ]
+    if instance_id is not None:
+        entries = [entry for entry in entries if entry.get("instance_id") == instance_id]
+    if len(entries) != 1:
+        reason = (
+            "No live GIMP adapter is registered"
+            if not entries
+            else "Multiple live GIMP adapters are registered"
+        )
+        result.update(failure_stage="readiness", failure_reason=reason)
+        return result
+    selected_instance = entries[0].get("instance_id")
+    if not isinstance(selected_instance, str) or not selected_instance.strip():
+        result.update(
+            failure_stage="readiness_identity",
+            failure_reason="Selected GIMP registry entry omitted its instance id",
+        )
+        return result
+    readiness = wait_for_sidecar_ready(
+        os.environ.get("DCC_MCP_REGISTRY_DIR"),
+        dcc_type="gimp",
+        instance_id=selected_instance,
+        timeout_secs=max(0.05, timeout),
+        poll_interval_secs=min(max(0.05, timeout), 0.1),
+        probe_tool=_READINESS_TOOL,
+        probe_timeout_secs=max(0.05, timeout),
     )
     result["readiness"] = readiness
     if not readiness.get("success"):
         result.update(
             failure_stage="readiness",
-            failure_reason=readiness.get("message", "GIMP adapter is not ready"),
+            failure_reason=readiness.get("message", "Typed GIMP readiness probe failed"),
         )
+        return result
+    failure = _runtime_identity_failure(
+        readiness,
+        target=target,
+        dcc_path=dcc_path,
+        gimp_version=gimp_version,
+        instance_id=selected_instance,
+        host_pid=host_pid,
+    )
+    if failure is not None:
+        result.update(failure_stage="readiness_identity", failure_reason=failure)
         return result
     result["directly_usable"] = True
     return result
 
 
 def _next_steps(report: dict[str, Any]) -> list[dict[str, Any]]:
+    launch = [str(report["dcc_path"])]
+    if str(report["dcc_path"]).lower().endswith(".appimage"):
+        launch.append("--appimage-extract-and-run")
+    verify = [
+        "dcc-mcp-gimp",
+        "verify",
+        "--json",
+        "--dcc-path",
+        str(report["dcc_path"]),
+        "--python",
+        str(report["python"]),
+        "--destination",
+        str(report["destination"]),
+    ]
+    if report.get("instance_id"):
+        verify.extend(("--instance-id", str(report["instance_id"])))
+    if report.get("host_pid"):
+        verify.extend(("--host-pid", str(report["host_pid"])))
     return [
         {
-            "id": "restart-gimp",
+            "id": "start-selected-gimp",
             "description": (
-                "Restart GIMP 3, then invoke the registered "
+                "Start the selected GIMP build, then invoke its registered "
                 "python-fu-dcc-mcp-gimp-bridge persistent procedure."
             ),
-            "command": [report.get("dcc_path") or "gimp-3.0"],
+            "command": launch,
             "why": (
-                "GIMP discovers Python plug-ins during startup and must run the "
-                "persistent procedure to open the authenticated bridge."
+                "GIMP discovers the receipted plug-in at startup; procedure invocation "
+                "remains an explicit host action."
             ),
         },
         {
-            "id": "start-adapter",
-            "description": "Start the DCC-MCP GIMP adapter process.",
-            "command": ["dcc-mcp-gimp"],
-            "why": "The MCP service must connect to the authenticated GIMP bridge.",
-        },
-        {
-            "id": "verify-ready",
-            "description": "Verify installed artifacts, target import, and live readiness.",
-            "command": ["dcc-mcp-gimp", "verify", "--json"],
-            "why": "Installed files alone do not prove the adapter is usable.",
+            "id": "verify-selected-gimp",
+            "description": "Verify the exact selected GIMP instance and authenticated bridge.",
+            "command": verify,
+            "why": (
+                "A typed PID-, origin-, endpoint-, and instance-bound probe is required before use."
+            ),
         },
     ]
 
@@ -130,17 +304,17 @@ def plan(
     gimp_version = _gimp_version(executable)
     versions = _target_versions(python)
     state = _installation_state(root)
-    installed_version = _plugin_version(
-        root / _PLUGIN_NAME / ("%s.py" % _PLUGIN_NAME)
-    )
+    installed_version = _plugin_version(root / _PLUGIN_NAME / ("%s.py" % _PLUGIN_NAME))
     return {
         "schema_version": SCHEMA_VERSION,
         "status": "planned",
         "dcc_type": "gimp",
         "verb": verb,
         "adapter_version": __version__,
-        "core_version": versions.get("dcc-mcp-core"),
-        "target_adapter_version": versions.get("dcc-mcp-gimp"),
+        "core_version": versions["dcc-mcp-core"],
+        "target_adapter_version": versions["dcc-mcp-gimp"],
+        "adapter_module_path": versions["adapter_module_path"],
+        "core_module_path": versions["core_module_path"],
         "installed_adapter_version": installed_version,
         "expected_adapter_version": __version__,
         "gimp_version": gimp_version,
@@ -155,7 +329,7 @@ def plan(
         ],
         "next_steps": [],
         "receipt_path": str(_receipt_path()),
-        "verify": None,
+        "verify": {"directly_usable": False, "failure_stage": None, "failure_reason": None},
     }
 
 

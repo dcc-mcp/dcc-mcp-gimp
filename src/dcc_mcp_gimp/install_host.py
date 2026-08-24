@@ -14,7 +14,12 @@ from typing import Any, Optional
 from .__version__ import __version__
 from .install_contract import EXIT_PREFLIGHT, MIN_CORE_VERSION, InstallFailure, _version_tuple
 
-_GIMP_VERSION_PATTERN = re.compile(r"\b(\d+)\.(\d+)(?:\.(\d+))?\b")
+_GIMP_VERSION_PATTERN = re.compile(
+    r"^(?:GNU Image Manipulation Program version|GIMP) "
+    r"(?P<version>(?:0|[1-9][0-9]{0,5})\.(?:0|[1-9][0-9]{0,5})\.(?:0|[1-9][0-9]{0,5}))$"
+)
+_GIMP_EXECUTABLES = frozenset(("gimp", "gimp.exe", "gimp-3.0", "gimp-3.0.exe"))
+_MAX_PROBE_OUTPUT = 16 * 1024
 
 
 def default_plugin_dir() -> Path:
@@ -80,7 +85,7 @@ def _resolve_python(value: Optional[Path], executable: Path) -> Path:
             Path(sys.executable),
         )
     resolved = configured.expanduser().resolve()
-    if not resolved.is_file():
+    if not resolved.is_file() or resolved.is_symlink() or resolved.stat().st_size <= 0:
         raise InstallFailure(
             EXIT_PREFLIGHT,
             "python",
@@ -118,15 +123,25 @@ def _resolve_gimp(value: Optional[Path]) -> Path:
             resolved / "gimp",
         )
         resolved = next((candidate for candidate in candidates if candidate.is_file()), resolved)
-    if not resolved.is_file():
+    if not resolved.is_file() or resolved.is_symlink() or resolved.stat().st_size <= 0:
         raise InstallFailure(EXIT_PREFLIGHT, "gimp", "GIMP executable not found: %s" % resolved)
+    name = resolved.name.lower()
+    is_appimage = name.endswith(".appimage") and "gimp" in name
+    if name not in _GIMP_EXECUTABLES and not is_appimage:
+        raise InstallFailure(
+            EXIT_PREFLIGHT, "gimp", "--dcc-path must select a canonical GIMP executable"
+        )
     return resolved
 
 
 def _gimp_version(executable: Path) -> str:
+    command = [str(executable)]
+    if executable.name.lower().endswith(".appimage"):
+        command.append("--appimage-extract-and-run")
+    command.append("--version")
     try:
         completed = subprocess.run(
-            [str(executable), "--version"],
+            command,
             capture_output=True,
             text=True,
             timeout=15,
@@ -135,11 +150,16 @@ def _gimp_version(executable: Path) -> str:
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise InstallFailure(EXIT_PREFLIGHT, "gimp_version", str(exc)) from exc
     output = "%s\n%s" % (completed.stdout, completed.stderr)
-    match = _GIMP_VERSION_PATTERN.search(output)
+    if len(output.encode("utf-8", errors="replace")) > _MAX_PROBE_OUTPUT:
+        raise InstallFailure(EXIT_PREFLIGHT, "gimp_version", "GIMP version output is unbounded")
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    matches = [match for line in lines if (match := _GIMP_VERSION_PATTERN.fullmatch(line))]
+    match = matches[0] if len(matches) == 1 else None
     if completed.returncode or match is None:
         raise InstallFailure(EXIT_PREFLIGHT, "gimp_version", "Could not determine GIMP version")
-    version = ".".join(part for part in match.groups() if part is not None)
-    if int(match.group(1)) != 3:
+    version = match.group("version")
+    parsed = _version_tuple(version)
+    if not parsed or parsed[0] != 3:
         raise InstallFailure(
             EXIT_PREFLIGHT,
             "gimp_version",
@@ -149,11 +169,87 @@ def _gimp_version(executable: Path) -> str:
 
 
 def _target_versions(python: Path) -> dict[str, str]:
-    code = (
-        "import importlib.metadata as m, json; "
-        "print(json.dumps({name: m.version(name) for name in "
-        "('dcc-mcp-core', 'dcc-mcp-gimp')}))"
+    code = r"""
+import importlib.metadata as metadata
+import json
+import pathlib
+import sys
+import urllib.parse
+import urllib.request
+
+import dcc_mcp_core
+import dcc_mcp_gimp
+from dcc_mcp_gimp.__version__ import __version__ as adapter_module_version
+
+
+def owned(distribution_name, package_name, module, module_version):
+    distribution = metadata.distribution(distribution_name)
+    module_path = pathlib.Path(module.__file__).resolve()
+    record_paths = {
+        pathlib.Path(distribution.locate_file(item)).resolve()
+        for item in tuple(distribution.files or ())
+    }
+    record_owned = module_path in record_paths
+    editable_root = None
+    try:
+        raw = distribution.read_text("direct_url.json")
+        direct_url = json.loads(raw) if raw else None
+        url = direct_url.get("url") if isinstance(direct_url, dict) else None
+        editable = (
+            direct_url.get("dir_info", {}).get("editable") is True
+            if isinstance(direct_url, dict)
+            else False
+        )
+        parsed = urllib.parse.urlsplit(url) if isinstance(url, str) else None
+        if (
+            editable
+            and parsed is not None
+            and parsed.scheme == "file"
+            and not parsed.query
+            and not parsed.fragment
+        ):
+            editable_root = pathlib.Path(
+                urllib.request.url2pathname(urllib.parse.unquote(parsed.path))
+            ).resolve()
+    except Exception:
+        editable_root = None
+    editable_owned = bool(
+        editable_root
+        and module_path
+        in {
+            editable_root / "src" / package_name / "__init__.py",
+            editable_root / package_name / "__init__.py",
+        }
     )
+    return {
+        "version": distribution.version,
+        "module_version": module_version,
+        "module_path": str(module_path),
+        "owned": record_owned or editable_owned,
+        "editable_root": str(editable_root) if editable_root else "",
+    }
+
+
+print(
+    json.dumps(
+        {
+            "python_executable": sys.executable,
+            "core": owned(
+                "dcc-mcp-core",
+                "dcc_mcp_core",
+                dcc_mcp_core,
+                getattr(dcc_mcp_core, "__version__", ""),
+            ),
+            "adapter": owned(
+                "dcc-mcp-gimp",
+                "dcc_mcp_gimp",
+                dcc_mcp_gimp,
+                adapter_module_version,
+            ),
+        }
+    )
+)
+""".strip()
     try:
         completed = subprocess.run(
             [str(python), "-c", code],
@@ -173,13 +269,46 @@ def _target_versions(python: Path) -> dict[str, str]:
         )
     try:
         versions = json.loads(completed.stdout.strip())
-    except json.JSONDecodeError as exc:
+    except (json.JSONDecodeError, UnicodeError) as exc:
         raise InstallFailure(
             EXIT_PREFLIGHT,
             "python",
             "Target interpreter returned invalid metadata",
         ) from exc
-    core_version = str(versions.get("dcc-mcp-core", ""))
+    if not isinstance(versions, dict):
+        raise InstallFailure(
+            EXIT_PREFLIGHT, "python", "Target interpreter returned invalid metadata"
+        )
+    try:
+        reported_python = Path(str(versions["python_executable"])).resolve()
+        core = versions["core"]
+        adapter = versions["adapter"]
+    except (KeyError, TypeError, OSError) as exc:
+        raise InstallFailure(
+            EXIT_PREFLIGHT, "python", "Target interpreter returned incomplete metadata"
+        ) from exc
+    if reported_python != python.resolve():
+        raise InstallFailure(
+            EXIT_PREFLIGHT, "python", "Target interpreter identity does not match --python"
+        )
+    core_version = str(core.get("version", ""))
+    adapter_version = str(adapter.get("version", ""))
+    if not _version_tuple(core_version) or not _version_tuple(adapter_version):
+        raise InstallFailure(
+            EXIT_PREFLIGHT, "python", "Target distributions returned noncanonical versions"
+        )
+    if core.get("module_version") != core_version or not core.get("owned"):
+        raise InstallFailure(
+            EXIT_PREFLIGHT, "python", "Imported Core module is outside its selected distribution"
+        )
+    if (
+        adapter.get("module_version") != adapter_version
+        or adapter_version != __version__
+        or not adapter.get("owned")
+    ):
+        raise InstallFailure(
+            EXIT_PREFLIGHT, "python", "Imported GIMP adapter is outside its selected distribution"
+        )
     if _version_tuple(core_version) < _version_tuple(MIN_CORE_VERSION):
         raise InstallFailure(
             EXIT_PREFLIGHT,
@@ -187,37 +316,135 @@ def _target_versions(python: Path) -> dict[str, str]:
             "dcc-mcp-core %s is unsupported; version %s or newer is required"
             % (core_version, MIN_CORE_VERSION),
         )
-    return {str(key): str(item) for key, item in versions.items()}
+    return {
+        "dcc-mcp-core": core_version,
+        "dcc-mcp-gimp": adapter_version,
+        "core_module_path": str(core.get("module_path", "")),
+        "adapter_module_path": str(adapter.get("module_path", "")),
+        "python_executable": str(reported_python),
+    }
 
 
 def _python_import_check(python: Path) -> dict[str, Any]:
-    code = (
-        "import json, dcc_mcp_gimp; "
-        "from dcc_mcp_gimp.__version__ import __version__; "
-        "print(json.dumps({'version': __version__, 'importable': True}))"
-    )
     try:
-        completed = subprocess.run(
-            [str(python), "-c", code],
-            capture_output=True,
-            text=True,
-            timeout=15,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+        versions = _target_versions(python)
+    except InstallFailure as exc:
         return {"success": False, "reason": str(exc)}
-    if completed.returncode:
-        details = completed.stderr.strip().splitlines()
-        return {"success": False, "reason": details[-1] if details else "Import failed"}
+    return {
+        "success": True,
+        "version": versions["dcc-mcp-gimp"],
+        "core_version": versions["dcc-mcp-core"],
+        "adapter_module_path": versions["adapter_module_path"],
+        "core_module_path": versions["core_module_path"],
+    }
+
+
+def _process_executable_path(pid: int) -> Optional[Path]:
+    """Resolve one live PID to its executable without trusting registry metadata."""
+    if pid <= 0:
+        return None
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.QueryFullProcessImageNameW.argtypes = [
+            wintypes.HANDLE,
+            wintypes.DWORD,
+            wintypes.LPWSTR,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        handle = kernel32.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return None
+        try:
+            buffer = ctypes.create_unicode_buffer(32_768)
+            length = wintypes.DWORD(len(buffer))
+            if not kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(length)):
+                return None
+            return Path(buffer.value).resolve()
+        finally:
+            kernel32.CloseHandle(handle)
+    if sys.platform == "darwin":
+        import ctypes
+
+        buffer = ctypes.create_string_buffer(4096)
+        try:
+            libproc = ctypes.CDLL("/usr/lib/libproc.dylib")
+            length = int(libproc.proc_pidpath(int(pid), buffer, len(buffer)))
+        except (OSError, AttributeError):
+            return None
+        return Path(buffer.value.decode("utf-8")).resolve() if length > 0 else None
     try:
-        payload = json.loads(completed.stdout.strip())
-    except json.JSONDecodeError:
-        return {"success": False, "reason": "Target interpreter returned invalid output"}
-    if payload.get("version") != __version__:
-        return {
-            "success": False,
-            "version": payload.get("version"),
-            "expected_version": __version__,
-            "reason": "Target interpreter adapter version is stale",
-        }
-    return {"success": bool(payload.get("importable")), **payload}
+        return Path("/proc/%d/exe" % pid).resolve(strict=True)
+    except OSError:
+        return None
+
+
+def _process_start_identity(pid: int) -> Optional[str]:
+    """Return a stable process creation identity so PID reuse fails closed."""
+    if pid <= 0:
+        return None
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetProcessTimes.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+            ctypes.POINTER(wintypes.FILETIME),
+        ]
+        kernel32.GetProcessTimes.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        handle = kernel32.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return None
+        try:
+            creation = wintypes.FILETIME()
+            exit_time = wintypes.FILETIME()
+            kernel = wintypes.FILETIME()
+            user = wintypes.FILETIME()
+            if not kernel32.GetProcessTimes(
+                handle,
+                ctypes.byref(creation),
+                ctypes.byref(exit_time),
+                ctypes.byref(kernel),
+                ctypes.byref(user),
+            ):
+                return None
+            value = (int(creation.dwHighDateTime) << 32) | int(creation.dwLowDateTime)
+            return "windows-filetime:%d" % value
+        finally:
+            kernel32.CloseHandle(handle)
+    if sys.platform == "darwin":
+        try:
+            completed = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "lstart="],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        value = completed.stdout.strip()
+        return "darwin-lstart:%s" % value if completed.returncode == 0 and value else None
+    try:
+        stat = Path("/proc/%d/stat" % pid).read_text(encoding="utf-8")
+        closing = stat.rfind(") ")
+        start_ticks = stat[closing + 2 :].split()[19]
+        boot_id = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+    except (IndexError, OSError, ValueError):
+        return None
+    return "linux:%s:%s" % (boot_id, start_ticks)
