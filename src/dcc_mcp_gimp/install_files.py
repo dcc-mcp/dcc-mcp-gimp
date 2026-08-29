@@ -259,7 +259,9 @@ def _copy_validated_recovery(source: Path, recovery: Path) -> dict[str, Any]:
 
 def _replace_plugin(root: Path) -> Path:
     """Replace only the legacy copy; the lifecycle uses a receipted transaction."""
+    _assert_physical_root(root)
     root.mkdir(parents=True, exist_ok=True)
+    _assert_physical_root(root)
     target = root / _PLUGIN_NAME
     stage = _stage_plugin(root)
     backup = root / (".%s.%s.backup" % (_PLUGIN_NAME, uuid.uuid4().hex))
@@ -292,6 +294,20 @@ def _valid_relative_path(value: object) -> bool:
     )
 
 
+def _assert_physical_root(root: Path) -> None:
+    """Reject a profile path that changed identity after planning."""
+    try:
+        resolved = root.resolve(strict=False)
+    except OSError as exc:
+        raise InstallFailure(EXIT_PREFLIGHT, "profile", "GIMP profile path is unavailable") from exc
+    if os.path.normcase(str(resolved)) != os.path.normcase(str(root)):
+        raise InstallFailure(
+            EXIT_PREFLIGHT,
+            "profile",
+            "GIMP profile path resolves through a link or changed identity",
+        )
+
+
 def _validate_owned_install(
     destination: Path,
     target: Path,
@@ -306,6 +322,10 @@ def _validate_owned_install(
     if any(str(receipt.get(key, "")) != expected for key, expected in required.items()):
         raise InstallFailure(
             EXIT_PREFLIGHT, "receipt", "Receipt path does not match the selected profile"
+        )
+    if receipt.get("host_paths_touched") != [str(target)]:
+        raise InstallFailure(
+            EXIT_PREFLIGHT, "receipt", "Receipt host paths do not match the selected profile"
         )
     for version in (
         receipt.get("adapter_version"),
@@ -324,13 +344,19 @@ def _validate_owned_install(
     directories = ownership.get("directories")
     files = ownership.get("files")
     links = ownership.get("links")
-    if (
-        not isinstance(directories, list)
-        or len(directories) != len(set(directories))
-        or not all(_valid_relative_path(value) for value in directories)
+    if not isinstance(directories, list) or not all(
+        isinstance(value, str) and _valid_relative_path(value) for value in directories
     ):
         raise InstallFailure(EXIT_PREFLIGHT, "receipt", "Receipt directory ownership is invalid")
-    if not isinstance(links, list) or len(links) != len(set(links)) or links:
+    if len(directories) != len(set(directories)):
+        raise InstallFailure(
+            EXIT_PREFLIGHT,
+            "receipt",
+            "Receipt directory ownership contains duplicates",
+        )
+    if not isinstance(links, list) or not all(
+        isinstance(value, str) and _valid_relative_path(value) for value in links
+    ) or len(links) != len(set(links)) or links:
         raise InstallFailure(EXIT_PREFLIGHT, "receipt", "Receipt link ownership is invalid")
     if not isinstance(files, list) or not files:
         raise InstallFailure(EXIT_PREFLIGHT, "receipt", "Receipt file ownership is invalid")
@@ -350,6 +376,17 @@ def _validate_owned_install(
         raise InstallFailure(
             EXIT_PREFLIGHT, "receipt", "Receipt file ownership contains duplicates"
         )
+    expected_files = sorted(files, key=lambda item: item["path"])
+    declared_files = receipt.get("files")
+    if not isinstance(declared_files, list) or declared_files != expected_files:
+        raise InstallFailure(EXIT_PREFLIGHT, "receipt", "Receipt file manifest is inconsistent")
+    package_digest = receipt.get("package_digest")
+    if (
+        not isinstance(package_digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", package_digest) is None
+        or package_digest != _manifest_digest(expected_files)
+    ):
+        raise InstallFailure(EXIT_PREFLIGHT, "receipt", "Receipt package digest is invalid")
     actual_directories, actual_files, actual_links = _owned_root_manifest(target)
     if (
         actual_directories != sorted(directories)
@@ -469,7 +506,9 @@ class InstallTransaction:
 
 
 def _begin_replace_plugin(root: Path, report: Mapping[str, Any]) -> InstallTransaction:
+    _assert_physical_root(root)
     root.mkdir(parents=True, exist_ok=True)
+    _assert_physical_root(root)
     target = root / _PLUGIN_NAME
     lock_state = inspect_install_root(target)
     if lock_state.get("requires_restart"):
@@ -522,6 +561,7 @@ def _begin_replace_plugin(root: Path, report: Mapping[str, Any]) -> InstallTrans
 
 
 def _installation_state(destination: Path) -> str:
+    _assert_physical_root(destination)
     target = destination / _PLUGIN_NAME
     receipt_path = _receipt_path()
     target_exists = target.exists() or target.is_symlink()
@@ -620,6 +660,7 @@ def _restore_owned_bytes(
 
 def _execute_uninstall(report: dict[str, Any]) -> tuple[dict[str, Any], int]:
     destination = Path(report["destination"])
+    _assert_physical_root(destination)
     target = destination / _PLUGIN_NAME
     receipt_path = _receipt_path()
     if not target.exists() and not receipt_path.exists():

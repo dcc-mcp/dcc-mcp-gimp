@@ -724,6 +724,59 @@ def test_receipt_rejects_escape_duplicate_and_wrong_ownership_types(lifecycle_en
     assert report["verify"]["failure_stage"] == "receipt"
 
 
+def test_receipt_rejects_tampered_digest_and_top_level_manifest(lifecycle_env):
+    from dcc_mcp_gimp.install import _manifest_digest, run
+
+    installed, code, _ = run(["install", "--yes", *lifecycle_env.common])
+    assert code == 0, installed
+    receipt_path = lifecycle_env.root / ".dcc-mcp" / "receipts" / "gimp.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+
+    receipt["package_digest"] = "0" * 64
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    status, code, _ = run(["status", *lifecycle_env.common])
+
+    assert code == 40
+    assert status["installation_state"] == "repair"
+    assert status["verify"]["failure_stage"] == "receipt"
+
+    receipt["files"] = receipt["ownership"]["files"]
+    receipt["package_digest"] = _manifest_digest(receipt["files"])
+    receipt["host_paths_touched"] = [str(lifecycle_env.root / "foreign-plugin")]
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    status, code, _ = run(["status", *lifecycle_env.common])
+
+    assert code == 40
+    assert status["installation_state"] == "repair"
+    assert status["verify"]["failure_stage"] == "receipt"
+
+    receipt["package_digest"] = receipt["ownership"]["files"][0]["sha256"]
+    receipt["files"] = []
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    status, code, _ = run(["status", *lifecycle_env.common])
+
+    assert code == 40
+    assert status["installation_state"] == "repair"
+    assert status["verify"]["failure_stage"] == "receipt"
+
+
+def test_receipt_rejects_unhashable_ownership_entries_without_crashing(lifecycle_env):
+    from dcc_mcp_gimp.install import run
+
+    installed, code, _ = run(["install", "--yes", *lifecycle_env.common])
+    assert code == 0, installed
+    receipt_path = lifecycle_env.root / ".dcc-mcp" / "receipts" / "gimp.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["ownership"]["directories"] = [{}]
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+
+    status, code, _ = run(["status", *lifecycle_env.common])
+
+    assert code == 40
+    assert status["installation_state"] == "repair"
+    assert status["verify"]["failure_stage"] == "receipt"
+
+
 def test_uninstall_cleanup_failure_restores_target_and_receipt(lifecycle_env, monkeypatch):
     from dcc_mcp_gimp import install_files
     from dcc_mcp_gimp.install import run
@@ -856,6 +909,24 @@ def test_target_interpreter_rejects_shadowed_distribution(tmp_path, monkeypatch)
     )
 
     with pytest.raises(InstallFailure, match="outside its selected distribution"):
+        _target_versions(python)
+
+
+def test_target_interpreter_rejects_unbounded_metadata(tmp_path, monkeypatch):
+    from dcc_mcp_gimp.install_contract import InstallFailure
+    from dcc_mcp_gimp.install_host import _target_versions
+
+    python = tmp_path / "python.exe"
+    python.write_bytes(b"python")
+    oversized = "{" + (" " * (256 * 1024)) + "}"
+    monkeypatch.setattr(
+        "dcc_mcp_gimp.install_host.subprocess.run",
+        lambda command, **_kwargs: subprocess.CompletedProcess(
+            command, 0, stdout=oversized, stderr=""
+        ),
+    )
+
+    with pytest.raises(InstallFailure, match="metadata is unbounded"):
         _target_versions(python)
 
 

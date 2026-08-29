@@ -13,6 +13,7 @@ import socketserver
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Optional
@@ -41,15 +42,22 @@ def _capture_bootstrap_error(stage: str, error: BaseException) -> None:
         pass
 
 
-try:
+@contextmanager
+def capture_bootstrap_errors(stage: str):
+    """Record and re-raise startup failures while GIMP loads the plug-in."""
+    try:
+        yield
+    except BaseException as exc:
+        _capture_bootstrap_error(stage, exc)
+        raise
+
+
+with capture_bootstrap_errors("gi-import"):
     import gi
 
     gi.require_version("Gegl", "0.4")
     gi.require_version("Gimp", "3.0")
     from gi.repository import Gegl, Gimp, Gio, GLib  # noqa: E402
-except BaseException as exc:
-    _capture_bootstrap_error("gi-import", exc)
-    raise
 
 
 VERSION = "0.4.1"  # x-release-please-version
@@ -779,11 +787,8 @@ class DccMcpGimp(Gimp.PlugIn):
 
     @staticmethod
     def _run(procedure: Any, run_mode: Any, config: Any, plugin: Any) -> Any:
-        try:
+        with capture_bootstrap_errors("bridge-startup"):
             return DccMcpGimp._run_bridge(procedure, run_mode, config, plugin)
-        except BaseException as exc:
-            _capture_bootstrap_error("bridge-startup", exc)
-            raise
 
     @staticmethod
     def _run_bridge(procedure: Any, run_mode: Any, config: Any, plugin: Any) -> Any:
