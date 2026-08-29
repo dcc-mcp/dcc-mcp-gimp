@@ -20,6 +20,7 @@ _GIMP_VERSION_PATTERN = re.compile(
 )
 _GIMP_EXECUTABLES = frozenset(("gimp", "gimp.exe", "gimp-3.0", "gimp-3.0.exe"))
 _MAX_PROBE_OUTPUT = 16 * 1024
+_MAX_METADATA_OUTPUT = 256 * 1024
 
 
 def default_plugin_dir() -> Path:
@@ -261,14 +262,18 @@ print(
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise InstallFailure(EXIT_PREFLIGHT, "python", str(exc)) from exc
     if completed.returncode:
-        reason = completed.stderr.strip().splitlines()
+        stderr = completed.stderr if isinstance(completed.stderr, str) else ""
+        reason = stderr[:_MAX_METADATA_OUTPUT].strip().splitlines()
         raise InstallFailure(
             EXIT_PREFLIGHT,
             "python",
             reason[-1] if reason else "Target package metadata query failed",
         )
+    stdout = completed.stdout if isinstance(completed.stdout, str) else ""
+    if len(stdout.encode("utf-8", errors="replace")) > _MAX_METADATA_OUTPUT:
+        raise InstallFailure(EXIT_PREFLIGHT, "python", "Target interpreter metadata is unbounded")
     try:
-        versions = json.loads(completed.stdout.strip())
+        versions = json.loads(stdout.strip())
     except (json.JSONDecodeError, UnicodeError) as exc:
         raise InstallFailure(
             EXIT_PREFLIGHT,

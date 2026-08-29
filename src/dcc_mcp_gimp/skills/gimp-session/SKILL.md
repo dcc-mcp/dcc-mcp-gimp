@@ -20,11 +20,18 @@ metadata:
 
 # GIMP Image Authoring
 
-Install the bundled plug-in, configure `DCC_MCP_GIMP_ALLOWED_ROOTS`, restart
-GIMP, and run the persistent bridge before loading this Skill. All host API
-calls are typed and marshalled onto GIMP's GLib main thread. The bridge accepts
-only authenticated loopback JSON-lines requests and never executes arbitrary
-Python, Script-Fu, PDB procedure names, or actions supplied by a caller.
+Use the agent-first lifecycle before loading this Skill. Run
+`dcc-mcp-gimp install --dry-run --json` to inspect the selected GIMP executable,
+target interpreter, profile, and receipt; apply it with `install --yes`, then
+follow the machine-readable `next_steps[]` and require
+`verify.directly_usable: true`. Use `status`, `upgrade`, and `uninstall` for the
+same receipted profile. Configure `DCC_MCP_GIMP_ALLOWED_ROOTS`, and treat
+exit 50 as a fail-closed restart/lock boundary rather than proof of readiness.
+All host API calls are typed and marshalled onto GIMP's GLib main thread. The
+bridge
+accepts only authenticated loopback JSON-lines requests and never executes
+arbitrary Python, Script-Fu, PDB procedure names, or actions supplied by a
+caller.
 
 Use instance-scoped `image_id` and `layer_id` values only within the current
 GIMP process. Save layered work as XCF before exporting a delivery format.
