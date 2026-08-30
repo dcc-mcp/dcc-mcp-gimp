@@ -1234,6 +1234,61 @@ def test_receipt_success_does_not_leave_transaction_tombstones(tmp_path):
     )
 
 
+def test_upgrade_preserves_receipt_that_changes_before_commit(lifecycle_env, monkeypatch):
+    from dcc_mcp_gimp import install_files
+    from dcc_mcp_gimp.install import run
+
+    installed, code, _ = run(["install", "--yes", *lifecycle_env.common])
+    assert code == 0, installed
+    receipt = lifecycle_env.root / ".dcc-mcp" / "receipts" / "gimp.json"
+    parked = receipt.with_name("gimp.previous.json")
+    occupant = receipt.with_name("gimp.operator.json")
+    occupant.write_bytes(b"OPERATOR-RECEIPT")
+    original_write = install_files._write_json_atomic
+    state = {"changed": False}
+
+    def change_before_commit(path, payload, *args, **kwargs):
+        if not state["changed"]:
+            receipt.rename(parked)
+            occupant.rename(receipt)
+            state["changed"] = True
+        return original_write(path, payload, *args, **kwargs)
+
+    monkeypatch.setattr(install_files, "_write_json_atomic", change_before_commit)
+    report, code, _ = run(["upgrade", "--yes", *lifecycle_env.common])
+
+    assert code != 0, report
+    assert state["changed"] is True, report
+    assert receipt.read_bytes() == b"OPERATOR-RECEIPT"
+    assert parked.is_file()
+
+
+def test_install_preserves_receipt_that_appears_before_commit(lifecycle_env, monkeypatch):
+    from dcc_mcp_gimp import install_files
+    from dcc_mcp_gimp.install import run
+
+    receipt = lifecycle_env.root / ".dcc-mcp" / "receipts" / "gimp.json"
+    occupant = lifecycle_env.root / "operator-receipt.json"
+    occupant.write_bytes(b"OPERATOR-RECEIPT")
+    original_write = install_files._write_json_atomic
+    state = {"changed": False}
+
+    def appear_before_commit(path, payload, *args, **kwargs):
+        if not state["changed"]:
+            receipt.parent.mkdir(parents=True, exist_ok=True)
+            occupant.rename(receipt)
+            state["changed"] = True
+        return original_write(path, payload, *args, **kwargs)
+
+    monkeypatch.setattr(install_files, "_write_json_atomic", appear_before_commit)
+    report, code, _ = run(["install", "--yes", *lifecycle_env.common])
+
+    assert code != 0, report
+    assert state["changed"] is True
+    assert receipt.read_bytes() == b"OPERATOR-RECEIPT"
+    assert not (lifecycle_env.plugins / "dcc_mcp_gimp").exists()
+
+
 @pytest.mark.skipif(os.name == "nt", reason="Exercises POSIX receipt move rollback")
 def test_receipt_move_failure_restores_source_without_partial_destination(tmp_path, monkeypatch):
     from dcc_mcp_gimp import install_files
@@ -1575,6 +1630,139 @@ def test_uninstall_quarantine_late_unowned_entry_is_preserved(lifecycle_env, mon
     )
 
 
+def test_uninstall_rejects_entry_added_after_manifest_validation(lifecycle_env, monkeypatch):
+    from dcc_mcp_gimp import install_files
+    from dcc_mcp_gimp.install import run
+
+    installed, code, _ = run(["install", "--yes", *lifecycle_env.common])
+    assert code == 0, installed
+    target = lifecycle_env.plugins / "dcc_mcp_gimp"
+    added = target / "operator.txt"
+    original_capture = install_files._capture_owned_bytes
+    state = {"added": False}
+
+    def capture_then_add(*args, **kwargs):
+        snapshot = original_capture(*args, **kwargs)
+        added.write_text("preserve", encoding="utf-8")
+        state["added"] = True
+        return snapshot
+
+    monkeypatch.setattr(install_files, "_capture_owned_bytes", capture_then_add)
+    report, code, _ = run(["uninstall", "--yes", *lifecycle_env.common])
+
+    assert code != 0, report
+    assert state["added"] is True
+    assert added.read_text(encoding="utf-8") == "preserve"
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Uses Linux fd paths")
+def test_uninstall_preserves_name_occupant_selected_for_final_cleanup(lifecycle_env, monkeypatch):
+    from dcc_mcp_gimp import install_files
+    from dcc_mcp_gimp.install import run
+
+    installed, code, _ = run(["install", "--yes", *lifecycle_env.common])
+    assert code == 0, installed
+    original_unlink = install_files.os.unlink
+    original_rename = install_files._POSIX_RENAME
+    original_noreplace = install_files._posix_rename_noreplace
+    state = {"swapped": False}
+
+    def occupy_selected_name(name, *, dir_fd):
+        if state["swapped"] or str(name) != "dcc_mcp_gimp.py":
+            return
+        parent = Path(os.readlink("/proc/self/fd/%d" % dir_fd))
+        selected = parent / str(name)
+        parked = parent / "dcc_mcp_gimp.owned.py"
+        occupant = parent / "dcc_mcp_gimp.operator.py"
+        occupant.write_bytes(b"OPERATOR-CONTENT")
+        selected.rename(parked)
+        occupant.rename(selected)
+        state.update(swapped=True, parked=parked)
+
+    def unlink_after_occupy(name, *args, **kwargs):
+        occupy_selected_name(name, dir_fd=kwargs["dir_fd"])
+        return original_unlink(name, *args, **kwargs)
+
+    def rename_after_occupy(source, destination, *args, **kwargs):
+        occupy_selected_name(source, dir_fd=kwargs["src_dir_fd"])
+        return original_rename(source, destination, *args, **kwargs)
+
+    def noreplace_after_occupy(source, destination, source_fd, destination_fd):
+        occupy_selected_name(source, dir_fd=source_fd)
+        return original_noreplace(source, destination, source_fd, destination_fd)
+
+    monkeypatch.setattr(install_files.os, "unlink", unlink_after_occupy)
+    monkeypatch.setattr(install_files, "_POSIX_RENAME", rename_after_occupy)
+    monkeypatch.setattr(install_files, "_posix_rename_noreplace", noreplace_after_occupy)
+    report, code, _ = run(["uninstall", "--yes", *lifecycle_env.common])
+
+    assert code != 0, report
+    assert state["swapped"] is True
+    assert any(
+        candidate.is_file() and candidate.read_bytes() == b"OPERATOR-CONTENT"
+        for candidate in lifecycle_env.plugins.parent.rglob("*")
+    )
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Uses Linux fd paths")
+def test_uninstall_preserves_directory_occupant_selected_for_final_cleanup(
+    lifecycle_env, monkeypatch
+):
+    from dcc_mcp_gimp import install_files
+    from dcc_mcp_gimp.install import run
+
+    installed, code, _ = run(["install", "--yes", *lifecycle_env.common])
+    assert code == 0, installed
+    original_rmdir = install_files.os.rmdir
+    original_rename = install_files._POSIX_RENAME
+    original_noreplace = install_files._posix_rename_noreplace
+    state = {"swapped": False}
+
+    def occupy_selected_name(name, *, dir_fd):
+        if state["swapped"] or str(name) != "dcc_mcp_gimp":
+            return
+        parent = Path(os.readlink("/proc/self/fd/%d" % dir_fd))
+        if "quarantine" not in parent.name:
+            return
+        selected = parent / str(name)
+        parked = parent / "dcc_mcp_gimp.owned"
+        occupant = parent / "dcc_mcp_gimp.operator"
+        occupant.mkdir()
+        occupant_identity = occupant.stat().st_ino
+        selected.rename(parked)
+        occupant.rename(selected)
+        state.update(
+            swapped=True,
+            parked=parked,
+            occupant_identity=occupant_identity,
+            search_root=parent,
+        )
+
+    def rmdir_after_occupy(name, *args, **kwargs):
+        occupy_selected_name(name, dir_fd=kwargs["dir_fd"])
+        return original_rmdir(name, *args, **kwargs)
+
+    def rename_after_occupy(source, destination, *args, **kwargs):
+        occupy_selected_name(source, dir_fd=kwargs["src_dir_fd"])
+        return original_rename(source, destination, *args, **kwargs)
+
+    def noreplace_after_occupy(source, destination, source_fd, destination_fd):
+        occupy_selected_name(source, dir_fd=source_fd)
+        return original_noreplace(source, destination, source_fd, destination_fd)
+
+    monkeypatch.setattr(install_files.os, "rmdir", rmdir_after_occupy)
+    monkeypatch.setattr(install_files, "_POSIX_RENAME", rename_after_occupy)
+    monkeypatch.setattr(install_files, "_posix_rename_noreplace", noreplace_after_occupy)
+    report, code, _ = run(["uninstall", "--yes", *lifecycle_env.common])
+
+    assert code != 0, report
+    assert state["swapped"] is True
+    assert any(
+        candidate.is_dir() and candidate.stat().st_ino == state["occupant_identity"]
+        for candidate in state["search_root"].iterdir()
+    )
+
+
 def test_uninstall_transaction_late_unowned_entry_is_preserved(lifecycle_env, monkeypatch):
     from dcc_mcp_gimp import install_files
     from dcc_mcp_gimp.install import run
@@ -1748,6 +1936,50 @@ def test_stage_path_swap_is_not_published(lifecycle_env, monkeypatch):
     assert report["status"] == "failed"
     assert not (lifecycle_env.plugins / "dcc_mcp_gimp" / "operator.txt").exists()
     assert state["parked"].is_dir()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Exercises POSIX stage publication")
+def test_upgrade_preserves_stage_name_occupant_during_publication(lifecycle_env, monkeypatch):
+    from dcc_mcp_gimp import install_files
+    from dcc_mcp_gimp.install import run
+
+    installed, code, _ = run(["install", "--yes", *lifecycle_env.common])
+    assert code == 0, installed
+    original_replace = install_files.os.replace
+    state = {"swapped": False}
+
+    def occupy_stage_name(source, destination, *args, **kwargs):
+        source_name = str(source)
+        if (
+            not state["swapped"]
+            and source_name.startswith(".dcc_mcp_gimp.")
+            and source_name.endswith(".stage")
+        ):
+            stage = lifecycle_env.plugins / source_name
+            parked = stage.with_name(stage.name + ".owned")
+            occupant = stage.with_name(stage.name + ".occupant")
+            occupant.mkdir()
+            (occupant / "operator.txt").write_text("preserve", encoding="utf-8")
+            (occupant / "dcc_mcp_gimp.py").write_text('VERSION = "0.4.1"\n', encoding="utf-8")
+            stage.rename(parked)
+            occupant.rename(stage)
+            state.update(swapped=True, parked=parked, stage=stage)
+        return original_replace(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(install_files.os, "replace", occupy_stage_name)
+    monkeypatch.setattr(install_files, "_POSIX_RENAME", occupy_stage_name)
+    report, code, _ = run(["upgrade", "--yes", *lifecycle_env.common])
+
+    assert code != 0, report
+    assert state["swapped"] is True
+    assert not (lifecycle_env.plugins / "dcc_mcp_gimp" / "operator.txt").exists()
+    assert state["parked"].is_dir()
+    assert any(
+        candidate.is_dir()
+        and (candidate / "operator.txt").read_text(encoding="utf-8") == "preserve"
+        for candidate in lifecycle_env.plugins.iterdir()
+        if (candidate / "operator.txt").is_file()
+    )
 
 
 def test_uninstall_transaction_path_swap_preserves_foreign_tree(lifecycle_env, monkeypatch):
@@ -2128,7 +2360,7 @@ def test_receipt_symlink_swap_fails_closed_without_external_write(lifecycle_env,
     external.write_text("do not overwrite", encoding="utf-8")
     original_write = install_files._write_json_atomic
 
-    def swap_then_fail(path, payload):
+    def swap_then_fail(path, payload, *args, **kwargs):
         assert Path(path) == receipt_path
         receipt_path.unlink()
         receipt_path.symlink_to(external)

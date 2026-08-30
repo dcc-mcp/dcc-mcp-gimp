@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import errno
 import hashlib
 import json
 import os
@@ -585,6 +586,28 @@ def _assert_private_tree_identities(
         raise InstallFailure(EXIT_INSTALL, stage, "Private transaction entry changed identity")
 
 
+def _receipt_tree_identities(
+    path: Path,
+    receipt: Mapping[str, Any],
+    stage: str,
+) -> dict[str, tuple[int, int, int, int, int, int]]:
+    """Bind only entries declared by the validated receipt ownership manifest."""
+    ownership = receipt["ownership"]
+    expected_paths = {
+        "",
+        *(str(relative) for relative in ownership["directories"]),
+        *(str(record["path"]) for record in ownership["files"]),
+    }
+    actual = _private_tree_identities(path, stage)
+    if set(actual) != expected_paths:
+        raise InstallFailure(
+            EXIT_PREFLIGHT,
+            stage,
+            "Managed plug-in contains an entry outside the install receipt",
+        )
+    return {relative: actual[relative] for relative in sorted(expected_paths)}
+
+
 def _windows_remove_tree(
     path: Path,
     stage: str = "cleanup",
@@ -747,6 +770,37 @@ def _assert_receipt_descriptor_identity(
         matches = actual == tuple(expected)
     if not matches:
         raise InstallFailure(EXIT_PREFLIGHT, stage, "Managed receipt file changed identity")
+
+
+def _assert_receipt_commit_precondition(
+    actual: Optional[tuple[int, ...]],
+    expected_identity: Optional[tuple[int, ...]],
+    expected_absent: bool,
+) -> None:
+    """Require the receipt name to retain the transaction's starting state."""
+    if expected_identity is not None and expected_absent:
+        raise ValueError("receipt precondition is ambiguous")
+    if expected_absent:
+        if actual is not None:
+            raise InstallFailure(
+                EXIT_PREFLIGHT,
+                "receipt",
+                "Install receipt appeared before transaction commit",
+            )
+        return
+    identity_matches = False
+    if expected_identity is not None and actual is not None:
+        identity_matches = (
+            tuple(actual)[:2] == tuple(expected_identity)
+            if len(expected_identity) == 2
+            else tuple(actual) == tuple(expected_identity)
+        )
+    if expected_identity is not None and not identity_matches:
+        raise InstallFailure(
+            EXIT_PREFLIGHT,
+            "receipt",
+            "Install receipt changed identity before transaction commit",
+        )
 
 
 def _path_present_no_follow(path: Path) -> bool:
@@ -1003,6 +1057,53 @@ def _open_relative_dir_nofollow(
         raise
 
 
+def _posix_rename_noreplace(
+    source_name: str,
+    destination_name: str,
+    source_descriptor: int,
+    destination_descriptor: int,
+) -> None:
+    """Rename one descriptor-relative name without replacing the destination."""
+    if os.name == "nt":
+        raise OSError(errno.ENOTSUP, "POSIX no-replace rename is unavailable")
+    import ctypes
+
+    source = os.fsencode(source_name)
+    destination = os.fsencode(destination_name)
+    libc = ctypes.CDLL(None, use_errno=True)
+    if sys.platform.startswith("linux"):
+        rename = getattr(libc, "renameat2", None)
+        flags = 1  # RENAME_NOREPLACE
+    elif sys.platform == "darwin":
+        rename = getattr(libc, "renameatx_np", None)
+        flags = 0x00000004  # RENAME_EXCL
+    else:
+        rename = None
+        flags = 0
+    if rename is None:
+        raise OSError(errno.ENOTSUP, "atomic no-replace rename is unavailable")
+    rename.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    rename.restype = ctypes.c_int
+    if (
+        rename(
+            source_descriptor,
+            source,
+            destination_descriptor,
+            destination,
+            flags,
+        )
+        != 0
+    ):
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), destination_name)
+
+
 def _replace_path_owned(
     root: Path,
     expected_identity: Optional[tuple[int, int]],
@@ -1087,24 +1188,71 @@ def _replace_path_owned(
         destination_name = (
             destination_relative.name if destination_relative is not None else destination.name
         )
-        if expected_file_identities:
-            _assert_owned_file_identities(source, expected_file_identities, "install")
-        if expected_source_identity is not None:
-            if _object_identity(source, "install")[:2] != tuple(expected_source_identity)[:2]:
-                raise InstallFailure(EXIT_PREFLIGHT, "install", "Managed stage changed identity")
-        for attempt in range(6):
+        with _posix_directory_locks(source_descriptor, destination_descriptor):
+            if expected_file_identities:
+                _assert_owned_file_identities(source, expected_file_identities, "install")
+            selected_identity = (
+                tuple(expected_source_identity)[:2]
+                if expected_source_identity is not None
+                else _object_identity(source, "install")[:2]
+            )
+            tombstone_name = ".%s.publish-%s" % (source_name, uuid.uuid4().hex)
+            _POSIX_RENAME(
+                source_name,
+                tombstone_name,
+                src_dir_fd=source_descriptor,
+                dst_dir_fd=source_descriptor,
+            )
+            moved_owned = False
             try:
-                os.replace(
-                    source_name,
-                    destination_name,
-                    src_dir_fd=source_descriptor,
-                    dst_dir_fd=destination_descriptor,
+                moved = os.stat(
+                    tombstone_name,
+                    dir_fd=source_descriptor,
+                    follow_symlinks=False,
                 )
-                break
-            except PermissionError:
-                if attempt == 5:
-                    raise
-                time.sleep(0.05 * (2**attempt))
+                moved_identity = (int(moved.st_dev), int(moved.st_ino))
+                if moved_identity != selected_identity:
+                    raise InstallFailure(
+                        EXIT_PREFLIGHT,
+                        "install",
+                        "Managed stage changed identity after selection",
+                    )
+                moved_owned = True
+                _posix_rename_noreplace(
+                    tombstone_name,
+                    destination_name,
+                    source_descriptor,
+                    destination_descriptor,
+                )
+                published = os.stat(
+                    destination_name,
+                    dir_fd=destination_descriptor,
+                    follow_symlinks=False,
+                )
+                if (int(published.st_dev), int(published.st_ino)) != selected_identity:
+                    raise InstallFailure(
+                        EXIT_PREFLIGHT,
+                        "install",
+                        "Managed stage changed identity during publication",
+                    )
+                os.fsync(destination_descriptor)
+                if source_descriptor != destination_descriptor:
+                    os.fsync(source_descriptor)
+            except BaseException:
+                # Restore only when the original name is still free.  A raced
+                # occupant keeps that name, while the selected inode remains
+                # preserved in the private tombstone for manual recovery.
+                if moved_owned:
+                    try:
+                        _posix_rename_noreplace(
+                            tombstone_name,
+                            source_name,
+                            source_descriptor,
+                            source_descriptor,
+                        )
+                    except OSError:
+                        pass
+                raise
         _assert_physical_root(root, expected_identity)
     except InstallFailure:
         raise
@@ -1132,16 +1280,41 @@ def _chmod_no_follow(path: Path, mode: int) -> None:
         os.chmod(str(path), mode)
 
 
-def _write_bytes_atomic(path: Path, data: bytes, mode: Optional[int] = None) -> None:
+def _write_bytes_atomic(
+    path: Path,
+    data: bytes,
+    mode: Optional[int] = None,
+    *,
+    expected_identity: Optional[tuple[int, ...]] = None,
+    expected_absent: bool = False,
+) -> tuple[int, int, int, int, int, int]:
     """Replace bytes without following a swapped receipt symlink."""
     _assert_receipt_path_safe(path)
     if _replace_path is not _DEFAULT_REPLACE_PATH or os.name == "nt":
-        _write_bytes_atomic_legacy(path, data, mode)
-        return
-    _write_atomic_at_parent(path, data, mode)
+        return _write_bytes_atomic_legacy(
+            path,
+            data,
+            mode,
+            expected_identity=expected_identity,
+            expected_absent=expected_absent,
+        )
+    return _write_atomic_at_parent(
+        path,
+        data,
+        mode,
+        expected_identity=expected_identity,
+        expected_absent=expected_absent,
+    )
 
 
-def _write_bytes_atomic_legacy(path: Path, data: bytes, mode: Optional[int] = None) -> None:
+def _write_bytes_atomic_legacy(
+    path: Path,
+    data: bytes,
+    mode: Optional[int] = None,
+    *,
+    expected_identity: Optional[tuple[int, ...]] = None,
+    expected_absent: bool = False,
+) -> tuple[int, int, int, int, int, int]:
     temporary = path.with_name(".%s.%s.tmp" % (path.name, uuid.uuid4().hex))
     parent_identity = None
     created_temp = False
@@ -1169,14 +1342,33 @@ def _write_bytes_atomic_legacy(path: Path, data: bytes, mode: Optional[int] = No
             temporary_identity = _receipt_file_identity(temporary, "receipt")
             _assert_receipt_file_identity(temporary, temporary_identity, "receipt")
             if os.name == "nt" and _replace_path is _DEFAULT_REPLACE_PATH:
-                _windows_publish_receipt(temporary, path, temporary_identity, mode)
+                _windows_publish_receipt(
+                    temporary,
+                    path,
+                    temporary_identity,
+                    mode,
+                    expected_identity=expected_identity,
+                    expected_absent=expected_absent,
+                )
             else:
+                try:
+                    existing = _receipt_file_identity(path, "receipt")
+                except InstallFailure:
+                    if _path_present_no_follow(path):
+                        raise
+                    existing = None
+                _assert_receipt_commit_precondition(
+                    existing,
+                    expected_identity,
+                    expected_absent,
+                )
                 _replace_path(temporary, path)
             _assert_receipt_file_identity(path, temporary_identity[:2], "receipt")
             _assert_receipt_parent_identity(path, parent_identity)
             if mode is not None:
                 _chmod_no_follow(path, mode)
             published = True
+            return _receipt_file_identity(path, "receipt")
         finally:
             if created_temp and not published:
                 try:
@@ -1190,6 +1382,9 @@ def _windows_publish_receipt(
     destination: Path,
     temporary_identity: tuple[int, ...],
     mode: Optional[int],
+    *,
+    expected_identity: Optional[tuple[int, ...]] = None,
+    expected_absent: bool = False,
 ) -> None:
     """Publish a staged receipt without replacing a raced final name."""
     backup: Optional[Path] = None
@@ -1203,11 +1398,13 @@ def _windows_publish_receipt(
             if _path_present_no_follow(destination):
                 raise
             existing = None
+        _assert_receipt_commit_precondition(existing, expected_identity, expected_absent)
         if existing is not None:
             backup = destination.with_name(
                 ".%s.receipt-backup-%s" % (destination.name, uuid.uuid4().hex)
             )
             with _windows_object_handle(destination, "receipt", access=0x00010000 | 0x80) as handle:
+                _assert_receipt_file_identity_strict(destination, existing, "receipt")
                 _windows_rename_by_handle(destination, backup, replace=False, _bound_handle=handle)
             backup_identity = _receipt_file_identity(backup, "receipt")
         try:
@@ -1249,7 +1446,14 @@ def _windows_publish_receipt(
                     pass
 
 
-def _write_atomic_at_parent(path: Path, data: bytes, mode: Optional[int] = None) -> None:
+def _write_atomic_at_parent(
+    path: Path,
+    data: bytes,
+    mode: Optional[int] = None,
+    *,
+    expected_identity: Optional[tuple[int, ...]] = None,
+    expected_absent: bool = False,
+) -> tuple[int, int, int, int, int, int]:
     """Publish a complete payload through a held no-follow parent.
 
     The payload is written and fsynced in a private descriptor first.  The
@@ -1266,6 +1470,7 @@ def _write_atomic_at_parent(path: Path, data: bytes, mode: Optional[int] = None)
     backup_name: Optional[str] = None
     backup_identity: Optional[tuple[int, int]] = None
     expected_parent_identity: Optional[tuple[int, int]] = None
+    published_identity: Optional[tuple[int, int, int, int, int, int]] = None
     try:
         if path.parent.exists():
             expected_parent_identity = _directory_identity(path.parent, "receipt")
@@ -1308,6 +1513,23 @@ def _write_atomic_at_parent(path: Path, data: bytes, mode: Optional[int] = None)
                 raise InstallFailure(
                     EXIT_PREFLIGHT, "receipt", "Install receipt file is linked or not regular"
                 )
+            existing_record = (
+                None
+                if existing is None
+                else (
+                    int(existing.st_dev),
+                    int(existing.st_ino),
+                    int(existing.st_size),
+                    int(existing.st_mtime_ns),
+                    int(existing.st_ctime_ns),
+                    stat.S_IMODE(existing.st_mode),
+                )
+            )
+            _assert_receipt_commit_precondition(
+                existing_record,
+                expected_identity,
+                expected_absent,
+            )
             if existing is not None:
                 existing_identity = (int(existing.st_dev), int(existing.st_ino))
                 backup_name = ".%s.receipt-backup-%s" % (path.name, uuid.uuid4().hex)
@@ -1352,6 +1574,7 @@ def _write_atomic_at_parent(path: Path, data: bytes, mode: Optional[int] = None)
                 if mode is not None and stat.S_IMODE(published[5]) != stat.S_IMODE(mode):
                     raise InstallFailure(EXIT_PREFLIGHT, "receipt", "Managed receipt mode changed")
                 os.fsync(parent_descriptor)
+                published_identity = published
                 publication_succeeded = True
             except BaseException:
                 # If a raced temporary name was promoted, move the resulting
@@ -1440,6 +1663,9 @@ def _write_atomic_at_parent(path: Path, data: bytes, mode: Optional[int] = None)
                 os.close(parent_descriptor)
             except OSError:
                 pass
+    if published_identity is None:
+        raise InstallFailure(EXIT_INSTALL, "receipt", "Install receipt commit failed")
+    return published_identity
 
 
 def _read_receipt() -> Optional[dict[str, Any]]:
@@ -1626,7 +1852,13 @@ def _replace_path(source: Path, destination: Path) -> None:
 _DEFAULT_REPLACE_PATH = _replace_path
 
 
-def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+def _write_json_atomic(
+    path: Path,
+    payload: dict[str, Any],
+    *,
+    expected_identity: Optional[tuple[int, ...]] = None,
+    expected_absent: bool = False,
+) -> tuple[int, int, int, int, int, int]:
     _assert_receipt_path_safe(path)
     encoded = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
     if _replace_path is not _DEFAULT_REPLACE_PATH or os.name == "nt":
@@ -1655,20 +1887,43 @@ def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
                 temporary_identity = _receipt_file_identity(temporary, "receipt")
                 _assert_receipt_file_identity(temporary, temporary_identity, "receipt")
                 if os.name == "nt" and _replace_path is _DEFAULT_REPLACE_PATH:
-                    _windows_publish_receipt(temporary, path, temporary_identity, None)
+                    _windows_publish_receipt(
+                        temporary,
+                        path,
+                        temporary_identity,
+                        None,
+                        expected_identity=expected_identity,
+                        expected_absent=expected_absent,
+                    )
                 else:
+                    try:
+                        existing = _receipt_file_identity(path, "receipt")
+                    except InstallFailure:
+                        if _path_present_no_follow(path):
+                            raise
+                        existing = None
+                    _assert_receipt_commit_precondition(
+                        existing,
+                        expected_identity,
+                        expected_absent,
+                    )
                     _replace_path(temporary, path)
                 _assert_receipt_file_identity(path, temporary_identity[:2], "receipt")
                 _assert_receipt_parent_identity(path, parent_identity)
                 published = True
+                return _receipt_file_identity(path, "receipt")
             finally:
                 if created_temp and not published:
                     try:
                         _unlink_receipt_owned(temporary, expected_identity=temporary_identity)
                     except InstallFailure:
                         pass
-        return
-    _write_atomic_at_parent(path, encoded)
+    return _write_atomic_at_parent(
+        path,
+        encoded,
+        expected_identity=expected_identity,
+        expected_absent=expected_absent,
+    )
 
 
 def _replace_receipt_owned(
@@ -2179,7 +2434,7 @@ def _remove_entry_at(
     expected: Optional[Mapping[str, tuple[int, ...]]] = None,
     relative: str = "",
 ) -> None:
-    """Recursively remove one entry relative to a held no-follow directory."""
+    """Move one selected inode to a private name before recursive cleanup."""
     with _posix_directory_lock(parent_descriptor):
         details = os.lstat(name, dir_fd=parent_descriptor)
         identity = (int(details.st_dev), int(details.st_ino))
@@ -2193,9 +2448,22 @@ def _remove_entry_at(
                 raise InstallFailure(
                     EXIT_INSTALL, "cleanup", "Private transaction entry changed identity"
                 )
+        tombstone = ".%s.cleanup-%s" % (name, uuid.uuid4().hex)
+        _posix_rename_noreplace(
+            name,
+            tombstone,
+            parent_descriptor,
+            parent_descriptor,
+        )
+        moved = os.lstat(tombstone, dir_fd=parent_descriptor)
+        if (int(moved.st_dev), int(moved.st_ino)) != identity:
+            # The selected pathname was replaced before the move.  Preserve
+            # the moved occupant in the private name and fail closed; it is
+            # never passed to unlink/rmdir as an owned object.
+            raise InstallFailure(EXIT_INSTALL, "cleanup", "Managed path changed identity")
         if stat.S_ISDIR(details.st_mode) and not stat.S_ISLNK(details.st_mode):
             child = os.open(
-                name,
+                tombstone,
                 os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
                 dir_fd=parent_descriptor,
             )
@@ -2208,36 +2476,35 @@ def _remove_entry_at(
                         expected=expected,
                         relative=child_relative,
                     )
-                current = os.lstat(name, dir_fd=parent_descriptor)
+                current = os.lstat(tombstone, dir_fd=parent_descriptor)
                 if (int(current.st_dev), int(current.st_ino)) != identity:
                     raise InstallFailure(EXIT_INSTALL, "cleanup", "Managed path changed identity")
                 child_current = os.fstat(child)
                 if (int(child_current.st_dev), int(child_current.st_ino)) != identity:
                     raise InstallFailure(EXIT_INSTALL, "cleanup", "Managed path changed identity")
-                os.rmdir(name, dir_fd=parent_descriptor)
+                os.rmdir(tombstone, dir_fd=parent_descriptor)
             finally:
                 os.close(child)
             return
-        # Open the child and bind its inode before the final name check.  The
-        # directory lock provides the protocol boundary for cooperating
-        # writers; the strict recheck fails closed if an injected or hostile
-        # pathname swap is observed before the destructive syscall.
+        # Final destructive syscalls see only the private tombstone name after
+        # its moved inode has been verified.  The caller never unlinks the
+        # original selectable name directly.
         if stat.S_ISLNK(details.st_mode):
-            current = os.lstat(name, dir_fd=parent_descriptor)
+            current = os.lstat(tombstone, dir_fd=parent_descriptor)
             if (int(current.st_dev), int(current.st_ino)) != identity:
                 raise InstallFailure(EXIT_INSTALL, "cleanup", "Managed path changed identity")
-            os.unlink(name, dir_fd=parent_descriptor)
+            _POSIX_UNLINK_SAFE(tombstone, dir_fd=parent_descriptor)
             return
         child_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-        child_fd = os.open(name, child_flags, dir_fd=parent_descriptor)
+        child_fd = os.open(tombstone, child_flags, dir_fd=parent_descriptor)
         try:
             child_details = os.fstat(child_fd)
             if (int(child_details.st_dev), int(child_details.st_ino)) != identity:
                 raise InstallFailure(EXIT_INSTALL, "cleanup", "Managed path changed identity")
-            current = os.lstat(name, dir_fd=parent_descriptor)
+            current = os.lstat(tombstone, dir_fd=parent_descriptor)
             if (int(current.st_dev), int(current.st_ino)) != identity:
                 raise InstallFailure(EXIT_INSTALL, "cleanup", "Managed path changed identity")
-            os.unlink(name, dir_fd=parent_descriptor)
+            _POSIX_UNLINK_SAFE(tombstone, dir_fd=parent_descriptor)
         finally:
             os.close(child_fd)
 
@@ -3283,6 +3550,8 @@ class InstallTransaction:
     backup: Path
     old_receipt: Optional[bytes]
     old_receipt_mode: Optional[int]
+    old_receipt_identity: Optional[tuple[int, ...]]
+    receipt_expected_absent: bool
     previous_moved: bool
     previous_manifest: Optional[dict[str, Any]]
     root_identity: Optional[tuple[int, int]] = None
@@ -3292,7 +3561,25 @@ class InstallTransaction:
     target_identity: Optional[tuple[int, int]] = None
     file_identities: Optional[dict[str, tuple[int, ...]]] = None
     previous_file_identities: Optional[dict[str, tuple[int, ...]]] = None
+    receipt_committed_identity: Optional[tuple[int, ...]] = None
     closed: bool = False
+
+    def _restore_receipt(self) -> None:
+        if self.receipt_committed_identity is None:
+            return
+        if self.old_receipt is None:
+            _unlink_receipt_owned(
+                self.receipt_path,
+                expected_identity=self.receipt_committed_identity,
+            )
+        else:
+            _write_bytes_atomic(
+                self.receipt_path,
+                self.old_receipt,
+                self.old_receipt_mode,
+                expected_identity=self.receipt_committed_identity,
+            )
+        self.receipt_committed_identity = None
 
     def rollback(self) -> bool:
         if self.closed:
@@ -3326,12 +3613,7 @@ class InstallTransaction:
                     break
                 if restore_source is None:
                     if recovery_changed:
-                        if self.old_receipt is None:
-                            _unlink_receipt_owned(self.receipt_path)
-                        else:
-                            _write_bytes_atomic(
-                                self.receipt_path, self.old_receipt, self.old_receipt_mode
-                            )
+                        self._restore_receipt()
                         _cleanup_tree_owned(self.root, self.root_identity, failed)
                         self.closed = True
                         raise InstallFailure(
@@ -3352,10 +3634,7 @@ class InstallTransaction:
                     ),
                 )
             try:
-                if self.old_receipt is None:
-                    _unlink_receipt_owned(self.receipt_path)
-                else:
-                    _write_bytes_atomic(self.receipt_path, self.old_receipt, self.old_receipt_mode)
+                self._restore_receipt()
             except InstallFailure as receipt_error:
                 # A receipt pathname that changed to a link/reparse point is
                 # no longer safe to restore. Keep it untouched, clean only
@@ -3456,13 +3735,20 @@ def _begin_replace_plugin(root: Path, report: Mapping[str, Any]) -> InstallTrans
     receipt_path = _receipt_path()
     _assert_receipt_path_safe(receipt_path)
     try:
+        old_receipt_identity = _receipt_file_identity(receipt_path, "receipt")
         old_receipt = _read_bytes_no_follow(receipt_path, max_bytes=_MAX_RECEIPT_BYTES)
+        _assert_receipt_file_identity_strict(
+            receipt_path,
+            old_receipt_identity,
+            "receipt",
+        )
     except InstallFailure as exc:
         if not _path_present_no_follow(receipt_path):
             old_receipt = None
+            old_receipt_identity = None
         else:
             raise exc
-    old_receipt_mode = _path_mode(receipt_path) if old_receipt is not None else None
+    old_receipt_mode = int(old_receipt_identity[5]) if old_receipt_identity is not None else None
     previous_manifest = _recovery_manifest(target) if target.is_dir() else None
     transaction = InstallTransaction(
         root=root,
@@ -3471,6 +3757,8 @@ def _begin_replace_plugin(root: Path, report: Mapping[str, Any]) -> InstallTrans
         backup=backup,
         old_receipt=old_receipt,
         old_receipt_mode=old_receipt_mode,
+        old_receipt_identity=old_receipt_identity,
+        receipt_expected_absent=old_receipt_identity is None,
         previous_moved=False,
         previous_manifest=previous_manifest,
         root_identity=root_identity,
@@ -3503,7 +3791,12 @@ def _begin_replace_plugin(root: Path, report: Mapping[str, Any]) -> InstallTrans
         )
         transaction.replacement_moved = True
         _assert_physical_root(root, root_identity)
-        _write_json_atomic(receipt_path, _receipt_payload(root, target, report))
+        transaction.receipt_committed_identity = _write_json_atomic(
+            receipt_path,
+            _receipt_payload(root, target, report),
+            expected_identity=transaction.old_receipt_identity,
+            expected_absent=transaction.receipt_expected_absent,
+        )[:2]
         receipt = _read_receipt()
         if receipt is None:
             raise InstallFailure(EXIT_INSTALL, "receipt", "Install receipt commit failed")
@@ -3669,9 +3962,10 @@ def _execute_uninstall(report: dict[str, Any]) -> tuple[dict[str, Any], int]:
         )
     _assert_physical_root(destination, root_identity)
     owned_snapshot = _capture_owned_bytes(target, receipt_path, receipt)
-    # Bind every entry that will be moved into quarantine on every platform;
-    # POSIX cleanup must reject a late unowned child just as Windows does.
-    target_tree_identities = _private_tree_identities(target, "uninstall")
+    # Cleanup authority comes only from the receipt.  A new child is rejected
+    # here, and one added after this capture remains absent from the quarantine
+    # cleanup set so it can never be treated as installer-owned.
+    target_tree_identities = _receipt_tree_identities(target, receipt, "uninstall")
     _assert_target_identity(target, planned_target_identity, "uninstall")
     _assert_owned_file_identities(target, planned_file_identities, "uninstall")
     _assert_physical_root(destination, root_identity)

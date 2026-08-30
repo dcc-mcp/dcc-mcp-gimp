@@ -163,7 +163,7 @@ def _bootstrap_object_identity(path: Path) -> tuple[int, int]:
 def _windows_rename_by_handle(
     source: Path, destination: Path, *, expected_identity: Optional[tuple[int, int]] = None
 ) -> None:
-    """Atomically replace a bootstrap file through its held source handle."""
+    """Atomically rename a bootstrap file without replacing the destination."""
     import ctypes
 
     class _FileRenameInfo(ctypes.Structure):
@@ -175,7 +175,7 @@ def _windows_rename_by_handle(
         ]
 
     encoded = str(destination).encode("utf-16-le") + b"\x00\x00"
-    header = _FileRenameInfo(1, None, len(encoded) - 2, (ctypes.c_ubyte * 2)())
+    header = _FileRenameInfo(0, None, len(encoded) - 2, (ctypes.c_ubyte * 2)())
     offset = _FileRenameInfo.file_name.offset
     payload = (ctypes.c_ubyte * (offset + len(encoded)))()
     ctypes.memmove(payload, ctypes.byref(header), ctypes.sizeof(header))
@@ -379,10 +379,20 @@ def _capture_bootstrap_error(stage: str, error: BaseException) -> None:
                     if current_size + len(line) <= _MAX_BOOTSTRAP_LOG_BYTES:
                         if details is None:
                             descriptor = _windows_create_new_file(path)
+                            created = os.fstat(descriptor)
+                            created_identity = (int(created.st_dev), int(created.st_ino))
                             try:
-                                os.write(descriptor, line)
-                            finally:
-                                os.close(descriptor)
+                                try:
+                                    write_all(descriptor, line)
+                                    os.fsync(descriptor)
+                                finally:
+                                    os.close(descriptor)
+                            except BaseException:
+                                try:
+                                    _delete_bootstrap_owned(path, created_identity)
+                                except (FileNotFoundError, OSError):
+                                    pass
+                                raise
                         else:
                             before = (int(details.st_dev), int(details.st_ino))
                             with _windows_object_handle(path):
@@ -405,22 +415,81 @@ def _capture_bootstrap_error(stage: str, error: BaseException) -> None:
                         return
                     with temporary.open("xb") as stream:
                         stream.write(payload)
+                        stream.flush()
+                        os.fsync(stream.fileno())
                     temporary_identity = _bootstrap_object_identity(temporary)
+                    backup = path.with_name(
+                        ".%s.bootstrap-backup-%s" % (path.name, uuid.uuid4().hex)
+                    )
+                    backup_identity = None
+                    publication_succeeded = False
                     try:
                         if _bootstrap_path_safe(path):
+                            existing_identity = (int(details.st_dev), int(details.st_ino))
+                            _BOOTSTRAP_RENAME_EXPECTED = existing_identity
+                            with _windows_object_handle(
+                                path, access=0x00010000 | 0x80
+                            ) as existing_handle:
+                                _BOOTSTRAP_RENAME_HANDLE = existing_handle
+                                _windows_rename_by_handle(
+                                    path,
+                                    backup,
+                                    expected_identity=existing_identity,
+                                )
+                            _BOOTSTRAP_RENAME_HANDLE = None
+                            _BOOTSTRAP_RENAME_EXPECTED = None
+                            backup_identity = _bootstrap_object_identity(backup)
+                            if backup_identity != existing_identity:
+                                raise OSError("bootstrap log changed identity")
                             _BOOTSTRAP_RENAME_EXPECTED = temporary_identity
                             with _windows_object_handle(
                                 temporary, access=0x00010000 | 0x80
                             ) as temporary_handle:
                                 _BOOTSTRAP_RENAME_HANDLE = temporary_handle
-                                _windows_rename_by_handle(temporary, path)
+                                _windows_rename_by_handle(
+                                    temporary,
+                                    path,
+                                    expected_identity=temporary_identity,
+                                )
                             _BOOTSTRAP_RENAME_HANDLE = None
                             _BOOTSTRAP_RENAME_EXPECTED = None
                             if _bootstrap_object_identity(path) != temporary_identity:
-                                return
+                                raise OSError("bootstrap temporary changed identity")
+                            publication_succeeded = True
+                    except BaseException:
+                        _BOOTSTRAP_RENAME_HANDLE = None
+                        _BOOTSTRAP_RENAME_EXPECTED = None
+                        if backup_identity is not None:
+                            try:
+                                _bootstrap_object_identity(path)
+                            except (FileNotFoundError, OSError):
+                                try:
+                                    _BOOTSTRAP_RENAME_EXPECTED = backup_identity
+                                    with _windows_object_handle(
+                                        backup, access=0x00010000 | 0x80
+                                    ) as backup_handle:
+                                        _BOOTSTRAP_RENAME_HANDLE = backup_handle
+                                        _windows_rename_by_handle(
+                                            backup,
+                                            path,
+                                            expected_identity=backup_identity,
+                                        )
+                                    _BOOTSTRAP_RENAME_HANDLE = None
+                                    _BOOTSTRAP_RENAME_EXPECTED = None
+                                    if _bootstrap_object_identity(path) != backup_identity:
+                                        raise OSError("bootstrap rollback changed identity")
+                                    backup_identity = None
+                                except OSError:
+                                    pass
+                        raise
                     finally:
                         _BOOTSTRAP_RENAME_HANDLE = None
                         _BOOTSTRAP_RENAME_EXPECTED = None
+                        if publication_succeeded and backup_identity is not None:
+                            try:
+                                _delete_bootstrap_owned(backup, backup_identity)
+                            except (FileNotFoundError, OSError):
+                                pass
                         try:
                             if _bootstrap_object_identity(temporary) == temporary_identity:
                                 _delete_bootstrap_owned(temporary, temporary_identity)
