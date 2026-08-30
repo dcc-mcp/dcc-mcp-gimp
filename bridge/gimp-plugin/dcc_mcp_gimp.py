@@ -10,6 +10,7 @@ import os
 import secrets
 import socket
 import socketserver
+import stat
 import sys
 import threading
 import time
@@ -54,6 +55,127 @@ def _bootstrap_path_safe(path: Path) -> bool:
         candidate = parent
 
 
+@contextmanager
+def _windows_directory_lease(path: Path):
+    """Hold a bootstrap parent without allowing pathname replacement."""
+    if os.name != "nt":
+        yield
+        return
+    import ctypes
+
+    try:
+        before = os.lstat(str(path))
+        if _path_is_link_or_reparse(path):
+            raise OSError("bootstrap parent is linked")
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateFileW.argtypes = [
+            ctypes.c_wchar_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+        ]
+        kernel32.CreateFileW.restype = ctypes.c_void_p
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = ctypes.c_int
+        handle = kernel32.CreateFileW(
+            str(path),
+            0x80 | 0x20,
+            0x1 | 0x2,
+            None,
+            3,
+            0x02000000 | 0x00200000,
+            None,
+        )
+        invalid = ctypes.c_void_p(-1).value
+        if handle in (None, invalid):
+            raise OSError(ctypes.get_last_error(), "bootstrap parent lease failed")
+        after = os.lstat(str(path))
+        if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+            kernel32.CloseHandle(handle)
+            raise OSError("bootstrap parent changed identity")
+    except (AttributeError, OSError, RuntimeError, ValueError):
+        raise
+    try:
+        yield
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+@contextmanager
+def _windows_object_handle(path: Path):
+    """Hold one bootstrap file with delete sharing disabled."""
+    if os.name != "nt":
+        yield
+        return
+    import ctypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+    ]
+    kernel32.CreateFileW.restype = ctypes.c_void_p
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+    handle = kernel32.CreateFileW(
+        str(path),
+        0x80,
+        0x1 | 0x2,
+        None,
+        3,
+        0x02000000,
+        None,
+    )
+    invalid = ctypes.c_void_p(-1).value
+    if handle in (None, invalid):
+        raise OSError(ctypes.get_last_error(), "bootstrap file handle failed")
+    try:
+        if _path_is_link_or_reparse(path):
+            raise OSError("bootstrap file is linked")
+        yield
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _windows_rename_by_handle(source: Path, destination: Path) -> None:
+    """Atomically replace a bootstrap file through its held source handle."""
+    import ctypes
+
+    class _FileRenameInfo(ctypes.Structure):
+        _fields_ = [
+            ("replace_if_exists", ctypes.c_uint32),
+            ("root_directory", ctypes.c_void_p),
+            ("file_name_length", ctypes.c_uint32),
+            ("file_name", ctypes.c_ubyte * 2),
+        ]
+
+    encoded = str(destination).encode("utf-16-le") + b"\x00\x00"
+    header = _FileRenameInfo(1, None, len(encoded) - 2, (ctypes.c_ubyte * 2)())
+    offset = _FileRenameInfo.file_name.offset
+    payload = (ctypes.c_ubyte * (offset + len(encoded)))()
+    ctypes.memmove(payload, ctypes.byref(header), ctypes.sizeof(header))
+    ctypes.memmove(ctypes.addressof(payload) + offset, encoded, len(encoded))
+    with _windows_object_handle(source) as handle:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.SetFileInformationByHandle.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+        ]
+        kernel32.SetFileInformationByHandle.restype = ctypes.c_int
+        if not kernel32.SetFileInformationByHandle(handle, 3, payload, len(payload)):
+            raise OSError(ctypes.get_last_error(), "bootstrap rename failed")
+
+
 def _bootstrap_error_path() -> Path:
     configured = os.environ.get("DCC_MCP_GIMP_BOOTSTRAP_ERRORS")
     if configured:
@@ -82,34 +204,141 @@ def _capture_bootstrap_error(stage: str, error: BaseException) -> None:
             line = (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode(
                 "utf-8"
             )
-            current_size = path.stat().st_size if path.is_file() else 0
-            if current_size + len(line) <= _MAX_BOOTSTRAP_LOG_BYTES:
-                with path.open("ab") as stream:
-                    stream.write(line)
+
+            def rotate(existing: bytes, current_size: int) -> bytes:
+                lines = existing.splitlines(keepends=True)
+                if current_size > _MAX_BOOTSTRAP_LOG_BYTES and b"\n" in existing:
+                    lines = lines[1:]
+                lines = lines[-(_MAX_BOOTSTRAP_RECORDS - 1) :]
+                while (
+                    lines
+                    and sum(len(item) for item in lines) + len(line) > _MAX_BOOTSTRAP_LOG_BYTES
+                ):
+                    lines.pop(0)
+                return b"".join(lines) + line
+
+            if os.name == "nt":
+                with _windows_directory_lease(path.parent):
+                    if not _bootstrap_path_safe(path):
+                        return
+                    try:
+                        details = os.lstat(str(path))
+                    except FileNotFoundError:
+                        details = None
+                    if details is not None and (
+                        not os.path.isfile(path) or _path_is_link_or_reparse(path)
+                    ):
+                        return
+                    current_size = int(details.st_size) if details is not None else 0
+                    if current_size + len(line) <= _MAX_BOOTSTRAP_LOG_BYTES:
+                        if details is None:
+                            flags = (
+                                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+                            )
+                            descriptor = os.open(str(path), flags, 0o666)
+                            try:
+                                os.write(descriptor, line)
+                            finally:
+                                os.close(descriptor)
+                        else:
+                            before = (int(details.st_dev), int(details.st_ino))
+                            with _windows_object_handle(path):
+                                opened = os.lstat(str(path))
+                                if (int(opened.st_dev), int(opened.st_ino)) != before:
+                                    return
+                                with path.open("ab") as stream:
+                                    stream.write(line)
+                                after = os.lstat(str(path))
+                                if (int(after.st_dev), int(after.st_ino)) != before:
+                                    return
+                        return
+                    with _windows_object_handle(path):
+                        with path.open("rb") as stream:
+                            stream.seek(max(0, current_size - _MAX_BOOTSTRAP_LOG_BYTES))
+                            existing = stream.read(_MAX_BOOTSTRAP_LOG_BYTES)
+                    payload = rotate(existing, current_size)
+                    temporary = path.with_name(".%s.%s.tmp" % (path.name, uuid.uuid4().hex))
+                    if not _bootstrap_path_safe(temporary):
+                        return
+                    with temporary.open("xb") as stream:
+                        stream.write(payload)
+                    try:
+                        if _bootstrap_path_safe(path):
+                            _windows_rename_by_handle(temporary, path)
+                    finally:
+                        try:
+                            temporary.unlink()
+                        except FileNotFoundError:
+                            pass
                 return
-            with path.open("rb") as stream:
-                stream.seek(max(0, current_size - _MAX_BOOTSTRAP_LOG_BYTES))
-                existing = stream.read(_MAX_BOOTSTRAP_LOG_BYTES)
-            lines = existing.splitlines(keepends=True)
-            if current_size > _MAX_BOOTSTRAP_LOG_BYTES and b"\n" in existing:
-                lines = lines[1:]
-            lines = lines[-(_MAX_BOOTSTRAP_RECORDS - 1) :]
-            while lines and sum(len(item) for item in lines) + len(line) > _MAX_BOOTSTRAP_LOG_BYTES:
-                lines.pop(0)
-            payload = b"".join(lines) + line
-            temporary = path.with_name(".%s.%s.tmp" % (path.name, uuid.uuid4().hex))
-            if not _bootstrap_path_safe(temporary):
-                return
-            with temporary.open("xb") as stream:
-                stream.write(payload)
+
+            parent_descriptor = os.open(
+                str(path.parent),
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+            )
+            temporary_name = None
             try:
-                if _bootstrap_path_safe(path):
-                    os.replace(temporary, path)
-            finally:
                 try:
-                    temporary.unlink()
+                    details = os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
                 except FileNotFoundError:
-                    pass
+                    details = None
+                if details is not None and not stat.S_ISREG(details.st_mode):
+                    return
+                current_size = int(details.st_size) if details is not None else 0
+                if current_size + len(line) <= _MAX_BOOTSTRAP_LOG_BYTES:
+                    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+                    descriptor = os.open(path.name, flags, 0o666, dir_fd=parent_descriptor)
+                    try:
+                        opened = os.fstat(descriptor)
+                        if details is not None and (int(opened.st_dev), int(opened.st_ino)) != (
+                            int(details.st_dev),
+                            int(details.st_ino),
+                        ):
+                            return
+                        os.write(descriptor, line)
+                    finally:
+                        os.close(descriptor)
+                    return
+                descriptor = os.open(
+                    path.name,
+                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=parent_descriptor,
+                )
+                try:
+                    opened = os.fstat(descriptor)
+                    if (int(opened.st_dev), int(opened.st_ino)) != (
+                        int(details.st_dev),
+                        int(details.st_ino),
+                    ):
+                        return
+                    os.lseek(
+                        descriptor, max(0, current_size - _MAX_BOOTSTRAP_LOG_BYTES), os.SEEK_SET
+                    )
+                    existing = os.read(descriptor, _MAX_BOOTSTRAP_LOG_BYTES)
+                finally:
+                    os.close(descriptor)
+                payload = rotate(existing, current_size)
+                temporary_name = ".%s.%s.tmp" % (path.name, uuid.uuid4().hex)
+                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+                descriptor = os.open(temporary_name, flags, 0o666, dir_fd=parent_descriptor)
+                try:
+                    os.write(descriptor, payload)
+                finally:
+                    os.close(descriptor)
+                os.replace(
+                    temporary_name,
+                    path.name,
+                    src_dir_fd=parent_descriptor,
+                    dst_dir_fd=parent_descriptor,
+                )
+                temporary_name = None
+            finally:
+                if temporary_name is not None:
+                    try:
+                        os.unlink(temporary_name, dir_fd=parent_descriptor)
+                    except (FileNotFoundError, OSError):
+                        pass
+                os.close(parent_descriptor)
     except OSError:
         pass
 
