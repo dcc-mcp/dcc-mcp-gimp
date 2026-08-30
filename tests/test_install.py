@@ -1174,6 +1174,64 @@ def test_recovery_copy_destination_swap_does_not_write_external(tmp_path, monkey
     assert not (external / "dcc_mcp_gimp" / "owned.txt").exists()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Exercises POSIX owned transaction cleanup")
+def test_private_quarantine_cleanup_rejects_unowned_entries(tmp_path):
+    from dcc_mcp_gimp import install_files
+
+    quarantine = tmp_path / "quarantine"
+    quarantine.mkdir()
+    owned = quarantine / "dcc_mcp_gimp"
+    owned.mkdir()
+    (owned / "dcc_mcp_gimp.py").write_text("owned", encoding="utf-8")
+    foreign = quarantine / "operator.txt"
+    foreign.write_text("do not delete", encoding="utf-8")
+    expected = install_files._private_tree_identities(owned, "uninstall")
+    expected = {
+        "": install_files._object_identity(quarantine, "uninstall"),
+        **{
+            "dcc_mcp_gimp" if not relative else f"dcc_mcp_gimp/{relative}": identity
+            for relative, identity in expected.items()
+        },
+    }
+
+    with pytest.raises(install_files.InstallFailure):
+        install_files._cleanup_private_tree(
+            quarantine,
+            expected_identities=expected,
+        )
+
+    assert foreign.read_text(encoding="utf-8") == "do not delete"
+    assert (owned / "dcc_mcp_gimp.py").read_text(encoding="utf-8") == "owned"
+
+
+def test_uninstall_quarantine_late_unowned_entry_is_preserved(lifecycle_env, monkeypatch):
+    from dcc_mcp_gimp import install_files
+    from dcc_mcp_gimp.install import run
+
+    installed, code, _ = run(["install", "--yes", *lifecycle_env.common])
+    assert code == 0, installed
+    original_move = install_files._replace_receipt_owned
+
+    def move_then_inject(source, destination, root, expected_identity):
+        result = original_move(source, destination, root, expected_identity)
+        (destination.parent / "operator.txt").write_text("do not delete", encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(install_files, "_replace_receipt_owned", move_then_inject)
+    report, code, _ = run(["uninstall", "--yes", *lifecycle_env.common])
+
+    assert code != 0, report
+    assert report["status"] == "failed"
+    assert (lifecycle_env.plugins / "dcc_mcp_gimp" / "dcc_mcp_gimp.py").is_file()
+    transactions = list(lifecycle_env.plugins.parent.glob(".dcc-mcp-gimp-uninstall-*"))
+    assert transactions
+    assert any(
+        (candidate / "quarantine" / "operator.txt").read_text(encoding="utf-8") == "do not delete"
+        for candidate in transactions
+        if (candidate / "quarantine" / "operator.txt").is_file()
+    )
+
+
 def test_verify_runtime_shape_failure_is_structured(lifecycle_env, monkeypatch):
     from dcc_mcp_gimp.install import run
 
