@@ -91,6 +91,66 @@ def _assert_executable_identity(
 
 
 @contextlib.contextmanager
+def _posix_executable_binding(
+    path: Path,
+    expected: Optional[tuple[int, int, int, int]],
+    stage: str,
+) -> Any:
+    """Bind a POSIX child launch to the executable object selected by preflight."""
+    if os.name == "nt":
+        yield {}
+        return
+    descriptor = None
+    try:
+        descriptor = os.open(
+            str(path),
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+        )
+        details = os.fstat(descriptor)
+        actual = (
+            int(details.st_dev),
+            int(details.st_ino),
+            int(details.st_size),
+            int(getattr(details, "st_mtime_ns", int(details.st_mtime * 1_000_000_000))),
+        )
+        if not stat.S_ISREG(details.st_mode) or (
+            expected is not None and actual != tuple(expected)
+        ):
+            raise InstallFailure(EXIT_PREFLIGHT, stage, "Selected executable changed identity")
+        launch_path = None
+        for descriptor_root in (Path("/proc/self/fd"), Path("/dev/fd")):
+            candidate = descriptor_root / str(descriptor)
+            try:
+                candidate_details = os.stat(str(candidate))
+            except OSError:
+                continue
+            if (int(candidate_details.st_dev), int(candidate_details.st_ino)) == actual[:2]:
+                launch_path = candidate
+                break
+        if launch_path is None:
+            raise InstallFailure(
+                EXIT_PREFLIGHT,
+                stage,
+                "POSIX identity-bound executable launch is unavailable",
+            )
+        yield {"executable": str(launch_path), "pass_fds": (descriptor,)}
+    except InstallFailure:
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise InstallFailure(
+            EXIT_PREFLIGHT,
+            stage,
+            "POSIX identity-bound executable launch is unavailable",
+        ) from exc
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+@contextlib.contextmanager
 def _windows_executable_lease(path: Path, stage: str) -> Any:
     """Hold the executable parent against a Windows rename/reparse swap."""
     if os.name != "nt":
@@ -448,17 +508,21 @@ def _gimp_version(
         command.append("--appimage-extract-and-run")
     command.append("--version")
     try:
-        with _windows_executable_lease(executable, "gimp_version"):
-            with _windows_executable_handle(executable, "gimp_version"):
-                _assert_executable_identity(executable, expected_identity, "gimp_version")
-                completed = subprocess.run(
-                    command,
-                    capture_output=True,
-                    text=True,
-                    timeout=15,
-                    check=False,
-                )
-                _assert_executable_identity(executable, expected_identity, "gimp_version")
+        with _posix_executable_binding(
+            executable, expected_identity, "gimp_version"
+        ) as launch_options:
+            with _windows_executable_lease(executable, "gimp_version"):
+                with _windows_executable_handle(executable, "gimp_version"):
+                    _assert_executable_identity(executable, expected_identity, "gimp_version")
+                    completed = subprocess.run(
+                        command,
+                        capture_output=True,
+                        text=True,
+                        timeout=15,
+                        check=False,
+                        **launch_options,
+                    )
+                    _assert_executable_identity(executable, expected_identity, "gimp_version")
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise InstallFailure(EXIT_PREFLIGHT, "gimp_version", str(exc)) from exc
     output = "%s\n%s" % (completed.stdout, completed.stderr)
@@ -568,17 +632,19 @@ print(
 )
     """.strip()
     try:
-        with _windows_executable_lease(python, "python"):
-            with _windows_executable_handle(python, "python"):
-                _assert_executable_identity(python, expected_identity, "python")
-                completed = subprocess.run(
-                    [str(python), "-c", code],
-                    capture_output=True,
-                    text=True,
-                    timeout=15,
-                    check=False,
-                )
-                _assert_executable_identity(python, expected_identity, "python")
+        with _posix_executable_binding(python, expected_identity, "python") as launch_options:
+            with _windows_executable_lease(python, "python"):
+                with _windows_executable_handle(python, "python"):
+                    _assert_executable_identity(python, expected_identity, "python")
+                    completed = subprocess.run(
+                        [str(python), "-c", code],
+                        capture_output=True,
+                        text=True,
+                        timeout=15,
+                        check=False,
+                        **launch_options,
+                    )
+                    _assert_executable_identity(python, expected_identity, "python")
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise InstallFailure(EXIT_PREFLIGHT, "python", str(exc)) from exc
     if completed.returncode:
