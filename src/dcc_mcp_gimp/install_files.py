@@ -602,7 +602,13 @@ def _assert_receipt_name_identity(
     path: Path, expected: tuple[int, ...], stage: str = "receipt"
 ) -> None:
     """Re-check the pathname itself after descriptor checks and race hooks."""
-    _assert_receipt_file_identity(path, expected, stage)
+    actual = _receipt_file_identity(path, stage)
+    if len(expected) == 2:
+        matches = actual[:2] == tuple(expected)
+    else:
+        matches = actual == tuple(expected)
+    if not matches:
+        raise InstallFailure(EXIT_PREFLIGHT, stage, "Managed receipt file changed identity")
 
 
 def _receipt_descriptor_identity(
@@ -1234,6 +1240,7 @@ def _replace_receipt_owned(
         _assert_receipt_descriptor_identity(
             source_descriptor, source.name, source_identity, "uninstall"
         )
+        _assert_receipt_file_identity(source, source_identity, "uninstall")
         _assert_receipt_name_identity(source, source_identity, "uninstall")
         os.replace(
             source.name,
@@ -1278,6 +1285,7 @@ def _unlink_receipt_owned(path: Path) -> None:
         _assert_receipt_path_safe(path)
         descriptor = _open_absolute_dir_nofollow(path.parent)
         _assert_receipt_descriptor_identity(descriptor, path.name, expected_identity, "receipt")
+        _assert_receipt_file_identity(path, expected_identity, "receipt")
         _assert_receipt_name_identity(path, expected_identity, "receipt")
         os.unlink(path.name, dir_fd=descriptor)
     except FileNotFoundError:
@@ -1788,7 +1796,13 @@ def _copy_validated_recovery(
     expected = _recovery_manifest(source)
     destination_parent = recovery.parent
     destination_parent_identity = _directory_identity(destination_parent, "recovery")
-    staging_root = Path(tempfile.mkdtemp(prefix="dcc-mcp-gimp-recovery-"))
+    staging_parent = destination_parent.parent
+    _assert_path_components_safe(staging_parent, "recovery")
+    staging_parent_identity = _directory_identity(staging_parent, "recovery")
+    staging_root = Path(tempfile.mkdtemp(prefix=".dcc-mcp-gimp-recovery-", dir=str(staging_parent)))
+    if _directory_identity(staging_parent, "recovery") != staging_parent_identity:
+        shutil.rmtree(staging_root, ignore_errors=True)
+        raise InstallFailure(EXIT_PREFLIGHT, "recovery", "Recovery staging parent changed identity")
     staged_recovery = staging_root / recovery.name
     try:
         # Build the snapshot outside the managed tree.  A pathname swap of the
