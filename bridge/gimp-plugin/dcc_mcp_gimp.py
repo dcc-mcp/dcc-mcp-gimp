@@ -552,7 +552,9 @@ def _capture_bootstrap_error(stage: str, error: BaseException) -> None:
                     return
                 current_size = int(details.st_size) if details is not None else 0
                 if current_size + len(line) <= _MAX_BOOTSTRAP_LOG_BYTES:
-                    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+                    flags = os.O_WRONLY | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+                    if details is None:
+                        flags |= os.O_CREAT | os.O_EXCL
                     descriptor = os.open(path.name, flags, 0o666, dir_fd=parent_descriptor)
                     try:
                         opened = os.fstat(descriptor)

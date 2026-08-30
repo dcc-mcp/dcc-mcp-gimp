@@ -2,6 +2,7 @@ import hashlib
 import importlib.resources
 import json
 import os
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -1248,6 +1249,30 @@ def test_receipt_atomic_write_failure_preserves_previous_bytes(tmp_path, monkeyp
     assert receipt.read_bytes() == expected
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Exercises POSIX receipt publication rollback")
+def test_receipt_directory_fsync_failure_restores_previous_bytes(tmp_path, monkeypatch):
+    from dcc_mcp_gimp import install_files
+
+    receipt = tmp_path / "gimp.json"
+    receipt.write_bytes(b"OLD-RECEIPT")
+    original_fsync = install_files.os.fsync
+    state = {"failed": False}
+
+    def fail_first_directory_fsync(descriptor):
+        details = os.fstat(descriptor)
+        if stat.S_ISDIR(details.st_mode) and not state["failed"]:
+            state["failed"] = True
+            raise OSError("injected receipt directory fsync failure")
+        return original_fsync(descriptor)
+
+    monkeypatch.setattr(install_files.os, "fsync", fail_first_directory_fsync)
+    with pytest.raises(install_files.InstallFailure, match="could not be written"):
+        install_files._write_bytes_atomic(receipt, b"NEW-RECEIPT")
+
+    assert state["failed"] is True
+    assert receipt.read_bytes() == b"OLD-RECEIPT"
+
+
 @pytest.mark.skipif(os.name == "nt", reason="Exercises POSIX bound receipt publication")
 def test_receipt_atomic_final_name_create_preserves_previous_and_foreign(tmp_path, monkeypatch):
     from dcc_mcp_gimp import install_files
@@ -1499,6 +1524,78 @@ def test_launch_preflight_rejects_changed_executable_identity(tmp_path):
     python.write_bytes(b"attacker")
     with pytest.raises(InstallFailure, match="identity"):
         _target_versions(python, expected_identity=python_identity)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Exercises POSIX descriptor-bound launch")
+def test_posix_launch_executes_checked_gimp_and_python_during_path_aba(tmp_path, monkeypatch):
+    from dcc_mcp_gimp.install_host import _executable_identity, _gimp_version, _target_versions
+
+    gimp = tmp_path / "gimp-3.0"
+    python = tmp_path / "python"
+    gimp.write_bytes(b"SELECTED-GIMP")
+    python.write_bytes(b"SELECTED-PYTHON")
+    expected = {gimp: _executable_identity(gimp), python: _executable_identity(python)}
+    calls = []
+
+    def aba_run(command, **kwargs):
+        selected = Path(command[0])
+        selected_bytes = selected.read_bytes()
+        parked = selected.with_name(selected.name + ".selected")
+        foreign = selected.with_name(selected.name + ".foreign")
+        foreign.write_bytes(b"FOREIGN")
+        selected.rename(parked)
+        foreign.rename(selected)
+        try:
+            bound_path = Path(kwargs["executable"])
+            pass_fds = tuple(kwargs["pass_fds"])
+            assert bound_path != selected
+            assert int(bound_path.name) in pass_fds
+            assert bound_path.read_bytes() == selected_bytes
+            calls.append(selected.name)
+        finally:
+            selected.rename(foreign)
+            parked.rename(selected)
+        if selected == gimp:
+            output = "GNU Image Manipulation Program version 3.0.8\n"
+        else:
+            output = json.dumps(_target_metadata(python))
+        return subprocess.CompletedProcess(command, 0, stdout=output, stderr="")
+
+    monkeypatch.setattr("dcc_mcp_gimp.install_host.subprocess.run", aba_run)
+
+    assert _gimp_version(gimp, expected_identity=expected[gimp]) == "3.0.8"
+    versions = _target_versions(python, expected_identity=expected[python])
+    assert versions["python_executable"] == str(python.resolve())
+    assert calls == ["gimp-3.0", "python"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Exercises POSIX descriptor launch availability")
+def test_posix_launch_fails_closed_without_descriptor_endpoint(tmp_path, monkeypatch):
+    from dcc_mcp_gimp import install_host
+
+    executable = tmp_path / "gimp-3.0"
+    executable.write_bytes(b"SELECTED-GIMP")
+    expected = install_host._executable_identity(executable)
+    original_stat = install_host.os.stat
+    called = False
+
+    def hide_descriptor_endpoint(path, *args, **kwargs):
+        value = os.fspath(path)
+        if value.startswith("/proc/self/fd/") or value.startswith("/dev/fd/"):
+            raise FileNotFoundError(value)
+        return original_stat(path, *args, **kwargs)
+
+    def unexpected_run(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("subprocess must not start without an identity-bound endpoint")
+
+    monkeypatch.setattr(install_host.os, "stat", hide_descriptor_endpoint)
+    monkeypatch.setattr(install_host.subprocess, "run", unexpected_run)
+
+    with pytest.raises(install_host.InstallFailure, match="identity-bound"):
+        install_host._gimp_version(executable, expected_identity=expected)
+    assert called is False
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Exercises POSIX profile-root swap")
@@ -2071,6 +2168,64 @@ def test_stage_path_swap_is_not_published(lifecycle_env, monkeypatch):
     assert not (lifecycle_env.plugins / "dcc_mcp_gimp" / "operator.txt").exists()
     assert state["parked"].is_dir()
     assert (state["stage"] / "operator.txt").read_text(encoding="utf-8") == "foreign"
+
+
+def test_structured_stage_validation_failure_cleans_owned_stage(tmp_path, monkeypatch):
+    from dcc_mcp_gimp import install_files
+
+    root = tmp_path / "plug-ins"
+    root.mkdir()
+    original_evidence = install_files._file_evidence
+    state = {"failed": False}
+
+    def reject_staged_file(path, manifest_root, *args, **kwargs):
+        if Path(manifest_root).name.endswith(".stage"):
+            state["failed"] = True
+            raise install_files.InstallFailure(
+                install_files.EXIT_PREFLIGHT,
+                "install",
+                "injected structured stage validation failure",
+            )
+        return original_evidence(path, manifest_root, *args, **kwargs)
+
+    monkeypatch.setattr(install_files, "_file_evidence", reject_staged_file)
+    with pytest.raises(install_files.InstallFailure, match="structured stage validation"):
+        install_files._stage_plugin(root)
+
+    assert state["failed"] is True
+    assert not list(root.glob(".dcc_mcp_gimp.*.stage"))
+
+
+def test_structured_stage_cleanup_preserves_replaced_stage_name(tmp_path, monkeypatch):
+    from dcc_mcp_gimp import install_files
+
+    root = tmp_path / "plug-ins"
+    root.mkdir()
+    original_evidence = install_files._file_evidence
+    state = {}
+
+    def replace_then_reject(path, manifest_root, *args, **kwargs):
+        stage = Path(manifest_root)
+        if stage.name.endswith(".stage"):
+            parked = stage.with_name(stage.name + ".owned")
+            stage.rename(parked)
+            stage.mkdir()
+            foreign = stage / "operator.txt"
+            foreign.write_text("preserve", encoding="utf-8")
+            state.update(stage=stage, parked=parked, foreign=foreign)
+            raise install_files.InstallFailure(
+                install_files.EXIT_PREFLIGHT,
+                "install",
+                "injected replaced stage validation failure",
+            )
+        return original_evidence(path, manifest_root, *args, **kwargs)
+
+    monkeypatch.setattr(install_files, "_file_evidence", replace_then_reject)
+    with pytest.raises(install_files.InstallFailure, match="replaced stage validation"):
+        install_files._stage_plugin(root)
+
+    assert state["foreign"].read_text(encoding="utf-8") == "preserve"
+    assert state["parked"].is_dir()
 
 
 def test_stage_child_rewrite_is_not_published_or_receipted(lifecycle_env, monkeypatch):

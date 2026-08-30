@@ -171,6 +171,29 @@ def test_runtime_bootstrap_concurrent_writers_remain_bounded(runtime, tmp_path, 
     assert errors.stat().st_size <= 256 * 1024
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Exercises POSIX bootstrap first-create race")
+def test_runtime_bootstrap_first_create_does_not_append_to_raced_file(
+    runtime, tmp_path, monkeypatch
+):
+    errors = tmp_path / "bootstrap-errors.jsonl"
+    monkeypatch.setenv("DCC_MCP_GIMP_BOOTSTRAP_ERRORS", str(errors))
+    capture = runtime["_capture_bootstrap_error"]
+    original_open = os.open
+    state = {"injected": False}
+
+    def race_open(path, flags, *args, **kwargs):
+        if path == errors.name and flags & os.O_CREAT and not state["injected"]:
+            errors.write_bytes(b"OPERATOR-BOOTSTRAP")
+            state["injected"] = True
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", race_open)
+    capture("bridge-startup", RuntimeError("must not append"))
+
+    assert state["injected"] is True
+    assert errors.read_bytes() == b"OPERATOR-BOOTSTRAP"
+
+
 @pytest.mark.skipif(os.name == "nt", reason="Exercises POSIX bootstrap publication")
 def test_runtime_bootstrap_rotation_ignores_swapped_python_rename(runtime, tmp_path, monkeypatch):
     errors = tmp_path / "bootstrap-errors.jsonl"

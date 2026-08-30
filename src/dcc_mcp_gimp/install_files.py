@@ -1771,27 +1771,31 @@ def _write_atomic_at_parent(
                         )
                     except InstallFailure:
                         current = None
-                    if current is not None and current[:2] != temporary_identity:
-                        foreign_name = ".%s.receipt-foreign-%s" % (path.name, uuid.uuid4().hex)
-                        try:
-                            _posix_rename_at(
+                    if current is not None:
+                        if current[:2] == temporary_identity:
+                            try:
+                                _unlink_posix_name(
+                                    parent_descriptor,
+                                    path.name,
+                                    temporary_identity,
+                                    "receipt",
+                                )
+                            except (InstallFailure, OSError):
+                                pass
+                        else:
+                            foreign_name = ".%s.receipt-foreign-%s" % (
                                 path.name,
-                                foreign_name,
-                                parent_descriptor,
-                                parent_descriptor,
+                                uuid.uuid4().hex,
                             )
-                        except OSError:
-                            pass
-                if committed:
-                    try:
-                        _unlink_posix_name(
-                            parent_descriptor,
-                            temporary_path.name,
-                            temporary_identity,
-                            "receipt",
-                        )
-                    except InstallFailure:
-                        pass
+                            try:
+                                _posix_rename_at(
+                                    path.name,
+                                    foreign_name,
+                                    parent_descriptor,
+                                    parent_descriptor,
+                                )
+                            except OSError:
+                                pass
                 if backup_name is not None and backup_identity is not None:
                     try:
                         current_destination = os.stat(
@@ -2501,6 +2505,7 @@ def _stage_plugin(root: Path) -> Path:
             stage_cleanup_identities = {"": _object_identity(stage, "install")}
             script = stage / ("%s.py" % _PLUGIN_NAME)
             shutil.copy2(source, script)
+            stage_cleanup_identities[script.name] = _object_identity(script, "install")
             _assert_physical_root(root, root_identity)
         staged_record, staged_identity = _file_evidence(script, stage)
         stage_cleanup_identities[script.name] = staged_identity
@@ -2520,9 +2525,7 @@ def _stage_plugin(root: Path) -> Path:
             tree_identities={"": stage_identity, script.name: staged_identity},
         )
         return stage
-    except InstallFailure:
-        raise
-    except OSError as exc:
+    except BaseException as exc:
         try:
             _cleanup_tree_owned(
                 root,
@@ -2532,7 +2535,13 @@ def _stage_plugin(root: Path) -> Path:
             )
         except InstallFailure:
             pass
-        raise InstallFailure(EXIT_INSTALL, "install", "Plug-in staging failed: %s" % exc) from exc
+        if isinstance(exc, InstallFailure):
+            raise
+        if isinstance(exc, OSError):
+            raise InstallFailure(
+                EXIT_INSTALL, "install", "Plug-in staging failed: %s" % exc
+            ) from exc
+        raise
     finally:
         if stage_descriptor is not None:
             try:
