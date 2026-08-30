@@ -37,6 +37,8 @@ from .install_host import default_plugin_dir
 
 _MAX_RECEIPT_BYTES = 1024 * 1024
 _MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024
+_MAX_MANIFEST_ENTRIES = 4096
+_MAX_MANIFEST_DEPTH = 64
 _DEFAULT_SAFE_REMOVE_TREE = safe_remove_tree
 
 
@@ -175,10 +177,24 @@ def _owned_root_manifest(
     total_bytes = 0
     for current, dirnames, filenames in os.walk(str(root), topdown=True, followlinks=False):
         current_path = Path(current)
+        try:
+            current_depth = len(current_path.relative_to(root).parts)
+        except ValueError as exc:
+            raise InstallFailure(
+                EXIT_PREFLIGHT, "receipt", "Managed manifest escaped its root"
+            ) from exc
+        if current_depth > _MAX_MANIFEST_DEPTH:
+            raise InstallFailure(EXIT_PREFLIGHT, "receipt", "Managed manifest is too deep")
         traversable: list[str] = []
         for name in sorted(dirnames):
             path = current_path / name
             relative = path.relative_to(root).as_posix()
+            if len(directories) + len(files) + len(links) >= _MAX_MANIFEST_ENTRIES:
+                raise InstallFailure(
+                    EXIT_PREFLIGHT, "receipt", "Managed manifest has too many entries"
+                )
+            if len(Path(relative).parts) > _MAX_MANIFEST_DEPTH:
+                raise InstallFailure(EXIT_PREFLIGHT, "receipt", "Managed manifest is too deep")
             if _is_link(path):
                 links.append(relative)
             else:
@@ -188,6 +204,12 @@ def _owned_root_manifest(
         for name in sorted(filenames):
             path = current_path / name
             relative = path.relative_to(root).as_posix()
+            if len(directories) + len(files) + len(links) >= _MAX_MANIFEST_ENTRIES:
+                raise InstallFailure(
+                    EXIT_PREFLIGHT, "receipt", "Managed manifest has too many entries"
+                )
+            if len(Path(relative).parts) > _MAX_MANIFEST_DEPTH:
+                raise InstallFailure(EXIT_PREFLIGHT, "receipt", "Managed manifest is too deep")
             if _is_link(path):
                 links.append(relative)
             else:
@@ -1082,35 +1104,49 @@ def _write_atomic_at_parent(path: Path, data: bytes, mode: Optional[int] = None)
     created_temp = False
     try:
         parent_descriptor = _open_absolute_dir_nofollow(path.parent, create=True)
-        temporary_name = ".%s.%s.tmp" % (path.name, uuid.uuid4().hex)
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
-        file_descriptor = os.open(temporary_name, flags, 0o666, dir_fd=parent_descriptor)
-        created_temp = True
-        try:
-            view = memoryview(data)
-            while view:
-                written = os.write(file_descriptor, view)
-                view = view[written:]
-        finally:
-            os.close(file_descriptor)
-        if mode is not None:
-            os.chmod(temporary_name, mode, dir_fd=parent_descriptor, follow_symlinks=False)
-        temporary_identity = os.stat(
-            temporary_name, dir_fd=parent_descriptor, follow_symlinks=False
-        )
-        expected_inode = (int(temporary_identity.st_dev), int(temporary_identity.st_ino))
-        current_temp = os.stat(temporary_name, dir_fd=parent_descriptor, follow_symlinks=False)
-        if (int(current_temp.st_dev), int(current_temp.st_ino)) != expected_inode:
-            raise InstallFailure(EXIT_PREFLIGHT, "receipt", "Managed receipt file changed identity")
-        os.replace(
-            temporary_name,
-            path.name,
-            src_dir_fd=parent_descriptor,
-            dst_dir_fd=parent_descriptor,
-        )
-        current_target = os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
-        if (int(current_target.st_dev), int(current_target.st_ino)) != expected_inode:
-            raise InstallFailure(EXIT_PREFLIGHT, "receipt", "Managed receipt file changed identity")
+        with _posix_directory_lock(parent_descriptor):
+            temporary_name = ".%s.%s.tmp" % (path.name, uuid.uuid4().hex)
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+            file_descriptor = os.open(temporary_name, flags, 0o666, dir_fd=parent_descriptor)
+            created_temp = True
+            try:
+                view = memoryview(data)
+                while view:
+                    written = os.write(file_descriptor, view)
+                    view = view[written:]
+            finally:
+                os.close(file_descriptor)
+            if mode is not None:
+                os.chmod(temporary_name, mode, dir_fd=parent_descriptor, follow_symlinks=False)
+            temporary_identity = os.stat(
+                temporary_name, dir_fd=parent_descriptor, follow_symlinks=False
+            )
+            expected_inode = (int(temporary_identity.st_dev), int(temporary_identity.st_ino))
+            current_temp = os.stat(temporary_name, dir_fd=parent_descriptor, follow_symlinks=False)
+            if (int(current_temp.st_dev), int(current_temp.st_ino)) != expected_inode:
+                raise InstallFailure(
+                    EXIT_PREFLIGHT, "receipt", "Managed receipt file changed identity"
+                )
+            # Re-check the descriptor-bound entry while holding the directory
+            # transaction lock immediately before the rename.  Writers in
+            # this package use the same lock, so no lifecycle operation can
+            # substitute the temporary or destination between these checks.
+            current_temp = os.stat(temporary_name, dir_fd=parent_descriptor, follow_symlinks=False)
+            if (int(current_temp.st_dev), int(current_temp.st_ino)) != expected_inode:
+                raise InstallFailure(
+                    EXIT_PREFLIGHT, "receipt", "Managed receipt file changed identity"
+                )
+            os.replace(
+                temporary_name,
+                path.name,
+                src_dir_fd=parent_descriptor,
+                dst_dir_fd=parent_descriptor,
+            )
+            current_target = os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
+            if (int(current_target.st_dev), int(current_target.st_ino)) != expected_inode:
+                raise InstallFailure(
+                    EXIT_PREFLIGHT, "receipt", "Managed receipt file changed identity"
+                )
     except InstallFailure:
         raise
     except (OSError, RuntimeError, ValueError) as exc:
@@ -1347,17 +1383,77 @@ def _stage_plugin(root: Path) -> Path:
         source = _source_file()
     except OSError as exc:
         raise InstallFailure(EXIT_ACQUIRE, "acquire", str(exc)) from exc
-    stage = root / (".%s.%s.stage" % (_PLUGIN_NAME, uuid.uuid4().hex))
+    # Re-acquire the physical profile immediately before creating the stage.
+    # The lifecycle already pins this identity, but this guard also protects
+    # direct/legacy callers and rejects a root junction injected between the
+    # outer preflight and this side effect.
+    root_identity = _assert_physical_root(root)
+    stage_name = ".%s.%s.stage" % (_PLUGIN_NAME, uuid.uuid4().hex)
+    stage = root / stage_name
+    descriptor = None
+    stage_descriptor = None
     try:
-        stage.mkdir(parents=True)
-        script = stage / ("%s.py" % _PLUGIN_NAME)
-        shutil.copy2(source, script)
         if os.name != "nt":
-            script.chmod(0o755)
+            descriptor = _open_owned_root_fd(root, root_identity)
+            os.mkdir(stage_name, 0o755, dir_fd=descriptor)
+            stage_descriptor = os.open(
+                stage_name,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=descriptor,
+            )
+            script_name = "%s.py" % _PLUGIN_NAME
+            # Keep the bundled copy operation behind the existing ``copy2``
+            # seam (so disk/acquire failures remain injectable) while the
+            # final managed write stays descriptor-bound.
+            scratch_fd, scratch_name = tempfile.mkstemp(prefix=".dcc-mcp-gimp-stage-")
+            os.close(scratch_fd)
+            scratch = Path(scratch_name)
+            try:
+                shutil.copy2(source, scratch)
+                source_bytes = scratch.read_bytes()
+            finally:
+                try:
+                    scratch.unlink()
+                except OSError:
+                    pass
+            script_fd = os.open(
+                script_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o755,
+                dir_fd=stage_descriptor,
+            )
+            try:
+                view = memoryview(source_bytes)
+                while view:
+                    written = os.write(script_fd, view)
+                    view = view[written:]
+                os.fchmod(script_fd, 0o755)
+            finally:
+                os.close(script_fd)
+            return stage
+        with _windows_directory_lease(root, "install"):
+            _assert_physical_root(root, root_identity)
+            stage.mkdir(parents=True)
+            script = stage / ("%s.py" % _PLUGIN_NAME)
+            shutil.copy2(source, script)
+            _assert_physical_root(root, root_identity)
         return stage
+    except InstallFailure:
+        raise
     except OSError as exc:
         safe_remove_tree(stage)
         raise InstallFailure(EXIT_INSTALL, "install", "Plug-in staging failed: %s" % exc) from exc
+    finally:
+        if stage_descriptor is not None:
+            try:
+                os.close(stage_descriptor)
+            except OSError:
+                pass
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
 
 
 def _cleanup_tree(path: Path) -> dict[str, Any]:
@@ -1626,6 +1722,57 @@ def _cleanup_private_tree(
     except BaseException as exc:
         raise InstallFailure(EXIT_INSTALL, stage, "Private transaction cleanup failed") from exc
     return result if isinstance(result, dict) else {"success": False}
+
+
+def _create_private_transaction(parent: Path, name: str, stage: str) -> Path:
+    """Create a private transaction relative to a physically held parent."""
+    if os.name == "nt":
+        with _windows_directory_lease(parent, stage):
+            parent_identity = _directory_identity(parent, stage)
+            transaction = parent / name
+            try:
+                transaction.mkdir(mode=0o700)
+            except FileExistsError as exc:
+                raise InstallFailure(
+                    EXIT_INSTALL, stage, "Private transaction already exists"
+                ) from exc
+            if _directory_identity(parent, stage) != parent_identity:
+                raise InstallFailure(
+                    EXIT_PREFLIGHT, stage, "Managed transaction parent changed identity"
+                )
+            if _directory_identity(transaction, stage) == parent_identity:
+                raise InstallFailure(EXIT_INSTALL, stage, "Private transaction identity is invalid")
+            return transaction
+    descriptor = None
+    try:
+        descriptor = _open_absolute_dir_nofollow(parent)
+        details = os.fstat(descriptor)
+        parent_identity = (int(details.st_dev), int(details.st_ino))
+        os.mkdir(name, 0o700, dir_fd=descriptor)
+        current = os.fstat(descriptor)
+        if (int(current.st_dev), int(current.st_ino)) != parent_identity:
+            try:
+                os.unlink(name, dir_fd=descriptor)
+            except OSError:
+                pass
+            raise InstallFailure(
+                EXIT_PREFLIGHT, stage, "Managed transaction parent changed identity"
+            )
+        return parent / name
+    except FileExistsError as exc:
+        raise InstallFailure(EXIT_INSTALL, stage, "Private transaction already exists") from exc
+    except InstallFailure:
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise InstallFailure(
+            EXIT_INSTALL, stage, "Private transaction could not be created"
+        ) from exc
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
 
 
 def _mkdir_relative_nofollow(
@@ -1975,11 +2122,15 @@ def _copy_validated_recovery(
     staging_parent: Optional[Path] = None
     staging_parent_identity: Optional[tuple[int, int]] = None
     candidates: list[Path] = []
+    # A sibling of the transaction is the only staging location whose parent
+    # is already in the selected physical profile.  Prefer it over global
+    # temp: custom destinations may be on another volume and a global
+    # pathname can be swapped while copytree is running (notably on macOS).
+    candidates.append(destination_parent.parent)
     try:
         candidates.append(Path(tempfile.gettempdir()).expanduser())
     except (OSError, RuntimeError, TypeError, ValueError):
         pass
-    candidates.append(destination_parent.parent)
     seen_candidates: set[str] = set()
     for candidate in candidates:
         try:
@@ -2266,6 +2417,10 @@ def _validate_owned_install(
         isinstance(value, str) and _valid_relative_path(value) for value in directories
     ):
         raise InstallFailure(EXIT_PREFLIGHT, "receipt", "Receipt directory ownership is invalid")
+    if len(directories) > _MAX_MANIFEST_ENTRIES:
+        raise InstallFailure(EXIT_PREFLIGHT, "receipt", "Receipt manifest has too many entries")
+    if any(len(Path(value).parts) > _MAX_MANIFEST_DEPTH for value in directories):
+        raise InstallFailure(EXIT_PREFLIGHT, "receipt", "Receipt manifest is too deep")
     if len(directories) != len(set(directories)):
         raise InstallFailure(
             EXIT_PREFLIGHT,
@@ -2279,6 +2434,8 @@ def _validate_owned_install(
         or links
     ):
         raise InstallFailure(EXIT_PREFLIGHT, "receipt", "Receipt link ownership is invalid")
+    if len(links) > _MAX_MANIFEST_ENTRIES:
+        raise InstallFailure(EXIT_PREFLIGHT, "receipt", "Receipt manifest has too many entries")
     if not isinstance(files, list) or not files:
         raise InstallFailure(EXIT_PREFLIGHT, "receipt", "Receipt file ownership is invalid")
     file_paths: list[str] = []
@@ -2293,6 +2450,10 @@ def _validate_owned_install(
         ):
             raise InstallFailure(EXIT_PREFLIGHT, "receipt", "Receipt file ownership is invalid")
         file_paths.append(record["path"])
+    if len(files) + len(directories) + len(links) > _MAX_MANIFEST_ENTRIES:
+        raise InstallFailure(EXIT_PREFLIGHT, "receipt", "Receipt manifest has too many entries")
+    if any(len(Path(value).parts) > _MAX_MANIFEST_DEPTH for value in file_paths):
+        raise InstallFailure(EXIT_PREFLIGHT, "receipt", "Receipt manifest is too deep")
     if len(file_paths) != len(set(file_paths)):
         raise InstallFailure(
             EXIT_PREFLIGHT, "receipt", "Receipt file ownership contains duplicates"
@@ -2758,8 +2919,13 @@ def _execute_uninstall(report: dict[str, Any]) -> tuple[dict[str, Any], int]:
     transaction_created = False
     preserve_transaction = False
     quarantine_expected_identities = None
+    transaction_cleanup_identities = None
     try:
-        transaction.mkdir(mode=0o700)
+        transaction = _create_private_transaction(
+            transaction_parent,
+            transaction.name,
+            "uninstall",
+        )
         transaction_created = True
         snapshot.mkdir()
         quarantine.mkdir()
@@ -2807,6 +2973,17 @@ def _execute_uninstall(report: dict[str, Any]) -> tuple[dict[str, Any], int]:
             quarantine_expected_identities["gimp.json"] = _receipt_file_identity(
                 quarantine_receipt, "uninstall"
             )
+        # Snapshot the complete transaction ownership before quarantine is
+        # removed.  Final cleanup must only remove these known entries; any
+        # operator file injected after quarantine cleanup is left in place and
+        # the transaction is preserved for manual recovery.
+        transaction_expected = _private_tree_identities(transaction, "uninstall")
+        transaction_cleanup_identities = {
+            relative: identity
+            for relative, identity in transaction_expected.items()
+            if not relative.startswith("quarantine/")
+            and relative not in {"quarantine", "quarantine/dcc_mcp_gimp", "quarantine/gimp.json"}
+        }
         _assert_physical_root(destination, root_identity)
         try:
             removed = _cleanup_private_tree(
@@ -2824,7 +3001,10 @@ def _execute_uninstall(report: dict[str, Any]) -> tuple[dict[str, Any], int]:
                 "uninstall",
                 "Uninstall cleanup failed; prior state will be restored",
             )
-        cleanup = _cleanup_private_tree(transaction)
+        cleanup = _cleanup_private_tree(
+            transaction,
+            expected_identities=transaction_cleanup_identities,
+        )
         if not cleanup.get("success"):
             raise InstallFailure(EXIT_INSTALL, "uninstall", "Uninstall snapshot cleanup failed")
     except BaseException as exc:
@@ -2842,8 +3022,22 @@ def _execute_uninstall(report: dict[str, Any]) -> tuple[dict[str, Any], int]:
             raise InstallFailure(
                 EXIT_INSTALL, "uninstall", "Uninstall rollback could not restore prior state"
             ) from restore_error
-        if transaction_created and not preserve_transaction:
-            _cleanup_private_tree(transaction)
+        if (
+            transaction_created
+            and not preserve_transaction
+            and transaction_cleanup_identities is not None
+        ):
+            try:
+                _cleanup_private_tree(
+                    transaction,
+                    expected_identities=transaction_cleanup_identities,
+                )
+            except InstallFailure:
+                pass
+        elif transaction_created and transaction_cleanup_identities is None:
+            # We never obtained a complete ownership snapshot, so recursive
+            # cleanup would be unsafe if a foreign child was injected.
+            preserve_transaction = True
         if isinstance(exc, InstallFailure):
             raise exc
         code = EXIT_REQUIRES_RESTART if isinstance(exc, PermissionError) else EXIT_INSTALL

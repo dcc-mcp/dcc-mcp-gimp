@@ -520,7 +520,14 @@ def doctor(destination: Optional[Path] = None) -> dict[str, object]:
         .expanduser()
         .resolve()
     )
-    installed_version = _plugin_version(script) if script.is_file() and not script_linked else None
+    # Never inspect script bytes once any containing component has failed the
+    # physical-path check.  ``Path.is_file`` follows a junction/symlink and
+    # would otherwise report an operator-owned external script as installed.
+    installed_version = (
+        _plugin_version(script)
+        if physical_error is None and script.is_file() and not script_linked
+        else None
+    )
     version_matches = installed_version == __version__
     return {
         "ready": physical_error is None and script.is_file() and version_matches,
