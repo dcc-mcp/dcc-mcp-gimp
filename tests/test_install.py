@@ -193,6 +193,24 @@ def test_doctor_rejects_linked_plugin_child(tmp_path, monkeypatch):
     assert result["plugin_script_exists"] is False
 
 
+def test_doctor_does_not_read_script_through_linked_target(tmp_path):
+    from dcc_mcp_gimp import install_lifecycle
+
+    root = tmp_path / "plugins"
+    root.mkdir()
+    external = tmp_path / "external"
+    external.mkdir()
+    (external / "dcc_mcp_gimp.py").write_text('VERSION = "0.4.1"\n', encoding="utf-8")
+    linked = root / "dcc_mcp_gimp"
+    try:
+        linked.symlink_to(external, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink creation unavailable")
+    result = install_lifecycle.doctor(root)
+    assert result["ready"] is False
+    assert result["installed_adapter_version"] is None
+
+
 def test_status_preflight_records_gimp_profile_and_target_interpreter(lifecycle_env):
     from dcc_mcp_gimp.install import run
 
@@ -1230,6 +1248,60 @@ def test_uninstall_quarantine_late_unowned_entry_is_preserved(lifecycle_env, mon
         for candidate in transactions
         if (candidate / "quarantine" / "operator.txt").is_file()
     )
+
+
+def test_uninstall_transaction_late_unowned_entry_is_preserved(lifecycle_env, monkeypatch):
+    from dcc_mcp_gimp import install_files
+    from dcc_mcp_gimp.install import run
+
+    installed, code, _ = run(["install", "--yes", *lifecycle_env.common])
+    assert code == 0, installed
+    original_cleanup = install_files._cleanup_private_tree
+    injected = False
+
+    def cleanup_then_inject(path, *args, **kwargs):
+        nonlocal injected
+        result = original_cleanup(path, *args, **kwargs)
+        candidate = Path(path)
+        if candidate.name == "quarantine" and not injected:
+            (candidate.parent / "operator.txt").write_text("do not delete", encoding="utf-8")
+            injected = True
+        return result
+
+    monkeypatch.setattr(install_files, "_cleanup_private_tree", cleanup_then_inject)
+    report, code, _ = run(["uninstall", "--yes", *lifecycle_env.common])
+
+    assert code != 0, report
+    assert report["status"] == "failed"
+    assert injected is True
+    transactions = list(lifecycle_env.plugins.parent.glob(".dcc-mcp-gimp-uninstall-*"))
+    assert transactions
+    assert any(
+        (candidate / "operator.txt").read_text(encoding="utf-8") == "do not delete"
+        for candidate in transactions
+        if (candidate / "operator.txt").is_file()
+    )
+
+
+def test_manifest_rejects_entry_count_and_depth_limits(tmp_path):
+    from dcc_mcp_gimp import install_files
+
+    root = tmp_path / "plugin"
+    root.mkdir()
+    for index in range(install_files._MAX_MANIFEST_ENTRIES + 1):
+        (root / ("entry-%04d" % index)).write_bytes(b"x")
+    with pytest.raises(install_files.InstallFailure, match="too many entries"):
+        install_files._owned_root_manifest(root)
+
+    shallow = tmp_path / "shallow"
+    shallow.mkdir()
+    current = shallow
+    for index in range(install_files._MAX_MANIFEST_DEPTH + 1):
+        current = current / ("d%d" % index)
+        current.mkdir()
+    (current / "entry.txt").write_bytes(b"x")
+    with pytest.raises(install_files.InstallFailure, match="too deep"):
+        install_files._owned_root_manifest(shallow)
 
 
 def test_verify_runtime_shape_failure_is_structured(lifecycle_env, monkeypatch):

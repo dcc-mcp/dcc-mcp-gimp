@@ -206,6 +206,46 @@ def _windows_rename_by_handle(
             rename_with_handle(handle)
 
 
+def _windows_create_new_file(path: Path, mode: int = 0o666) -> int:
+    """Create a file with CREATE_NEW and OPEN_REPARSE_POINT semantics."""
+    if os.name != "nt":
+        raise OSError("Windows file creation is unavailable")
+    import ctypes
+    import msvcrt
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+    ]
+    kernel32.CreateFileW.restype = ctypes.c_void_p
+    handle = kernel32.CreateFileW(
+        str(path),
+        0x40000000,
+        0x1 | 0x2,
+        None,
+        1,  # CREATE_NEW
+        0x80 | 0x00200000,  # FILE_ATTRIBUTE_NORMAL | OPEN_REPARSE_POINT
+        None,
+    )
+    invalid = ctypes.c_void_p(-1).value
+    if handle in (None, invalid):
+        raise OSError(ctypes.get_last_error(), "bootstrap file create failed")
+    try:
+        descriptor = msvcrt.open_osfhandle(int(handle), os.O_WRONLY | os.O_BINARY)
+    except BaseException:
+        kernel32.CloseHandle(handle)
+        raise
+    if mode != 0o666:
+        os.chmod(path, mode)
+    return descriptor
+
+
 def _bootstrap_error_path() -> Path:
     configured = os.environ.get("DCC_MCP_GIMP_BOOTSTRAP_ERRORS")
     if configured:
@@ -263,10 +303,7 @@ def _capture_bootstrap_error(stage: str, error: BaseException) -> None:
                     current_size = int(details.st_size) if details is not None else 0
                     if current_size + len(line) <= _MAX_BOOTSTRAP_LOG_BYTES:
                         if details is None:
-                            flags = (
-                                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
-                            )
-                            descriptor = os.open(str(path), flags, 0o666)
+                            descriptor = _windows_create_new_file(path)
                             try:
                                 os.write(descriptor, line)
                             finally:
@@ -369,6 +406,20 @@ def _capture_bootstrap_error(stage: str, error: BaseException) -> None:
                     os.write(descriptor, payload)
                 finally:
                     os.close(descriptor)
+                # Re-open the temporary entry by its no-follow name and
+                # prove the inode immediately before publication.  The
+                # process-wide writer lock is the bootstrap transaction
+                # protocol shared by every writer in this plug-in.
+                current = os.stat(
+                    temporary_name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+                if (int(current.st_dev), int(current.st_ino)) != (
+                    int(temporary_identity.st_dev),
+                    int(temporary_identity.st_ino),
+                ):
+                    return
                 os.replace(
                     temporary_name,
                     path.name,
