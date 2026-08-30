@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import stat
+import sys
 import tempfile
 import time
 import uuid
@@ -1403,7 +1404,7 @@ def _posix_directory_locks(*descriptors: int):
 @contextlib.contextmanager
 def _posix_stable_directory(path: Path, stage: str):
     """Yield an fd-backed path when the platform exposes one."""
-    if os.name == "nt":
+    if os.name == "nt" or sys.platform == "darwin":
         yield None
         return
     descriptor = None
