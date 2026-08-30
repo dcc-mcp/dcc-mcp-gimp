@@ -1576,26 +1576,62 @@ def test_posix_launch_fails_closed_without_descriptor_endpoint(tmp_path, monkeyp
     executable = tmp_path / "gimp-3.0"
     executable.write_bytes(b"SELECTED-GIMP")
     expected = install_host._executable_identity(executable)
-    original_stat = install_host.os.stat
+    original_open = install_host.os.open
     called = False
 
     def hide_descriptor_endpoint(path, *args, **kwargs):
         value = os.fspath(path)
         if value.startswith("/proc/self/fd/") or value.startswith("/dev/fd/"):
             raise FileNotFoundError(value)
-        return original_stat(path, *args, **kwargs)
+        return original_open(path, *args, **kwargs)
 
     def unexpected_run(*_args, **_kwargs):
         nonlocal called
         called = True
         raise AssertionError("subprocess must not start without an identity-bound endpoint")
 
-    monkeypatch.setattr(install_host.os, "stat", hide_descriptor_endpoint)
+    monkeypatch.setattr(install_host.os, "open", hide_descriptor_endpoint)
     monkeypatch.setattr(install_host.subprocess, "run", unexpected_run)
 
     with pytest.raises(install_host.InstallFailure, match="identity-bound"):
         install_host._gimp_version(executable, expected_identity=expected)
     assert called is False
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Exercises POSIX descriptor alias identity")
+def test_posix_binding_validates_opened_alias_not_virtual_path_stat(tmp_path, monkeypatch):
+    from dcc_mcp_gimp import install_host
+
+    executable = tmp_path / "gimp-3.0"
+    executable.write_bytes(b"SELECTED-GIMP")
+    expected = install_host._executable_identity(executable)
+    original_open = install_host.os.open
+    original_stat = install_host.os.stat
+
+    def dev_descriptor_endpoint(path, *args, **kwargs):
+        value = os.fspath(path)
+        if value.startswith("/proc/self/fd/"):
+            raise FileNotFoundError(value)
+        return original_open(path, *args, **kwargs)
+
+    def virtual_alias_stat(path, *args, **kwargs):
+        value = os.fspath(path)
+        if value.startswith("/proc/self/fd/"):
+            raise FileNotFoundError(value)
+        details = original_stat(path, *args, **kwargs)
+        if value.startswith("/dev/fd/"):
+            return SimpleNamespace(st_dev=int(details.st_dev) + 1, st_ino=int(details.st_ino))
+        return details
+
+    monkeypatch.setattr(install_host.os, "open", dev_descriptor_endpoint)
+    monkeypatch.setattr(install_host.os, "stat", virtual_alias_stat)
+
+    with install_host._posix_executable_binding(
+        executable, expected, "gimp_version"
+    ) as launch_options:
+        bound_path = Path(launch_options["executable"])
+        assert str(bound_path).startswith("/dev/fd/")
+        assert bound_path.read_bytes() == b"SELECTED-GIMP"
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Exercises POSIX profile-root swap")
