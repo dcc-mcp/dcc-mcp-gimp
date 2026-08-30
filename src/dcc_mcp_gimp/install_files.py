@@ -258,6 +258,237 @@ def _windows_directory_lease(path: Path, stage: str) -> Any:
                 pass
 
 
+@contextlib.contextmanager
+def _windows_object_handle(path: Path, stage: str, *, access: int) -> Any:
+    """Open one Windows object without following a reparse point."""
+    if os.name != "nt":
+        yield None
+        return
+    handle = None
+    try:
+        import ctypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateFileW.argtypes = [
+            ctypes.c_wchar_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+        ]
+        kernel32.CreateFileW.restype = ctypes.c_void_p
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = ctypes.c_int
+        handle = kernel32.CreateFileW(
+            str(path),
+            access,
+            0x1 | 0x2,
+            None,
+            3,
+            0x02000000 | 0x00200000,
+            None,
+        )
+        invalid = ctypes.c_void_p(-1).value
+        if handle in (None, invalid):
+            error = ctypes.get_last_error()
+            raise OSError(error, "CreateFileW object handle failed", str(path))
+    except InstallFailure:
+        raise
+    except (OSError, AttributeError, RuntimeError, ValueError) as exc:
+        raise InstallFailure(EXIT_PREFLIGHT, stage, "Windows object handle unavailable") from exc
+    try:
+        yield handle
+    finally:
+        if handle not in (None,):
+            try:
+                kernel32.CloseHandle(handle)
+            except (OSError, AttributeError):
+                pass
+
+
+def _windows_set_file_information(handle: Any, info_class: int, payload: Any) -> None:
+    import ctypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.SetFileInformationByHandle.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+    ]
+    kernel32.SetFileInformationByHandle.restype = ctypes.c_int
+    size = ctypes.sizeof(payload)
+    if not kernel32.SetFileInformationByHandle(handle, info_class, ctypes.byref(payload), size):
+        error = ctypes.get_last_error()
+        raise OSError(error, "SetFileInformationByHandle failed")
+
+
+def _object_identity(path: Path, stage: str) -> tuple[int, int, int, int, int, int]:
+    try:
+        details = os.lstat(str(path))
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise InstallFailure(EXIT_PREFLIGHT, stage, "Managed path is unavailable") from exc
+    if _is_link(path):
+        raise InstallFailure(EXIT_PREFLIGHT, stage, "Managed path is linked")
+    return (
+        int(details.st_dev),
+        int(details.st_ino),
+        int(details.st_size),
+        int(details.st_mtime_ns),
+        int(details.st_ctime_ns),
+        stat.S_IMODE(details.st_mode),
+    )
+
+
+def _windows_rename_by_handle(source: Path, destination: Path, *, replace: bool = False) -> None:
+    """Rename a child through its held handle, preventing pathname swaps."""
+    import ctypes
+
+    source_before = _object_identity(source, "install")
+    with _windows_object_handle(source, "install", access=0x00010000 | 0x80) as source_handle:
+        if _object_identity(source, "install") != source_before:
+            raise InstallFailure(EXIT_PREFLIGHT, "install", "Managed path changed identity")
+        _assert_path_components_safe(destination, "install")
+        if not replace:
+            try:
+                os.lstat(str(destination))
+            except FileNotFoundError:
+                pass
+            else:
+                raise InstallFailure(
+                    EXIT_PREFLIGHT, "install", "Managed rename destination already exists"
+                )
+
+        class _FileRenameHeader(ctypes.Structure):
+            _fields_ = [
+                ("replace_if_exists", ctypes.c_uint32),
+                ("root_directory", ctypes.c_void_p),
+                ("file_name_length", ctypes.c_uint32),
+                # FILE_RENAME_INFO has a flexible WCHAR[1] member.  Keeping
+                # one WCHAR in the ctypes layout is important: the filename
+                # starts at offset 20 on 64-bit Windows, not at sizeof the
+                # padded header (24 bytes).
+                ("file_name", ctypes.c_ubyte * 2),
+            ]
+
+        encoded_name = str(destination).encode("utf-16-le") + b"\x00\x00"
+        header = _FileRenameHeader(
+            1 if replace else 0,
+            None,
+            len(encoded_name) - 2,
+            (ctypes.c_ubyte * 2)(),
+        )
+        filename_offset = _FileRenameHeader.file_name.offset
+        payload = (ctypes.c_ubyte * (filename_offset + len(encoded_name)))()
+        ctypes.memmove(payload, ctypes.byref(header), ctypes.sizeof(header))
+        ctypes.memmove(
+            ctypes.addressof(payload) + filename_offset,
+            encoded_name,
+            len(encoded_name),
+        )
+        _windows_set_file_information(source_handle, 3, payload)
+
+
+def _windows_delete_handle(handle: Any) -> None:
+    import ctypes
+
+    class _FileDisposition(ctypes.Structure):
+        _fields_ = [("delete_file", ctypes.c_ubyte)]
+
+    _windows_set_file_information(handle, 4, _FileDisposition(1))
+
+
+def _private_tree_identities(
+    path: Path, stage: str
+) -> dict[str, tuple[int, int, int, int, int, int]]:
+    """Capture every physical entry in a private transaction tree."""
+    identities = {"": _object_identity(path, stage)}
+    try:
+        for current, dirnames, filenames in os.walk(str(path), topdown=True, followlinks=False):
+            current_path = Path(current)
+            for name in sorted(dirnames + filenames):
+                child = current_path / name
+                relative = child.relative_to(path).as_posix()
+                identities[relative] = _object_identity(child, stage)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise InstallFailure(EXIT_INSTALL, stage, "Managed cleanup enumeration failed") from exc
+    return identities
+
+
+def _assert_private_tree_identities(
+    path: Path,
+    expected: Mapping[str, tuple[int, int, int, int, int, int]],
+    stage: str,
+) -> None:
+    actual = _private_tree_identities(path, stage)
+    if actual.keys() != expected.keys() or any(
+        actual[key] != value for key, value in expected.items()
+    ):
+        raise InstallFailure(EXIT_INSTALL, stage, "Private transaction entry changed identity")
+
+
+def _windows_remove_tree(
+    path: Path,
+    stage: str = "cleanup",
+    *,
+    expected: Optional[Mapping[str, tuple[int, int, int, int, int, int]]] = None,
+    owner_root: Optional[Path] = None,
+) -> None:
+    """Recursively remove one tree with per-entry no-follow handles."""
+    if os.name != "nt":
+        raise InstallFailure(EXIT_INSTALL, stage, "Windows cleanup is unavailable")
+    if owner_root is None:
+        owner_root = path
+    root_expected = expected.get("", _object_identity(owner_root, stage)) if expected else None
+    if root_expected is not None:
+        relative_root = path.relative_to(owner_root).as_posix() if path != owner_root else ""
+        key = relative_root
+        if expected is not None and key not in expected:
+            raise InstallFailure(EXIT_INSTALL, stage, "Private transaction entry is unowned")
+        expected_identity = expected.get(key, root_expected) if expected else root_expected
+    else:
+        expected_identity = _object_identity(path, stage)
+    with _windows_object_handle(path, stage, access=0x00010000 | 0x80 | 0x1) as handle:
+        if _object_identity(path, stage) != expected_identity:
+            raise InstallFailure(EXIT_INSTALL, stage, "Managed path changed identity")
+        details = os.lstat(str(path))
+        if not stat.S_ISDIR(details.st_mode):
+            _windows_delete_handle(handle)
+            return
+        try:
+            entries = list(os.scandir(str(path)))
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise InstallFailure(EXIT_INSTALL, stage, "Managed cleanup enumeration failed") from exc
+        for entry in entries:
+            child = Path(path) / entry.name
+            child_relative = child.relative_to(owner_root).as_posix()
+            if expected is not None and child_relative not in expected:
+                raise InstallFailure(EXIT_INSTALL, stage, "Private transaction entry is unowned")
+            child_expected = (
+                expected[child_relative] if expected is not None else _object_identity(child, stage)
+            )
+            child_details = os.lstat(str(child))
+            if stat.S_ISDIR(child_details.st_mode):
+                _windows_remove_tree(
+                    child,
+                    stage,
+                    expected=expected,
+                    owner_root=owner_root,
+                )
+            else:
+                with _windows_object_handle(
+                    child,
+                    stage,
+                    access=0x00010000 | 0x80,
+                ) as child_handle:
+                    if _object_identity(child, stage) != child_expected:
+                        raise InstallFailure(EXIT_INSTALL, stage, "Managed path changed identity")
+                    _windows_delete_handle(child_handle)
+        _windows_delete_handle(handle)
+
+
 def _directory_identity(path: Path, stage: str) -> tuple[int, int]:
     try:
         details = os.lstat(str(path))
@@ -292,6 +523,8 @@ def _read_bytes_no_follow(path: Path, *, max_bytes: Optional[int] = None) -> byt
     _assert_receipt_path_safe(path)
     lease = None
     lease_entered = False
+    object_lease = None
+    object_entered = False
     parent_identity = _receipt_parent_identity(path)
     try:
         before = os.lstat(str(path))
@@ -307,6 +540,18 @@ def _read_bytes_no_follow(path: Path, *, max_bytes: Optional[int] = None) -> byt
             lease_entered = True
             _assert_receipt_parent_identity(path, parent_identity)
             _assert_receipt_path_safe(path)
+            object_lease = _windows_object_handle(path, "receipt", access=0x80)
+            object_lease.__enter__()
+            object_entered = True
+            if _object_identity(path, "receipt") != (
+                int(before.st_dev),
+                int(before.st_ino),
+                int(before.st_size),
+                int(before.st_mtime_ns),
+                int(before.st_ctime_ns),
+                stat.S_IMODE(before.st_mode),
+            ):
+                raise InstallFailure(EXIT_PREFLIGHT, "receipt", "Managed file changed identity")
             descriptor = os.open(str(path), flags)
         else:
             parent_descriptor = _open_absolute_dir_nofollow(path.parent)
@@ -342,6 +587,8 @@ def _read_bytes_no_follow(path: Path, *, max_bytes: Optional[int] = None) -> byt
     except (OSError, RuntimeError, ValueError) as exc:
         raise InstallFailure(EXIT_PREFLIGHT, "receipt", "Managed file is unavailable") from exc
     finally:
+        if object_entered and object_lease is not None:
+            object_lease.__exit__(None, None, None)
         if lease_entered and lease is not None:
             lease.__exit__(None, None, None)
 
@@ -352,8 +599,19 @@ def _write_bytes_no_follow(path: Path, data: bytes, mode: Optional[int] = None) 
     file_descriptor = None
     lease = None
     lease_entered = False
-    path.parent.mkdir(parents=True, exist_ok=True)
-    parent_identity = _directory_identity(path.parent, "uninstall")
+    object_lease = None
+    object_entered = False
+    try:
+        _assert_path_components_safe(path.parent, "uninstall")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _assert_path_components_safe(path.parent, "uninstall")
+        parent_identity = _directory_identity(path.parent, "uninstall")
+    except InstallFailure:
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise InstallFailure(
+            EXIT_INSTALL, "uninstall", "Managed restore parent is unavailable"
+        ) from exc
     try:
         if os.name == "nt":
             _assert_path_components_safe(path.parent, "uninstall")
@@ -382,6 +640,14 @@ def _write_bytes_no_follow(path: Path, data: bytes, mode: Optional[int] = None) 
             view = view[written:]
         if mode is not None:
             if os.name == "nt":
+                expected = _file_identity(path)
+                object_lease = _windows_object_handle(path, "uninstall", access=0x80 | 0x20)
+                object_lease.__enter__()
+                object_entered = True
+                if _file_identity(path) != expected:
+                    raise InstallFailure(
+                        EXIT_PREFLIGHT, "uninstall", "Managed file changed identity"
+                    )
                 _chmod_no_follow(path, mode)
             else:
                 os.chmod(path.name, mode, dir_fd=parent_descriptor, follow_symlinks=False)
@@ -394,6 +660,8 @@ def _write_bytes_no_follow(path: Path, data: bytes, mode: Optional[int] = None) 
             EXIT_INSTALL, "uninstall", "Managed file could not be restored"
         ) from exc
     finally:
+        if object_entered and object_lease is not None:
+            object_lease.__exit__(None, None, None)
         if file_descriptor is not None:
             try:
                 os.close(file_descriptor)
@@ -499,12 +767,19 @@ def _replace_path_owned(
     expected_identity: Optional[tuple[int, int]],
     source: Path,
     destination: Path,
+    expected_file_identities: Optional[Mapping[str, tuple[int, ...]]] = None,
 ) -> None:
     """Rename only while the selected profile still owns the pathname."""
     # Tests and callers may intentionally replace the primitive to inject a
     # failure.  Keep that seam, while the default path uses a held directory
     # descriptor so a root pathname swap cannot redirect the rename.
     if _replace_path is not _DEFAULT_REPLACE_PATH:
+        if expected_file_identities:
+            raise InstallFailure(
+                EXIT_PREFLIGHT,
+                "install",
+                "Managed child identity cannot be bound through a replaced rename primitive",
+            )
         with _windows_directory_lease(root, "install"):
             with _windows_directory_lease(destination.parent, "install"):
                 _assert_physical_root(root, expected_identity)
@@ -519,7 +794,9 @@ def _replace_path_owned(
                 _assert_physical_root(root, expected_identity)
                 _assert_path_components_safe(source, "install")
                 _assert_path_components_safe(destination, "install")
-                _replace_path(source, destination)
+                if expected_file_identities:
+                    _assert_owned_file_identities(source, expected_file_identities, "install")
+                _windows_rename_by_handle(source, destination, replace=False)
                 _assert_physical_root(root, expected_identity)
         return
     source_descriptor = None
@@ -552,6 +829,8 @@ def _replace_path_owned(
         destination_name = (
             destination_relative.name if destination_relative is not None else destination.name
         )
+        if expected_file_identities:
+            _assert_owned_file_identities(source, expected_file_identities, "install")
         for attempt in range(6):
             try:
                 os.replace(
@@ -605,8 +884,16 @@ def _write_bytes_atomic_legacy(path: Path, data: bytes, mode: Optional[int] = No
     temporary = path.with_name(".%s.%s.tmp" % (path.name, uuid.uuid4().hex))
     parent_identity = None
     created_temp = False
-    temporary.parent.mkdir(parents=True, exist_ok=True)
-    parent_identity = _receipt_parent_identity(path)
+    try:
+        temporary.parent.mkdir(parents=True, exist_ok=True)
+        _assert_receipt_path_safe(path)
+        parent_identity = _receipt_parent_identity(path)
+    except InstallFailure:
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise InstallFailure(
+            EXIT_INSTALL, "receipt", "Install receipt parent is unavailable"
+        ) from exc
     with _windows_directory_lease(temporary.parent, "receipt"):
         try:
             _assert_receipt_path_safe(path)
@@ -616,7 +903,10 @@ def _write_bytes_atomic_legacy(path: Path, data: bytes, mode: Optional[int] = No
             created_temp = True
             if mode is not None:
                 _chmod_no_follow(temporary, mode)
-            _replace_path(temporary, path)
+            if os.name == "nt" and _replace_path is _DEFAULT_REPLACE_PATH:
+                _windows_rename_by_handle(temporary, path, replace=True)
+            else:
+                _replace_path(temporary, path)
             _assert_receipt_parent_identity(path, parent_identity)
             if mode is not None:
                 _chmod_no_follow(path, mode)
@@ -717,8 +1007,16 @@ def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
         temporary = path.with_name(".%s.%s.tmp" % (path.name, uuid.uuid4().hex))
         parent_identity = None
         created_temp = False
-        path.parent.mkdir(parents=True, exist_ok=True)
-        parent_identity = _receipt_parent_identity(path)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _assert_receipt_path_safe(path)
+            parent_identity = _receipt_parent_identity(path)
+        except InstallFailure:
+            raise
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise InstallFailure(
+                EXIT_INSTALL, "receipt", "Install receipt parent is unavailable"
+            ) from exc
         with _windows_directory_lease(path.parent, "receipt"):
             try:
                 _assert_receipt_path_safe(path)
@@ -726,7 +1024,10 @@ def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
                 with temporary.open("xb") as stream:
                     stream.write(encoded)
                 created_temp = True
-                _replace_path(temporary, path)
+                if os.name == "nt" and _replace_path is _DEFAULT_REPLACE_PATH:
+                    _windows_rename_by_handle(temporary, path, replace=True)
+                else:
+                    _replace_path(temporary, path)
                 _assert_receipt_parent_identity(path, parent_identity)
             finally:
                 if created_temp:
@@ -763,7 +1064,7 @@ def _replace_receipt_owned(
                 _assert_physical_root(root, expected_identity)
                 _assert_receipt_path_safe(source)
                 if os.name == "nt" and _replace_path is _DEFAULT_REPLACE_PATH:
-                    os.rename(source, destination)
+                    _windows_rename_by_handle(source, destination, replace=False)
                 else:
                     _replace_path(source, destination)
                 _assert_receipt_parent_identity(source, source_parent_identity)
@@ -888,7 +1189,6 @@ def _cleanup_tree_owned(
     if (
         _cleanup_tree is not _DEFAULT_CLEANUP_TREE
         or safe_remove_tree is not _DEFAULT_SAFE_REMOVE_TREE
-        or os.name == "nt"
     ):
         with _windows_directory_lease(root, "cleanup"):
             _assert_physical_root(root, expected_identity)
@@ -905,6 +1205,18 @@ def _cleanup_tree_owned(
             if result.get("success"):
                 _assert_physical_root(root, expected_identity)
         return result
+    if os.name == "nt":
+        with _windows_directory_lease(root, "cleanup"):
+            _assert_physical_root(root, expected_identity)
+            try:
+                os.lstat(str(path))
+            except FileNotFoundError:
+                return {"success": True, "requires_restart": False}
+            expected = _private_tree_identities(path, "cleanup")
+            _assert_private_tree_identities(path, expected, "cleanup")
+            _windows_remove_tree(path, "cleanup", expected=expected)
+            _assert_physical_root(root, expected_identity)
+        return {"success": True, "requires_restart": False}
     try:
         relative = path.relative_to(root).parts
         if not relative:
@@ -942,6 +1254,19 @@ def _cleanup_private_tree(path: Path, stage: str = "uninstall") -> dict[str, Any
         with _windows_directory_lease(path.parent, stage):
             if _directory_identity(path.parent, stage) != parent_identity:
                 raise InstallFailure(EXIT_PREFLIGHT, stage, "Managed directory changed identity")
+            if (
+                os.name == "nt"
+                and _cleanup_tree is _DEFAULT_CLEANUP_TREE
+                and safe_remove_tree is _DEFAULT_SAFE_REMOVE_TREE
+            ):
+                try:
+                    os.lstat(str(path))
+                except FileNotFoundError:
+                    return {"success": True, "requires_restart": False}
+                expected = _private_tree_identities(path, stage)
+                _assert_private_tree_identities(path, expected, stage)
+                _windows_remove_tree(path, stage, expected=expected)
+                return {"success": True, "requires_restart": False}
             result = _cleanup_tree(path)
     except BaseException as exc:
         raise InstallFailure(EXIT_INSTALL, stage, "Private transaction cleanup failed") from exc
@@ -955,10 +1280,28 @@ def _mkdir_relative_nofollow(
 ) -> None:
     """Create a relative directory path using no-follow components."""
     if os.name == "nt":
-        _assert_physical_root(root, expected_identity)
-        _assert_path_components_safe(root / relative, "uninstall")
-        (root / relative).mkdir(parents=True, exist_ok=True)
-        _assert_path_components_safe(root / relative, "uninstall")
+        with _windows_directory_lease(root, "uninstall"):
+            _assert_physical_root(root, expected_identity)
+            current = root
+            for component in Path(relative).parts:
+                current = current / component
+                _assert_path_components_safe(current, "uninstall")
+                try:
+                    current.mkdir()
+                except FileExistsError:
+                    pass
+                with _windows_object_handle(
+                    current,
+                    "uninstall",
+                    access=0x80 | 0x20,
+                ):
+                    if _is_link(current) or not current.is_dir():
+                        raise InstallFailure(
+                            EXIT_PREFLIGHT,
+                            "uninstall",
+                            "Managed restore directory is linked or not a directory",
+                        )
+            _assert_physical_root(root, expected_identity)
         return
     parts = Path(relative).parts
     if not parts or any(part in {"", ".", ".."} for part in parts):
@@ -996,9 +1339,25 @@ def _chmod_relative_nofollow(
     mode: int,
 ) -> None:
     if os.name == "nt":
-        _assert_physical_root(root, expected_identity)
-        _assert_path_components_safe(root / relative, "uninstall")
-        _chmod_no_follow(root / relative, mode)
+        target = root / relative
+        with _windows_directory_lease(root, "uninstall"):
+            _assert_physical_root(root, expected_identity)
+            _assert_path_components_safe(target, "uninstall")
+            expected = _object_identity(target, "uninstall")
+            with _windows_object_handle(
+                target,
+                "uninstall",
+                access=0x80 | 0x20 | 0x00010000,
+            ):
+                if _object_identity(target, "uninstall")[:2] != expected[:2]:
+                    raise InstallFailure(
+                        EXIT_PREFLIGHT, "uninstall", "Managed path changed identity"
+                    )
+                _chmod_no_follow(target, mode)
+                if _object_identity(target, "uninstall")[:2] != expected[:2]:
+                    raise InstallFailure(
+                        EXIT_PREFLIGHT, "uninstall", "Managed path changed identity"
+                    )
         return
     parts = Path(relative).parts
     if not parts or any(part in {"", ".", ".."} for part in parts):
@@ -1262,7 +1621,12 @@ def _replace_plugin(root: Path) -> Path:
     backup = root / (".%s.%s.backup" % (_PLUGIN_NAME, uuid.uuid4().hex))
     try:
         if target.exists():
-            _replace_path_owned(root, root_identity, target, backup)
+            _replace_path_owned(
+                root,
+                root_identity,
+                target,
+                backup,
+            )
         _replace_path_owned(root, root_identity, stage, target)
         cleanup = _cleanup_tree_owned(root, root_identity, backup)
         if not cleanup.get("success"):
@@ -1507,31 +1871,61 @@ class InstallTransaction:
         failed = self.root / (".%s.%s.failed" % (_PLUGIN_NAME, uuid.uuid4().hex))
         try:
             _assert_physical_root(self.root, self.root_identity)
-            _assert_receipt_path_safe(self.receipt_path)
             if self.replacement_moved and (self.target.exists() or self.target.is_symlink()):
                 _replace_path_owned(self.root, self.root_identity, self.target, failed)
             if self.previous_moved:
                 restore_source = None
+                recovery_changed = False
                 for candidate in (self.recovery, self.backup):
                     if candidate is None or not candidate.is_dir() or _is_link(candidate):
                         continue
                     if self.previous_manifest is not None:
                         try:
                             if _recovery_manifest(candidate) != self.previous_manifest:
+                                recovery_changed = True
                                 continue
                         except (InstallFailure, OSError):
+                            recovery_changed = True
                             continue
                     restore_source = candidate
                     break
                 if restore_source is None:
+                    if recovery_changed:
+                        if self.old_receipt is None:
+                            _unlink_receipt_owned(self.receipt_path)
+                        else:
+                            _write_bytes_atomic(
+                                self.receipt_path, self.old_receipt, self.old_receipt_mode
+                            )
+                        _cleanup_tree_owned(self.root, self.root_identity, failed)
+                        self.closed = True
+                        raise InstallFailure(
+                            EXIT_INSTALL,
+                            "recovery",
+                            "Prior GIMP install changed identity; recovery was preserved",
+                        )
                     raise InstallFailure(
                         EXIT_INSTALL, "recovery", "No validated prior GIMP recovery remains"
                     )
                 _replace_path_owned(self.root, self.root_identity, restore_source, self.target)
-            if self.old_receipt is None:
-                _unlink_receipt_owned(self.receipt_path)
-            else:
-                _write_bytes_atomic(self.receipt_path, self.old_receipt, self.old_receipt_mode)
+            try:
+                if self.old_receipt is None:
+                    _unlink_receipt_owned(self.receipt_path)
+                else:
+                    _write_bytes_atomic(self.receipt_path, self.old_receipt, self.old_receipt_mode)
+            except InstallFailure as receipt_error:
+                # A receipt pathname that changed to a link/reparse point is
+                # no longer safe to restore. Keep it untouched, clean only
+                # the known replacement, and return a structured install
+                # failure instead of following the foreign target.
+                _cleanup_tree_owned(self.root, self.root_identity, failed)
+                _cleanup_tree_owned(self.root, self.root_identity, self.backup)
+                self.closed = True
+                raise InstallFailure(
+                    EXIT_INSTALL,
+                    "receipt",
+                    "Install receipt changed identity; rollback was preserved",
+                ) from receipt_error
             if self.previous_moved and self.previous_manifest is not None:
                 if _recovery_manifest(self.target) != self.previous_manifest:
                     raise InstallFailure(
@@ -1543,6 +1937,8 @@ class InstallTransaction:
                 _cleanup_tree_owned(self.root, self.root_identity, self.recovery)
             self.closed = True
             return self.previous_moved
+        except InstallFailure:
+            raise
         except BaseException as exc:
             raise InstallFailure(
                 EXIT_INSTALL, "install", "Prior GIMP install could not be restored"
@@ -1636,8 +2032,16 @@ def _begin_replace_plugin(root: Path, report: Mapping[str, Any]) -> InstallTrans
                 _assert_target_identity(target, planned_target_identity, "install")
             if planned_file_identities:
                 _assert_owned_file_identities(target, planned_file_identities, "install")
-            _replace_path_owned(root, root_identity, target, backup)
+            _replace_path_owned(
+                root,
+                root_identity,
+                target,
+                backup,
+                expected_file_identities=planned_file_identities,
+            )
             transaction.previous_moved = True
+            if planned_file_identities:
+                _assert_owned_file_identities(backup, planned_file_identities, "install")
         _assert_physical_root(root, root_identity)
         _replace_path_owned(root, root_identity, stage, target)
         transaction.replacement_moved = True
@@ -1819,6 +2223,7 @@ def _execute_uninstall(report: dict[str, Any]) -> tuple[dict[str, Any], int]:
     quarantine_target = quarantine / _PLUGIN_NAME
     quarantine_receipt = quarantine / "gimp.json"
     transaction_created = False
+    preserve_transaction = False
     try:
         transaction.mkdir(mode=0o700)
         transaction_created = True
@@ -1835,7 +2240,24 @@ def _execute_uninstall(report: dict[str, Any]) -> tuple[dict[str, Any], int]:
             or _path_mode(snapshot_receipt) != owned_snapshot.receipt_mode
         ):
             raise InstallFailure(EXIT_INSTALL, "uninstall", "Uninstall recovery validation failed")
-        _replace_path_owned(destination, root_identity, target, quarantine_target)
+        _replace_path_owned(
+            destination,
+            root_identity,
+            target,
+            quarantine_target,
+            expected_file_identities=planned_file_identities,
+        )
+        if planned_file_identities:
+            try:
+                _assert_owned_file_identities(
+                    quarantine_target, planned_file_identities, "uninstall"
+                )
+            except InstallFailure:
+                # Do not recursively delete a quarantine whose child identity
+                # changed after validation; it may now contain operator-owned
+                # bytes. Leave the private transaction for manual recovery.
+                preserve_transaction = True
+                raise
         _assert_receipt_path_safe(receipt_path)
         _replace_receipt_owned(receipt_path, quarantine_receipt, destination, root_identity)
         _assert_physical_root(destination, root_identity)
@@ -1864,7 +2286,7 @@ def _execute_uninstall(report: dict[str, Any]) -> tuple[dict[str, Any], int]:
             raise InstallFailure(
                 EXIT_INSTALL, "uninstall", "Uninstall rollback could not restore prior state"
             ) from restore_error
-        if transaction_created:
+        if transaction_created and not preserve_transaction:
             _cleanup_private_tree(transaction)
         if isinstance(exc, InstallFailure):
             raise exc

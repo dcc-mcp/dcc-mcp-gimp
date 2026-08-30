@@ -140,6 +140,11 @@ def run(argv: Sequence[str]) -> tuple[dict[str, Any], int, bool]:
                 report["gimp_version"],
                 instance_id=args.instance_id,
                 host_pid=args.host_pid,
+                expected_python_identity=(
+                    tuple(report["_python_identity"])
+                    if report.get("_python_identity") is not None
+                    else None
+                ),
             )
         except InstallFailure as failure:
             if transaction is not None and not transaction.closed:
@@ -201,6 +206,11 @@ def run(argv: Sequence[str]) -> tuple[dict[str, Any], int, bool]:
             report["gimp_version"],
             instance_id=args.instance_id,
             host_pid=args.host_pid,
+            expected_python_identity=(
+                tuple(report["_python_identity"])
+                if report.get("_python_identity") is not None
+                else None
+            ),
             expected_target_identity=(
                 tuple(report["_target_identity"])
                 if report.get("_target_identity") is not None

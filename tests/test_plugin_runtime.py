@@ -135,6 +135,41 @@ def test_runtime_bounds_bootstrap_error_log(runtime, tmp_path, monkeypatch):
     assert errors.stat().st_size <= 256 * 1024
 
 
+def test_runtime_bootstrap_rejects_reparse_parent(runtime, tmp_path, monkeypatch):
+    errors = tmp_path / "linked" / "bootstrap-errors.jsonl"
+    capture = runtime["_capture_bootstrap_error"]
+    globals_ = capture.__globals__
+    original = globals_["_path_is_link_or_reparse"]
+
+    def mark_parent(path):
+        return path == errors.parent or original(path)
+
+    monkeypatch.setitem(globals_, "_path_is_link_or_reparse", mark_parent)
+    capture("bridge-startup", RuntimeError("must not follow a reparse parent"))
+
+    assert not errors.exists()
+
+
+def test_runtime_bootstrap_concurrent_writers_remain_bounded(runtime, tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+
+    errors = tmp_path / "bootstrap-errors.jsonl"
+    errors.parent.mkdir(parents=True, exist_ok=True)
+    errors.write_bytes(b"x" * (200 * 1024))
+    monkeypatch.setenv("DCC_MCP_GIMP_BOOTSTRAP_ERRORS", str(errors))
+    capture = runtime["_capture_bootstrap_error"]
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        list(
+            pool.map(
+                lambda index: capture("bridge-startup", RuntimeError("failure-%d" % index)),
+                range(100),
+            )
+        )
+
+    assert errors.stat().st_size <= 256 * 1024
+
+
 def test_plugin_captures_gi_import_failure(tmp_path, monkeypatch):
     errors = tmp_path / "bootstrap-errors.jsonl"
     monkeypatch.setenv("DCC_MCP_GIMP_BOOTSTRAP_ERRORS", str(errors))

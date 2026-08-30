@@ -153,6 +153,7 @@ def verify_install(
     host_pid: Optional[int] = None,
     expected_target_identity: Optional[tuple[int, int]] = None,
     expected_file_identities: Optional[Mapping[str, tuple[int, ...]]] = None,
+    expected_python_identity: Optional[tuple[int, int, int, int]] = None,
 ) -> dict[str, Any]:
     target = destination / _PLUGIN_NAME
     result: dict[str, Any] = {
@@ -212,7 +213,7 @@ def verify_install(
             failure_stage="artifact", failure_reason="Plug-in version differs from the wheel"
         )
         return result
-    result["import"] = _python_import_check(python)
+    result["import"] = _python_import_check(python, expected_identity=expected_python_identity)
     if not result["import"].get("success"):
         result.update(failure_stage="import", failure_reason=result["import"].get("reason"))
         return result
@@ -433,6 +434,8 @@ def plan(
         "instance_id": instance_id,
         "host_pid": host_pid,
         "_target_identity": list(target_identity) if target_identity is not None else None,
+        "_python_identity": list(python_identity),
+        "_gimp_identity": list(gimp_identity),
         "_owned_file_identities": {
             relative: list(identity) for relative, identity in (owned_file_identities or {}).items()
         },
