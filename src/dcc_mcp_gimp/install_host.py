@@ -140,6 +140,56 @@ def _windows_executable_lease(path: Path, stage: str) -> Any:
                 pass
 
 
+@contextlib.contextmanager
+def _windows_executable_handle(path: Path, stage: str) -> Any:
+    """Hold the selected executable itself against rename/reparse swaps."""
+    if os.name != "nt":
+        yield
+        return
+    handle = None
+    try:
+        import ctypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateFileW.argtypes = [
+            ctypes.c_wchar_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+        ]
+        kernel32.CreateFileW.restype = ctypes.c_void_p
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = ctypes.c_int
+        handle = kernel32.CreateFileW(
+            str(path),
+            0x80,
+            0x1 | 0x2,
+            None,
+            3,
+            0x02000000,
+            None,
+        )
+        invalid = ctypes.c_void_p(-1).value
+        if handle in (None, invalid):
+            error = ctypes.get_last_error()
+            raise OSError(error, "CreateFileW executable handle failed", str(path))
+    except (OSError, AttributeError, RuntimeError, ValueError) as exc:
+        raise InstallFailure(
+            EXIT_PREFLIGHT, stage, "Selected executable handle unavailable"
+        ) from exc
+    try:
+        yield
+    finally:
+        if handle not in (None,):
+            try:
+                kernel32.CloseHandle(handle)
+            except (OSError, AttributeError):
+                pass
+
+
 def default_plugin_dir() -> Path:
     if sys.platform == "darwin":
         return Path.home() / "Library/Application Support/GIMP/3.0/plug-ins"
@@ -343,14 +393,16 @@ def _gimp_version(
     command.append("--version")
     try:
         with _windows_executable_lease(executable, "gimp_version"):
-            _assert_executable_identity(executable, expected_identity, "gimp_version")
-            completed = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                timeout=15,
-                check=False,
-            )
+            with _windows_executable_handle(executable, "gimp_version"):
+                _assert_executable_identity(executable, expected_identity, "gimp_version")
+                completed = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                    check=False,
+                )
+                _assert_executable_identity(executable, expected_identity, "gimp_version")
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise InstallFailure(EXIT_PREFLIGHT, "gimp_version", str(exc)) from exc
     output = "%s\n%s" % (completed.stdout, completed.stderr)
@@ -461,14 +513,16 @@ print(
     """.strip()
     try:
         with _windows_executable_lease(python, "python"):
-            _assert_executable_identity(python, expected_identity, "python")
-            completed = subprocess.run(
-                [str(python), "-c", code],
-                capture_output=True,
-                text=True,
-                timeout=15,
-                check=False,
-            )
+            with _windows_executable_handle(python, "python"):
+                _assert_executable_identity(python, expected_identity, "python")
+                completed = subprocess.run(
+                    [str(python), "-c", code],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                    check=False,
+                )
+                _assert_executable_identity(python, expected_identity, "python")
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise InstallFailure(EXIT_PREFLIGHT, "python", str(exc)) from exc
     if completed.returncode:
@@ -564,9 +618,13 @@ print(
     }
 
 
-def _python_import_check(python: Path) -> dict[str, Any]:
+def _python_import_check(
+    python: Path,
+    *,
+    expected_identity: Optional[tuple[int, int, int, int]] = None,
+) -> dict[str, Any]:
     try:
-        versions = _target_versions(python)
+        versions = _target_versions(python, expected_identity=expected_identity)
     except InstallFailure as exc:
         return {"success": False, "reason": str(exc)}
     return {

@@ -22,6 +22,36 @@ from typing import Any, Mapping, Optional
 _MAX_BOOTSTRAP_RECORD_BYTES = 64 * 1024
 _MAX_BOOTSTRAP_RECORDS = 1024
 _MAX_BOOTSTRAP_LOG_BYTES = 256 * 1024
+_BOOTSTRAP_WRITE_LOCK = threading.Lock()
+
+
+def _path_is_link_or_reparse(path: Path) -> bool:
+    """Fail closed for symlinks and Windows reparse points (including junctions)."""
+    try:
+        if path.is_symlink():
+            return True
+        if os.name != "nt":
+            return False
+        import ctypes
+
+        attributes = ctypes.windll.kernel32.GetFileAttributesW(str(path))
+        if int(attributes) in (-1, 0xFFFFFFFF):
+            return False
+        return bool(int(attributes) & 0x400)
+    except (AttributeError, OSError, RuntimeError, ValueError):
+        return True
+
+
+def _bootstrap_path_safe(path: Path) -> bool:
+    """Check the file and every existing parent without resolving links."""
+    candidate = path
+    while True:
+        if _path_is_link_or_reparse(candidate):
+            return False
+        parent = candidate.parent
+        if parent == candidate:
+            return True
+        candidate = parent
 
 
 def _bootstrap_error_path() -> Path:
@@ -40,37 +70,46 @@ def _capture_bootstrap_error(stage: str, error: BaseException) -> None:
         "message": str(error)[:_MAX_BOOTSTRAP_RECORD_BYTES],
     }
     try:
-        if path.is_symlink() or any(parent.is_symlink() for parent in path.parents):
-            return
-        path.parent.mkdir(parents=True, exist_ok=True)
-        line = (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode(
-            "utf-8"
-        )
-        current_size = path.stat().st_size if path.is_file() else 0
-        if current_size + len(line) <= _MAX_BOOTSTRAP_LOG_BYTES:
-            with path.open("ab") as stream:
-                stream.write(line)
-            return
-        with path.open("rb") as stream:
-            stream.seek(max(0, current_size - _MAX_BOOTSTRAP_LOG_BYTES))
-            existing = stream.read(_MAX_BOOTSTRAP_LOG_BYTES)
-        lines = existing.splitlines(keepends=True)
-        if current_size > _MAX_BOOTSTRAP_LOG_BYTES and b"\n" in existing:
-            lines = lines[1:]
-        lines = lines[-(_MAX_BOOTSTRAP_RECORDS - 1) :]
-        while lines and sum(len(item) for item in lines) + len(line) > _MAX_BOOTSTRAP_LOG_BYTES:
-            lines.pop(0)
-        payload = b"".join(lines) + line
-        temporary = path.with_name(".%s.%s.tmp" % (path.name, uuid.uuid4().hex))
-        with temporary.open("xb") as stream:
-            stream.write(payload)
-        try:
-            os.replace(temporary, path)
-        finally:
+        # Serialize all readers/writers in this process.  Without this lock,
+        # concurrent startup failures can each observe the old size and append
+        # past the bounded log cap.
+        with _BOOTSTRAP_WRITE_LOCK:
+            if not _bootstrap_path_safe(path):
+                return
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if not _bootstrap_path_safe(path):
+                return
+            line = (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode(
+                "utf-8"
+            )
+            current_size = path.stat().st_size if path.is_file() else 0
+            if current_size + len(line) <= _MAX_BOOTSTRAP_LOG_BYTES:
+                with path.open("ab") as stream:
+                    stream.write(line)
+                return
+            with path.open("rb") as stream:
+                stream.seek(max(0, current_size - _MAX_BOOTSTRAP_LOG_BYTES))
+                existing = stream.read(_MAX_BOOTSTRAP_LOG_BYTES)
+            lines = existing.splitlines(keepends=True)
+            if current_size > _MAX_BOOTSTRAP_LOG_BYTES and b"\n" in existing:
+                lines = lines[1:]
+            lines = lines[-(_MAX_BOOTSTRAP_RECORDS - 1) :]
+            while lines and sum(len(item) for item in lines) + len(line) > _MAX_BOOTSTRAP_LOG_BYTES:
+                lines.pop(0)
+            payload = b"".join(lines) + line
+            temporary = path.with_name(".%s.%s.tmp" % (path.name, uuid.uuid4().hex))
+            if not _bootstrap_path_safe(temporary):
+                return
+            with temporary.open("xb") as stream:
+                stream.write(payload)
             try:
-                temporary.unlink()
-            except FileNotFoundError:
-                pass
+                if _bootstrap_path_safe(path):
+                    os.replace(temporary, path)
+            finally:
+                try:
+                    temporary.unlink()
+                except FileNotFoundError:
+                    pass
     except OSError:
         pass
 
