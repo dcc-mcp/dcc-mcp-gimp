@@ -202,6 +202,30 @@ def test_runtime_bootstrap_rotation_ignores_swapped_python_rename(runtime, tmp_p
     assert b"FOREIGN\n" not in errors.read_bytes()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Exercises POSIX bootstrap rotation")
+def test_runtime_bootstrap_rotation_failure_preserves_previous_log(runtime, tmp_path, monkeypatch):
+    errors = tmp_path / "bootstrap-errors.jsonl"
+    original_bytes = b'{"stage":"old"}\n' * 400
+    errors.write_bytes(original_bytes)
+    monkeypatch.setenv("DCC_MCP_GIMP_BOOTSTRAP_ERRORS", str(errors))
+    capture = runtime["_capture_bootstrap_error"]
+    original_write = os.write
+    state = {"failed": False}
+
+    def fail_rotation_write(fd, data):
+        if not state["failed"] and len(data) > 5:
+            state["failed"] = True
+            original_write(fd, data[:5])
+            raise OSError("injected bootstrap write failure")
+        return original_write(fd, data)
+
+    monkeypatch.setattr(os, "write", fail_rotation_write)
+    capture("rotation", RuntimeError("probe"))
+
+    assert state["failed"]
+    assert errors.read_bytes() == original_bytes
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Exercises Windows bootstrap temp identity lease")
 def test_runtime_windows_bootstrap_rotation_rejects_temp_swap(runtime, tmp_path, monkeypatch):
     errors = tmp_path / "bootstrap-errors.jsonl"
