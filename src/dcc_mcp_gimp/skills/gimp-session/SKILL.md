@@ -27,6 +27,9 @@ follow the machine-readable `next_steps[]` and require
 `verify.directly_usable: true`. Use `status`, `upgrade`, and `uninstall` for the
 same receipted profile. Configure `DCC_MCP_GIMP_ALLOWED_ROOTS`, and treat
 exit 50 as a fail-closed restart/lock boundary rather than proof of readiness.
+Use the exact `next_steps[]` command, including any explicit `--instance-id` or
+`--host-pid` selectors. A legacy receipt without `entry_point_executable` is
+not migrated: status reports `repair`, upgrade and uninstall refuse mutation.
 All host API calls are typed and marshalled onto GIMP's GLib main thread. The
 bridge
 accepts only authenticated loopback JSON-lines requests and never executes

@@ -17,10 +17,15 @@ from .install_contract import (
     _version_tuple,
 )
 from .install_files import (
+    _assert_physical_root,
+    _assert_profile_writable,
+    _assert_target_identity,
     _installation_state,
+    _owned_file_identities,
     _plugin_version,
     _read_receipt,
     _receipt_path,
+    _target_identity,
     _validate_owned_install,
 )
 from .install_host import (
@@ -39,7 +44,10 @@ _READINESS_TOOL = "gimp_session__get_status"
 
 
 def _same_path(left: Path, right: Path) -> bool:
-    return os.path.normcase(str(left.resolve())) == os.path.normcase(str(right.resolve()))
+    try:
+        return os.path.normcase(str(left.resolve())) == os.path.normcase(str(right.resolve()))
+    except (OSError, RuntimeError, ValueError):
+        return False
 
 
 def _probe_context(readiness: Mapping[str, Any]) -> Optional[dict[str, Any]]:
@@ -117,7 +125,7 @@ def _runtime_identity_failure(
     try:
         if not _same_path(Path(module_value), target / ("%s.py" % _PLUGIN_NAME)):
             return "GIMP bridge module does not belong to the receipted installation"
-    except OSError:
+    except (OSError, RuntimeError, ValueError):
         return "GIMP bridge module path is invalid"
     before = _process_start_identity(actual_host_pid)
     process_path = _process_executable_path(actual_host_pid)
@@ -143,7 +151,6 @@ def verify_install(
     host_pid: Optional[int] = None,
 ) -> dict[str, Any]:
     target = destination / _PLUGIN_NAME
-    receipt = _read_receipt()
     result: dict[str, Any] = {
         "directly_usable": False,
         "failure_stage": None,
@@ -152,11 +159,26 @@ def verify_install(
         "import": {"success": False},
         "readiness": {"success": False},
     }
+    try:
+        receipt = _read_receipt()
+    except InstallFailure as exc:
+        result.update(failure_stage=exc.stage, failure_reason=str(exc))
+        return result
     if receipt is None or not target.is_dir():
         result.update(failure_stage="artifact", failure_reason="Plug-in or receipt is missing")
         return result
     try:
+        target_identity = _target_identity(target)
+    except InstallFailure as exc:
+        result.update(failure_stage=exc.stage, failure_reason=str(exc))
+        return result
+    try:
         _validate_owned_install(destination, target, _receipt_path(), receipt)
+    except InstallFailure as exc:
+        result.update(failure_stage="artifact", failure_reason=str(exc))
+        return result
+    try:
+        _assert_target_identity(target, target_identity)
     except InstallFailure as exc:
         result.update(failure_stage="artifact", failure_reason=str(exc))
         return result
@@ -184,6 +206,11 @@ def verify_install(
             failure_stage="import",
             failure_reason="Target interpreter module origins differ from the install receipt",
         )
+        return result
+    try:
+        _assert_target_identity(target, target_identity)
+    except InstallFailure as exc:
+        result.update(failure_stage="artifact", failure_reason=str(exc))
         return result
 
     errors = _bootstrap_error_summary()
@@ -254,6 +281,11 @@ def verify_install(
     if failure is not None:
         result.update(failure_stage="readiness_identity", failure_reason=failure)
         return result
+    try:
+        _assert_target_identity(target, target_identity)
+    except InstallFailure as exc:
+        result.update(failure_stage="artifact", failure_reason=str(exc))
+        return result
     result["directly_usable"] = True
     return result
 
@@ -316,15 +348,23 @@ def plan(
     destination: Optional[Path],
     python_value: Optional[Path],
     dcc_path: Optional[Path],
+    *,
+    instance_id: Optional[str] = None,
+    host_pid: Optional[int] = None,
 ) -> dict[str, Any]:
     try:
-        root = (destination or default_plugin_dir()).expanduser().resolve()
+        # Preserve the operator-selected path identity.  Resolving first would
+        # turn a symlink/junction destination into its target and silently bind
+        # the receipt to an external profile.
+        root = (destination or default_plugin_dir()).expanduser().absolute()
     except (OSError, RuntimeError, ValueError) as exc:
         raise InstallFailure(
             EXIT_PREFLIGHT,
             "profile",
             "GIMP profile path could not be resolved",
         ) from exc
+    _assert_physical_root(root)
+    _assert_profile_writable(root)
     executable = _resolve_gimp(dcc_path)
     python = _resolve_python(python_value, executable)
     gimp_version = _gimp_version(executable)
@@ -340,7 +380,17 @@ def plan(
                 "multi-profile installs are not supported",
             )
     state = _installation_state(root)
-    installed_version = _plugin_version(root / _PLUGIN_NAME / ("%s.py" % _PLUGIN_NAME))
+    target = root / _PLUGIN_NAME
+    installed_version = _plugin_version(target / ("%s.py" % _PLUGIN_NAME))
+    target_identity = None
+    owned_file_identities = None
+    if target.is_dir():
+        target_identity = _target_identity(target)
+        if receipt is not None:
+            try:
+                owned_file_identities = _owned_file_identities(target, receipt)
+            except InstallFailure:
+                owned_file_identities = None
     return {
         "schema_version": SCHEMA_VERSION,
         "status": "planned",
@@ -357,6 +407,12 @@ def plan(
         "dcc_path": str(executable),
         "python": str(python),
         "destination": str(root),
+        "instance_id": instance_id,
+        "host_pid": host_pid,
+        "_target_identity": list(target_identity) if target_identity is not None else None,
+        "_owned_file_identities": {
+            relative: list(identity) for relative, identity in (owned_file_identities or {}).items()
+        },
         "installation_state": state,
         "steps": [
             {"id": "preflight", "status": "ok", "gimp_version": gimp_version},
