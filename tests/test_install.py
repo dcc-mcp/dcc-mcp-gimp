@@ -1355,6 +1355,48 @@ def test_install_preserves_receipt_that_appears_before_commit(lifecycle_env, mon
     assert not (lifecycle_env.plugins / "dcc_mcp_gimp").exists()
 
 
+@pytest.mark.parametrize("verb", ["install", "upgrade"])
+def test_apply_rejects_receipt_identity_change_since_plan(lifecycle_env, monkeypatch, verb):
+    from dcc_mcp_gimp import install as install_module
+
+    target = lifecycle_env.plugins / "dcc_mcp_gimp"
+    receipt = lifecycle_env.root / ".dcc-mcp" / "receipts" / "gimp.json"
+    if verb == "upgrade":
+        installed, code, _ = install_module.run(["install", "--yes", *lifecycle_env.common])
+        assert code == 0, installed
+    prior_target = {
+        path.relative_to(target).as_posix(): path.read_bytes()
+        for path in target.rglob("*")
+        if path.is_file()
+    }
+    original_begin = install_module._begin_replace_plugin
+    state = {"changed": False}
+
+    def change_receipt_then_begin(root, report):
+        receipt.parent.mkdir(parents=True, exist_ok=True)
+        if receipt.exists():
+            parked = receipt.with_name("gimp.planned.json")
+            receipt.rename(parked)
+            state["parked"] = parked
+        receipt.write_bytes(b"OPERATOR-RECEIPT")
+        state["changed"] = True
+        return original_begin(root, report)
+
+    monkeypatch.setattr(install_module, "_begin_replace_plugin", change_receipt_then_begin)
+    report, code, _ = install_module.run([verb, "--yes", *lifecycle_env.common])
+
+    assert state["changed"] is True
+    assert code == 10, report
+    assert receipt.read_bytes() == b"OPERATOR-RECEIPT"
+    assert {
+        path.relative_to(target).as_posix(): path.read_bytes()
+        for path in target.rglob("*")
+        if path.is_file()
+    } == prior_target
+    if verb == "upgrade":
+        assert state["parked"].is_file()
+
+
 @pytest.mark.skipif(os.name == "nt", reason="Exercises POSIX receipt move rollback")
 def test_receipt_move_failure_restores_source_without_partial_destination(tmp_path, monkeypatch):
     from dcc_mcp_gimp import install_files
@@ -1696,6 +1738,32 @@ def test_uninstall_quarantine_late_unowned_entry_is_preserved(lifecycle_env, mon
     )
 
 
+def test_uninstall_transaction_snapshot_does_not_adopt_foreign_entry(lifecycle_env, monkeypatch):
+    from dcc_mcp_gimp import install_files
+    from dcc_mcp_gimp.install import run
+
+    installed, code, _ = run(["install", "--yes", *lifecycle_env.common])
+    assert code == 0, installed
+    original_move = install_files._replace_receipt_owned
+    state = {"injected": False}
+
+    def move_then_inject(source, destination, root, expected_identity, **kwargs):
+        result = original_move(source, destination, root, expected_identity, **kwargs)
+        snapshot = destination.parent.parent / "snapshot"
+        foreign = snapshot / "operator.txt"
+        foreign.write_text("do not delete", encoding="utf-8")
+        state.update(injected=True, foreign=foreign)
+        return result
+
+    monkeypatch.setattr(install_files, "_replace_receipt_owned", move_then_inject)
+    report, code, _ = run(["uninstall", "--yes", *lifecycle_env.common])
+
+    assert state["injected"] is True
+    assert code != 0, report
+    assert (lifecycle_env.plugins / "dcc_mcp_gimp" / "dcc_mcp_gimp.py").is_file()
+    assert state["foreign"].read_text(encoding="utf-8") == "do not delete"
+
+
 def test_uninstall_rejects_entry_added_after_manifest_validation(lifecycle_env, monkeypatch):
     from dcc_mcp_gimp import install_files
     from dcc_mcp_gimp.install import run
@@ -1992,7 +2060,7 @@ def test_stage_path_swap_is_not_published(lifecycle_env, monkeypatch):
         (foreign / "dcc_mcp_gimp.py").write_text('VERSION = "0.4.1"\n', encoding="utf-8")
         stage.rename(parked)
         foreign.rename(stage)
-        state["parked"] = parked
+        state.update(parked=parked, stage=stage)
         return stage
 
     monkeypatch.setattr(install_files, "_stage_plugin", stage_then_swap)
@@ -2002,6 +2070,7 @@ def test_stage_path_swap_is_not_published(lifecycle_env, monkeypatch):
     assert report["status"] == "failed"
     assert not (lifecycle_env.plugins / "dcc_mcp_gimp" / "operator.txt").exists()
     assert state["parked"].is_dir()
+    assert (state["stage"] / "operator.txt").read_text(encoding="utf-8") == "foreign"
 
 
 def test_stage_child_rewrite_is_not_published_or_receipted(lifecycle_env, monkeypatch):
@@ -2036,6 +2105,120 @@ def test_stage_child_rewrite_is_not_published_or_receipted(lifecycle_env, monkey
     assert code == 10, report
     assert target_script.read_bytes() == prior_script
     assert receipt_path.read_bytes() == prior_receipt
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Exercises Windows stage publication")
+def test_windows_stage_publication_does_not_publish_path_occupant(lifecycle_env, monkeypatch):
+    from dcc_mcp_gimp import install_files
+
+    root = lifecycle_env.plugins
+    root.mkdir(parents=True)
+    stage = install_files._stage_plugin(root)
+    manifest = install_files._BOUND_STAGE_MANIFESTS[str(stage.absolute())]
+    destination = root / "published-plugin"
+    parked = root / (stage.name + ".owned")
+    foreign = root / (stage.name + ".foreign")
+    foreign.mkdir()
+    (foreign / "operator.txt").write_text("preserve", encoding="utf-8")
+    original_assert = install_files._assert_stage_manifest
+    state = {"attempted": False, "swapped": False}
+
+    def validate_then_occupy(path, expected):
+        result = original_assert(path, expected)
+        if Path(path) == stage and not state["attempted"]:
+            state["attempted"] = True
+            try:
+                stage.rename(parked)
+                foreign.rename(stage)
+                state["swapped"] = True
+            except PermissionError as exc:
+                raise install_files.InstallFailure(
+                    install_files.EXIT_PREFLIGHT,
+                    "install",
+                    "Managed stage changed identity",
+                ) from exc
+        return result
+
+    monkeypatch.setattr(install_files, "_assert_stage_manifest", validate_then_occupy)
+
+    with pytest.raises(install_files.InstallFailure):
+        install_files._replace_path_owned(
+            root,
+            install_files._directory_identity(root, "install"),
+            stage,
+            destination,
+            expected_source_identity=manifest.root_identity,
+            expected_stage_manifest=manifest,
+        )
+
+    assert state["attempted"] is True
+    assert not destination.exists()
+    if state["swapped"]:
+        assert (stage / "operator.txt").read_text(encoding="utf-8") == "preserve"
+        assert parked.is_dir()
+    else:
+        assert (foreign / "operator.txt").read_text(encoding="utf-8") == "preserve"
+        assert stage.is_dir()
+
+
+def test_upgrade_cleanup_preserves_replaced_backup_name(lifecycle_env, monkeypatch):
+    from dcc_mcp_gimp import install_files
+    from dcc_mcp_gimp.install import run
+
+    installed, code, _ = run(["install", "--yes", *lifecycle_env.common])
+    assert code == 0, installed
+    foreign = lifecycle_env.plugins / ".operator-backup"
+    foreign.mkdir()
+    (foreign / "operator.txt").write_text("preserve", encoding="utf-8")
+    original_cleanup = install_files._cleanup_tree_owned
+    state = {"swapped": False}
+
+    def replace_before_cleanup(root, expected_identity, path, *args, **kwargs):
+        candidate = Path(path)
+        if not state["swapped"] and candidate.name.endswith(".backup"):
+            parked = candidate.with_name(candidate.name + ".owned")
+            candidate.rename(parked)
+            foreign.rename(candidate)
+            state.update(swapped=True, candidate=candidate, parked=parked)
+        return original_cleanup(root, expected_identity, path, *args, **kwargs)
+
+    monkeypatch.setattr(install_files, "_cleanup_tree_owned", replace_before_cleanup)
+    report, code, _ = run(["upgrade", "--yes", *lifecycle_env.common])
+
+    assert state["swapped"] is True
+    assert code != 0, report
+    assert (state["candidate"] / "operator.txt").read_text(encoding="utf-8") == "preserve"
+    assert state["parked"].is_dir()
+
+
+def test_upgrade_cleanup_preserves_replaced_recovery_name(lifecycle_env, monkeypatch):
+    from dcc_mcp_gimp import install_files
+    from dcc_mcp_gimp.install import run
+
+    installed, code, _ = run(["install", "--yes", *lifecycle_env.common])
+    assert code == 0, installed
+    foreign = lifecycle_env.plugins / ".operator-recovery"
+    foreign.mkdir()
+    (foreign / "operator.txt").write_text("preserve", encoding="utf-8")
+    original_cleanup = install_files._cleanup_tree_owned
+    state = {"swapped": False}
+
+    def replace_before_cleanup(root, expected_identity, path, *args, **kwargs):
+        candidate = Path(path)
+        if not state["swapped"] and candidate.name.endswith(".recovery"):
+            parked = candidate.with_name(candidate.name + ".owned")
+            candidate.rename(parked)
+            foreign.rename(candidate)
+            state.update(swapped=True, candidate=candidate, parked=parked)
+        return original_cleanup(root, expected_identity, path, *args, **kwargs)
+
+    monkeypatch.setattr(install_files, "_cleanup_tree_owned", replace_before_cleanup)
+    report, code, _ = run(["upgrade", "--yes", *lifecycle_env.common])
+
+    assert state["swapped"] is True
+    assert code != 0, report
+    assert (state["candidate"] / "operator.txt").read_text(encoding="utf-8") == "preserve"
+    assert state["parked"].is_dir()
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Exercises POSIX stage publication")

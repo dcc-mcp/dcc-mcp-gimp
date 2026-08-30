@@ -26,7 +26,9 @@ from .install_files import (
     _owned_file_identities,
     _plugin_version,
     _read_receipt,
+    _read_receipt_evidence,
     _receipt_path,
+    _receipt_tree_identities,
     _target_identity,
     _validate_owned_install,
 )
@@ -434,7 +436,7 @@ def plan(
     python_identity = _executable_identity(python)
     gimp_version = _gimp_version(executable, expected_identity=gimp_identity)
     versions = _target_versions(python, expected_identity=python_identity)
-    receipt = _read_receipt()
+    receipt, receipt_identity, receipt_expected_absent = _read_receipt_evidence()
     if receipt is not None:
         owner = receipt.get("destination")
         if isinstance(owner, str) and os.path.normcase(owner) != os.path.normcase(str(root)):
@@ -449,10 +451,12 @@ def plan(
     installed_version = _plugin_version(target / ("%s.py" % _PLUGIN_NAME))
     target_identity = None
     owned_file_identities = None
+    owned_tree_identities = None
     if target.is_dir():
         target_identity = _target_identity(target)
-        if receipt is not None:
+        if receipt is not None and state in {"current", "upgrade"}:
             owned_file_identities = _owned_file_identities(target, receipt)
+            owned_tree_identities = _receipt_tree_identities(target, receipt, "receipt")
     return {
         "schema_version": SCHEMA_VERSION,
         "status": "planned",
@@ -477,6 +481,11 @@ def plan(
         "_owned_file_identities": {
             relative: list(identity) for relative, identity in (owned_file_identities or {}).items()
         },
+        "_owned_tree_identities": {
+            relative: list(identity) for relative, identity in (owned_tree_identities or {}).items()
+        },
+        "_receipt_identity": list(receipt_identity) if receipt_identity is not None else None,
+        "_receipt_expected_absent": receipt_expected_absent,
         "installation_state": state,
         "steps": [
             {"id": "preflight", "status": "ok", "gimp_version": gimp_version},
