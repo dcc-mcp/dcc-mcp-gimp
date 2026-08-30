@@ -1290,6 +1290,8 @@ def _unlink_receipt_owned(path: Path) -> None:
         os.unlink(path.name, dir_fd=descriptor)
     except FileNotFoundError:
         return
+    except InstallFailure:
+        raise
     except (OSError, RuntimeError, ValueError) as exc:
         raise InstallFailure(
             EXIT_INSTALL, "receipt", "Install receipt could not be removed"
