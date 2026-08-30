@@ -244,6 +244,7 @@ def test_install_writes_receipt_and_verifies_to_usable(lifecycle_env):
         str((lifecycle_env.plugins / "dcc_mcp_gimp").resolve())
     ]
     assert receipt["files"][0]["sha256"]
+    assert isinstance(receipt["entry_point_executable"], bool)
 
 
 def test_uninstall_consumes_receipt_and_preserves_unrelated_profile_files(lifecycle_env):
@@ -928,6 +929,217 @@ def test_target_interpreter_rejects_unbounded_metadata(tmp_path, monkeypatch):
 
     with pytest.raises(InstallFailure, match="metadata is unbounded"):
         _target_versions(python)
+
+
+@pytest.mark.parametrize("field", ["core", "adapter"])
+@pytest.mark.parametrize("nested", [None, [], "not-an-object", 7])
+def test_target_interpreter_rejects_malformed_nested_metadata(
+    tmp_path, monkeypatch, field, nested
+):
+    from dcc_mcp_gimp.install_contract import InstallFailure
+    from dcc_mcp_gimp.install_host import _target_versions
+
+    python = tmp_path / "python.exe"
+    python.write_bytes(b"python")
+    payload = _target_metadata(python)
+    payload[field] = nested
+    monkeypatch.setattr(
+        "dcc_mcp_gimp.install_host.subprocess.run",
+        lambda command, **_kwargs: subprocess.CompletedProcess(
+            command, 0, stdout=json.dumps(payload), stderr=""
+        ),
+    )
+
+    with pytest.raises(InstallFailure, match="incomplete metadata"):
+        _target_versions(python)
+
+
+def test_run_returns_structured_preflight_for_malformed_nested_metadata(lifecycle_env, monkeypatch):
+    from dcc_mcp_gimp.install import EXIT_PREFLIGHT, run
+
+    original = _target_metadata(sys.executable)
+    original["adapter"] = None
+
+    def malformed_run(command, **_kwargs):
+        if Path(command[0]) == lifecycle_env.host:
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout="GNU Image Manipulation Program version 3.0.8\n",
+                stderr="",
+            )
+        return subprocess.CompletedProcess(command, 0, stdout=json.dumps(original), stderr="")
+
+    monkeypatch.setattr("dcc_mcp_gimp.install_host.subprocess.run", malformed_run)
+    report, code, as_json = run(["status", *lifecycle_env.common])
+
+    assert as_json is True
+    assert code == EXIT_PREFLIGHT == 10
+    assert report["status"] == "failed"
+    assert report["verify"]["failure_stage"] == "python"
+    assert "incomplete metadata" in report["verify"]["failure_reason"]
+
+
+def test_profile_preflight_rejects_regular_file_destination(lifecycle_env):
+    from dcc_mcp_gimp.install import EXIT_PREFLIGHT, run
+
+    lifecycle_env.plugins.parent.mkdir(parents=True, exist_ok=True)
+    lifecycle_env.plugins.write_text("not a directory", encoding="utf-8")
+
+    report, code, _ = run(["install", "--yes", *lifecycle_env.common])
+
+    assert code == EXIT_PREFLIGHT == 10
+    assert report["verify"]["failure_stage"] == "profile"
+    assert report["status"] == "failed"
+
+
+def test_multiple_destinations_fail_closed_without_overwriting_receipt(lifecycle_env):
+    from dcc_mcp_gimp.install import EXIT_PREFLIGHT, run
+
+    first = lifecycle_env.plugins
+    second = lifecycle_env.root / "other-profile" / "plug-ins"
+    installed, code, _ = run(["install", "--yes", *lifecycle_env.common])
+    assert code == 0, installed
+    receipt_path = lifecycle_env.root / ".dcc-mcp" / "receipts" / "gimp.json"
+    prior_receipt = receipt_path.read_bytes()
+
+    second_args = [
+        "status",
+        "--json",
+        "--dcc-path",
+        str(lifecycle_env.host),
+        "--python",
+        str(Path(sys.executable).resolve()),
+        "--destination",
+        str(second),
+    ]
+    report, code, _ = run(second_args)
+
+    assert code == EXIT_PREFLIGHT == 10
+    assert report["verify"]["failure_stage"] == "receipt"
+    assert "another GIMP profile" in report["verify"]["failure_reason"]
+    assert receipt_path.read_bytes() == prior_receipt
+    assert not second.exists()
+    assert first.exists()
+
+
+def test_plan_maps_symlink_loop_to_structured_preflight(tmp_path, monkeypatch):
+    from dcc_mcp_gimp.install import EXIT_PREFLIGHT, run
+
+    host = tmp_path / "gimp-3.0.exe"
+    host.write_bytes(b"gimp")
+    plugins = tmp_path / "profile" / "plug-ins"
+    original_resolve = Path.resolve
+
+    def loop_resolve(path, *args, **kwargs):
+        if path == plugins:
+            raise RuntimeError("Symlink loop")
+        return original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", loop_resolve)
+    report, code, _ = run(
+        [
+            "status",
+            "--json",
+            "--dcc-path",
+            str(host),
+            "--python",
+            sys.executable,
+            "--destination",
+            str(plugins),
+        ]
+    )
+
+    assert code == EXIT_PREFLIGHT == 10
+    assert report["status"] == "failed"
+    assert report["verify"]["failure_stage"] == "profile"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX execute-bit contract")
+def test_verify_rejects_entry_point_execute_bit_drift(lifecycle_env):
+    from dcc_mcp_gimp.install import run
+
+    installed, code, _ = run(["install", "--yes", *lifecycle_env.common])
+    assert code == 0, installed
+    script = lifecycle_env.plugins / "dcc_mcp_gimp" / "dcc_mcp_gimp.py"
+    script.chmod(0o644)
+
+    report, code, _ = run(["verify", *lifecycle_env.common])
+
+    assert code == 40
+    assert report["verify"]["failure_stage"] == "artifact"
+    assert "executable mode" in report["verify"]["failure_reason"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Symlink creation requires elevated Windows rights")
+def test_receipt_symlink_swap_fails_closed_without_external_write(lifecycle_env, monkeypatch):
+    from dcc_mcp_gimp import install_files
+    from dcc_mcp_gimp.install import run
+
+    installed, code, _ = run(["install", "--yes", *lifecycle_env.common])
+    assert code == 0, installed
+    receipt_path = lifecycle_env.root / ".dcc-mcp" / "receipts" / "gimp.json"
+    external = lifecycle_env.root / "foreign-receipt.json"
+    external.write_text("do not overwrite", encoding="utf-8")
+    original_write = install_files._write_json_atomic
+
+    def swap_then_fail(path, payload):
+        assert Path(path) == receipt_path
+        receipt_path.unlink()
+        receipt_path.symlink_to(external)
+        raise OSError("simulated receipt race")
+
+    monkeypatch.setattr(install_files, "_write_json_atomic", swap_then_fail)
+    report, code, _ = run(["upgrade", "--yes", *lifecycle_env.common])
+
+    assert code == 30
+    assert report["status"] == "failed"
+    assert external.read_text(encoding="utf-8") == "do not overwrite"
+    assert receipt_path.is_symlink()
+    monkeypatch.setattr(install_files, "_write_json_atomic", original_write)
+
+
+def test_root_identity_swap_during_staging_fails_closed(lifecycle_env, monkeypatch):
+    from dcc_mcp_gimp import install_files
+    from dcc_mcp_gimp.install import run
+
+    installed, code, _ = run(["install", "--yes", *lifecycle_env.common])
+    assert code == 0, installed
+    original_stage = install_files._stage_plugin
+
+    def stage_then_swap(root):
+        stage = original_stage(root)
+        old_root = root.with_name("plug-ins-old")
+        root.rename(old_root)
+        root.mkdir()
+        return stage
+
+    monkeypatch.setattr(install_files, "_stage_plugin", stage_then_swap)
+    report, code, _ = run(["upgrade", "--yes", *lifecycle_env.common])
+
+    assert code == 10
+    assert report["status"] == "failed"
+    assert report["verify"]["failure_stage"] == "profile"
+    assert not (lifecycle_env.plugins / "dcc_mcp_gimp").exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows reparse-point contract")
+def test_windows_junction_is_rejected_as_reparse_point(tmp_path):
+    from dcc_mcp_gimp.install_files import _is_link
+
+    external = tmp_path / "external"
+    external.mkdir()
+    junction = tmp_path / "junction"
+    created = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(junction), str(external)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if created.returncode != 0:
+        pytest.skip("junction creation unavailable")
+
+    assert _is_link(junction) is True
 
 
 def test_verify_rejects_pid_reuse_during_identity_check(lifecycle_env, monkeypatch):

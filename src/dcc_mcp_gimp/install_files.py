@@ -72,8 +72,22 @@ def _plugin_version(script: Path) -> Optional[str]:
 
 
 def _is_link(path: Path) -> bool:
-    is_junction = getattr(path, "is_junction", None)
-    return path.is_symlink() or bool(is_junction and is_junction())
+    try:
+        is_junction = getattr(path, "is_junction", None)
+        if path.is_symlink() or bool(is_junction and is_junction()):
+            return True
+        if os.name != "nt":
+            return False
+        import ctypes
+
+        attributes = ctypes.windll.kernel32.GetFileAttributesW(str(path))
+    except (AttributeError, OSError, RuntimeError, ValueError):
+        return False
+    # GetFileAttributesW returns INVALID_FILE_ATTRIBUTES (-1) for a missing
+    # path.  ctypes may expose that sentinel as either signed or unsigned.
+    if int(attributes) in (-1, 0xFFFFFFFF):
+        return False
+    return bool(int(attributes) & 0x400)
 
 
 def _file_record(path: Path, root: Path) -> dict[str, Any]:
@@ -133,15 +147,161 @@ def _receipt_path() -> Path:
     return Path.home() / RECEIPT_RELATIVE_PATH
 
 
+def _assert_receipt_path_safe(path: Path) -> None:
+    """Reject receipt files or parent directories that are links/reparse points."""
+    try:
+        candidate = path
+        while True:
+            if _is_link(candidate):
+                raise InstallFailure(
+                    EXIT_PREFLIGHT,
+                    "receipt",
+                    "Install receipt path contains a link or reparse point",
+                )
+            parent = candidate.parent
+            if parent == candidate:
+                break
+            candidate = parent
+    except (OSError, RuntimeError, ValueError) as exc:
+        if isinstance(exc, InstallFailure):
+            raise
+        raise InstallFailure(
+            EXIT_PREFLIGHT, "receipt", "Install receipt path is unavailable"
+        ) from exc
+
+
+def _path_present_no_follow(path: Path) -> bool:
+    try:
+        os.lstat(str(path))
+    except FileNotFoundError:
+        return False
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise InstallFailure(EXIT_PREFLIGHT, "receipt", "Managed file is unavailable") from exc
+    return True
+
+
+def _read_bytes_no_follow(path: Path, *, max_bytes: Optional[int] = None) -> bytes:
+    """Read one regular file while binding the read to its original identity."""
+    _assert_receipt_path_safe(path)
+    try:
+        before = os.lstat(str(path))
+        if not stat.S_ISREG(before.st_mode) or _is_link(path):
+            raise InstallFailure(EXIT_PREFLIGHT, "receipt", "Managed file is missing or linked")
+        flags = os.O_RDONLY
+        flags |= getattr(os, "O_BINARY", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(str(path), flags)
+        try:
+            opened = os.fstat(descriptor)
+            if (int(opened.st_dev), int(opened.st_ino)) != (
+                int(before.st_dev),
+                int(before.st_ino),
+            ) or not stat.S_ISREG(opened.st_mode):
+                raise InstallFailure(EXIT_PREFLIGHT, "receipt", "Managed file changed identity")
+            chunks: list[bytes] = []
+            remaining = max_bytes
+            while True:
+                size = 1024 * 1024 if remaining is None else min(1024 * 1024, remaining + 1)
+                chunk = os.read(descriptor, size)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                if remaining is not None:
+                    remaining -= len(chunk)
+                    if remaining < 0:
+                        raise InstallFailure(EXIT_PREFLIGHT, "receipt", "Managed file is unbounded")
+            return b"".join(chunks)
+        finally:
+            os.close(descriptor)
+    except InstallFailure:
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise InstallFailure(EXIT_PREFLIGHT, "receipt", "Managed file is unavailable") from exc
+
+
+def _write_bytes_no_follow(path: Path, data: bytes, mode: Optional[int] = None) -> None:
+    """Create a new regular file without following a swapped symlink."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags |= getattr(os, "O_BINARY", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(str(path), flags, 0o666)
+        try:
+            view = memoryview(data)
+            while view:
+                written = os.write(descriptor, view)
+                view = view[written:]
+        finally:
+            os.close(descriptor)
+        if mode is not None:
+            _chmod_no_follow(path, mode)
+    except FileExistsError as exc:
+        raise InstallFailure(EXIT_INSTALL, "uninstall", "Managed file changed identity") from exc
+    except InstallFailure:
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise InstallFailure(
+            EXIT_INSTALL, "uninstall", "Managed file could not be restored"
+        ) from exc
+
+
+def _replace_path_owned(
+    root: Path,
+    expected_identity: Optional[tuple[int, int]],
+    source: Path,
+    destination: Path,
+) -> None:
+    """Rename only while the selected profile still owns the pathname."""
+    _assert_physical_root(root, expected_identity)
+    _replace_path(source, destination)
+    # A concurrent junction/symlink swap must fail closed before the caller
+    # performs its next operation or reports success.
+    _assert_physical_root(root, expected_identity)
+
+
+def _chmod_no_follow(path: Path, mode: int) -> None:
+    """Change mode without traversing a swapped symlink where supported."""
+    try:
+        os.chmod(str(path), mode, follow_symlinks=False)
+    except (NotImplementedError, TypeError):
+        if _is_link(path):
+            raise InstallFailure(
+                EXIT_PREFLIGHT, "receipt", "Managed file changed to a link"
+            ) from None
+        os.chmod(str(path), mode)
+
+
+def _write_bytes_atomic(path: Path, data: bytes, mode: Optional[int] = None) -> None:
+    """Replace bytes without following a swapped receipt symlink."""
+    _assert_receipt_path_safe(path)
+    temporary = path.with_name(".%s.%s.tmp" % (path.name, uuid.uuid4().hex))
+    try:
+        temporary.parent.mkdir(parents=True, exist_ok=True)
+        temporary.write_bytes(data)
+        if mode is not None:
+            _chmod_no_follow(temporary, mode)
+        _replace_path(temporary, path)
+        if mode is not None:
+            _chmod_no_follow(path, mode)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def _read_receipt() -> Optional[dict[str, Any]]:
     path = _receipt_path()
-    if not path.is_file():
-        return None
+    _assert_receipt_path_safe(path)
     try:
-        if _is_link(path) or not 0 < path.stat().st_size <= _MAX_RECEIPT_BYTES:
-            raise ValueError("receipt is empty, linked, or unbounded")
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        data = _read_bytes_no_follow(path, max_bytes=_MAX_RECEIPT_BYTES)
+    except InstallFailure as exc:
+        if not _path_present_no_follow(path):
+            return None
+        raise InstallFailure(EXIT_PREFLIGHT, "receipt", "Install receipt is unreadable") from exc
+    if not data:
+        raise InstallFailure(EXIT_PREFLIGHT, "receipt", "Install receipt is unreadable")
+    try:
+        payload = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
         raise InstallFailure(EXIT_PREFLIGHT, "receipt", "Install receipt is unreadable") from exc
     if not isinstance(payload, dict):
         raise InstallFailure(EXIT_PREFLIGHT, "receipt", "Install receipt root must be an object")
@@ -164,6 +324,7 @@ def _replace_path(source: Path, destination: Path) -> None:
 
 
 def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    _assert_receipt_path_safe(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(".%s.%s.tmp" % (path.name, uuid.uuid4().hex))
     try:
@@ -204,6 +365,23 @@ def _cleanup_tree(path: Path) -> dict[str, Any]:
 def _path_mode(path: Path) -> int:
     """Return a non-following mode on every supported Python, including 3.9."""
     return stat.S_IMODE(os.stat(path, follow_symlinks=False).st_mode)
+
+
+def _entry_point_executable(path: Path) -> bool:
+    """Return whether the installed bridge entry point is executable.
+
+    Windows does not use POSIX mode bits for Python plug-ins, so the contract
+    treats an existing regular entry point as executable there.  On POSIX the
+    receipt binds the execute-bit state and status/verify reject a chmod-only
+    drift even when the file bytes are unchanged.
+    """
+    try:
+        mode = _path_mode(path)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise InstallFailure(
+            EXIT_PREFLIGHT, "receipt", "Managed GIMP entry point mode is unavailable"
+        ) from exc
+    return os.name == "nt" or bool(mode & 0o111)
 
 
 def _recovery_manifest(root: Path) -> dict[str, Any]:
@@ -260,15 +438,20 @@ def _copy_validated_recovery(source: Path, recovery: Path) -> dict[str, Any]:
 def _replace_plugin(root: Path) -> Path:
     """Replace only the legacy copy; the lifecycle uses a receipted transaction."""
     _assert_physical_root(root)
-    root.mkdir(parents=True, exist_ok=True)
-    _assert_physical_root(root)
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise InstallFailure(
+            EXIT_PREFLIGHT, "profile", "GIMP profile path is not a directory"
+        ) from exc
+    root_identity = _assert_physical_root(root)
     target = root / _PLUGIN_NAME
     stage = _stage_plugin(root)
     backup = root / (".%s.%s.backup" % (_PLUGIN_NAME, uuid.uuid4().hex))
     try:
         if target.exists():
-            _replace_path(target, backup)
-        _replace_path(stage, target)
+            _replace_path_owned(root, root_identity, target, backup)
+        _replace_path_owned(root, root_identity, stage, target)
         cleanup = _cleanup_tree(backup)
         if not cleanup.get("success"):
             raise InstallFailure(EXIT_INSTALL, "cleanup", "Legacy backup cleanup failed")
@@ -294,11 +477,13 @@ def _valid_relative_path(value: object) -> bool:
     )
 
 
-def _assert_physical_root(root: Path) -> None:
+def _assert_physical_root(
+    root: Path, expected_identity: Optional[tuple[int, int]] = None
+) -> Optional[tuple[int, int]]:
     """Reject a profile path that changed identity after planning."""
     try:
         resolved = root.resolve(strict=False)
-    except OSError as exc:
+    except (OSError, RuntimeError, ValueError) as exc:
         raise InstallFailure(EXIT_PREFLIGHT, "profile", "GIMP profile path is unavailable") from exc
     if os.path.normcase(str(resolved)) != os.path.normcase(str(root)):
         raise InstallFailure(
@@ -306,6 +491,20 @@ def _assert_physical_root(root: Path) -> None:
             "profile",
             "GIMP profile path resolves through a link or changed identity",
         )
+    if root.exists() and (_is_link(root) or not root.is_dir()):
+        raise InstallFailure(EXIT_PREFLIGHT, "profile", "GIMP profile path is not a directory")
+    if not root.exists():
+        if expected_identity is not None:
+            raise InstallFailure(EXIT_PREFLIGHT, "profile", "GIMP profile path changed identity")
+        return None
+    try:
+        details = os.lstat(str(root))
+        identity = (int(details.st_dev), int(details.st_ino))
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise InstallFailure(EXIT_PREFLIGHT, "profile", "GIMP profile path is unavailable") from exc
+    if expected_identity is not None and identity != expected_identity:
+        raise InstallFailure(EXIT_PREFLIGHT, "profile", "GIMP profile path changed identity")
+    return identity
 
 
 def _validate_owned_install(
@@ -387,6 +586,16 @@ def _validate_owned_install(
         or package_digest != _manifest_digest(expected_files)
     ):
         raise InstallFailure(EXIT_PREFLIGHT, "receipt", "Receipt package digest is invalid")
+    entry_point_executable = receipt.get("entry_point_executable")
+    if not isinstance(entry_point_executable, bool):
+        raise InstallFailure(EXIT_PREFLIGHT, "receipt", "Receipt entry point mode is invalid")
+    entry_point = target / ("%s.py" % _PLUGIN_NAME)
+    if _entry_point_executable(entry_point) != entry_point_executable:
+        raise InstallFailure(
+            EXIT_PREFLIGHT,
+            "receipt",
+            "Managed GIMP entry point executable mode differs from the receipt",
+        )
     actual_directories, actual_files, actual_links = _owned_root_manifest(target)
     if (
         actual_directories != sorted(directories)
@@ -402,6 +611,7 @@ def _validate_owned_install(
 
 def _receipt_payload(root: Path, target: Path, report: Mapping[str, Any]) -> dict[str, Any]:
     directories, files, links = _owned_root_manifest(target)
+    entry_point = target / ("%s.py" % _PLUGIN_NAME)
     return {
         "schema_version": SCHEMA_VERSION,
         "dcc_type": "gimp",
@@ -417,6 +627,7 @@ def _receipt_payload(root: Path, target: Path, report: Mapping[str, Any]) -> dic
         "host_paths_touched": [str(target)],
         "installed_at": datetime.now(timezone.utc).isoformat(),
         "package_digest": _manifest_digest(files),
+        "entry_point_executable": _entry_point_executable(entry_point),
         "files": files,
         "ownership": {"directories": directories, "files": files, "links": links},
     }
@@ -432,6 +643,7 @@ class InstallTransaction:
     old_receipt_mode: Optional[int]
     previous_moved: bool
     previous_manifest: Optional[dict[str, Any]]
+    root_identity: Optional[tuple[int, int]] = None
     replacement_moved: bool = False
     recovery: Optional[Path] = None
     recovery_manifest: Optional[dict[str, Any]] = None
@@ -442,8 +654,10 @@ class InstallTransaction:
             return self.previous_moved
         failed = self.root / (".%s.%s.failed" % (_PLUGIN_NAME, uuid.uuid4().hex))
         try:
+            _assert_physical_root(self.root, self.root_identity)
+            _assert_receipt_path_safe(self.receipt_path)
             if self.replacement_moved and (self.target.exists() or self.target.is_symlink()):
-                _replace_path(self.target, failed)
+                _replace_path_owned(self.root, self.root_identity, self.target, failed)
             if self.previous_moved:
                 restore_source = None
                 for candidate in (self.recovery, self.backup):
@@ -461,14 +675,11 @@ class InstallTransaction:
                     raise InstallFailure(
                         EXIT_INSTALL, "recovery", "No validated prior GIMP recovery remains"
                     )
-                _replace_path(restore_source, self.target)
+                _replace_path_owned(self.root, self.root_identity, restore_source, self.target)
             if self.old_receipt is None:
                 self.receipt_path.unlink(missing_ok=True)
             else:
-                self.receipt_path.parent.mkdir(parents=True, exist_ok=True)
-                self.receipt_path.write_bytes(self.old_receipt)
-                if self.old_receipt_mode is not None:
-                    self.receipt_path.chmod(self.old_receipt_mode)
+                _write_bytes_atomic(self.receipt_path, self.old_receipt, self.old_receipt_mode)
             if self.previous_moved and self.previous_manifest is not None:
                 if _recovery_manifest(self.target) != self.previous_manifest:
                     raise InstallFailure(
@@ -488,6 +699,7 @@ class InstallTransaction:
     def commit(self) -> None:
         if self.closed:
             return
+        _assert_physical_root(self.root, self.root_identity)
         if self.previous_moved:
             self.recovery = self.root / (".%s.%s.recovery" % (_PLUGIN_NAME, uuid.uuid4().hex))
             try:
@@ -495,6 +707,7 @@ class InstallTransaction:
             except InstallFailure:
                 self.rollback()
                 raise
+        _assert_physical_root(self.root, self.root_identity)
         cleanup = _cleanup_tree(self.backup)
         if not cleanup.get("success"):
             self.rollback()
@@ -502,13 +715,19 @@ class InstallTransaction:
             raise InstallFailure(code, "cleanup", "Verified install backup cleanup failed")
         self.closed = True
         if self.recovery is not None:
+            _assert_physical_root(self.root, self.root_identity)
             _cleanup_tree(self.recovery)
 
 
 def _begin_replace_plugin(root: Path, report: Mapping[str, Any]) -> InstallTransaction:
     _assert_physical_root(root)
-    root.mkdir(parents=True, exist_ok=True)
-    _assert_physical_root(root)
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise InstallFailure(
+            EXIT_PREFLIGHT, "profile", "GIMP profile path is not a directory"
+        ) from exc
+    root_identity = _assert_physical_root(root)
     target = root / _PLUGIN_NAME
     lock_state = inspect_install_root(target)
     if lock_state.get("requires_restart"):
@@ -522,10 +741,22 @@ def _begin_replace_plugin(root: Path, report: Mapping[str, Any]) -> InstallTrans
             EXIT_INSTALL, "receipt", "Unowned or changed GIMP plug-in state cannot be overwritten"
         )
     stage = _stage_plugin(root)
+    try:
+        _assert_physical_root(root, root_identity)
+    except BaseException:
+        _cleanup_tree(stage)
+        raise
     backup = root / (".%s.%s.backup" % (_PLUGIN_NAME, uuid.uuid4().hex))
     receipt_path = _receipt_path()
-    old_receipt = receipt_path.read_bytes() if receipt_path.is_file() else None
-    old_receipt_mode = _path_mode(receipt_path) if receipt_path.is_file() else None
+    _assert_receipt_path_safe(receipt_path)
+    try:
+        old_receipt = _read_bytes_no_follow(receipt_path, max_bytes=_MAX_RECEIPT_BYTES)
+    except InstallFailure as exc:
+        if not _path_present_no_follow(receipt_path):
+            old_receipt = None
+        else:
+            raise exc
+    old_receipt_mode = _path_mode(receipt_path) if old_receipt is not None else None
     previous_manifest = _recovery_manifest(target) if target.is_dir() else None
     transaction = InstallTransaction(
         root=root,
@@ -536,13 +767,17 @@ def _begin_replace_plugin(root: Path, report: Mapping[str, Any]) -> InstallTrans
         old_receipt_mode=old_receipt_mode,
         previous_moved=False,
         previous_manifest=previous_manifest,
+        root_identity=root_identity,
     )
     try:
         if target.exists():
-            _replace_path(target, backup)
+            _assert_physical_root(root, root_identity)
+            _replace_path_owned(root, root_identity, target, backup)
             transaction.previous_moved = True
-        _replace_path(stage, target)
+        _assert_physical_root(root, root_identity)
+        _replace_path_owned(root, root_identity, stage, target)
         transaction.replacement_moved = True
+        _assert_physical_root(root, root_identity)
         _write_json_atomic(receipt_path, _receipt_payload(root, target, report))
         receipt = _read_receipt()
         if receipt is None:
@@ -603,7 +838,11 @@ def _capture_owned_bytes(
     }
     files: dict[str, bytes] = {}
     file_modes: dict[str, int] = {}
-    total = receipt_path.stat().st_size
+    try:
+        receipt_bytes = _read_bytes_no_follow(receipt_path, max_bytes=_MAX_RECEIPT_BYTES)
+    except InstallFailure as exc:
+        raise InstallFailure(EXIT_PREFLIGHT, "receipt", "Install receipt is unreadable") from exc
+    total = len(receipt_bytes)
     for record in ownership["files"]:
         relative = str(record["path"])
         path = target / relative
@@ -611,7 +850,6 @@ def _capture_owned_bytes(
         total += len(data)
         files[relative] = data
         file_modes[relative] = _path_mode(path)
-    receipt_bytes = receipt_path.read_bytes()
     if total > _MAX_SNAPSHOT_BYTES:
         raise InstallFailure(
             EXIT_INSTALL, "uninstall", "Managed install is too large for bounded rollback"
@@ -632,37 +870,46 @@ def _restore_owned_bytes(
     receipt_path: Path,
     receipt: Mapping[str, Any],
     snapshot: OwnedSnapshot,
+    expected_identity: Optional[tuple[int, int]] = None,
 ) -> None:
+    _assert_physical_root(destination, expected_identity)
+    _assert_receipt_path_safe(receipt_path)
     if target.exists() or target.is_symlink():
-        _cleanup_tree(target)
+        removed = _cleanup_tree(target)
+        if not removed.get("success"):
+            raise InstallFailure(EXIT_INSTALL, "uninstall", "Managed plug-in could not be restored")
+    _assert_physical_root(destination, expected_identity)
+    if target.exists() or target.is_symlink() or _is_link(target):
+        raise InstallFailure(EXIT_INSTALL, "uninstall", "Managed plug-in path is linked")
     target.mkdir(parents=True, exist_ok=True)
     for relative in sorted(
         snapshot.directory_modes, key=lambda value: (len(Path(value).parts), value)
     ):
+        _assert_physical_root(destination, expected_identity)
         (target / relative).mkdir()
     for relative, data in snapshot.files.items():
+        _assert_physical_root(destination, expected_identity)
         path = target / relative
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(data)
-        path.chmod(snapshot.file_modes[relative])
+        _write_bytes_no_follow(path, data, snapshot.file_modes[relative])
     for relative in sorted(
         snapshot.directory_modes,
         key=lambda value: (len(Path(value).parts), value),
         reverse=True,
     ):
+        _assert_physical_root(destination, expected_identity)
         (target / relative).chmod(snapshot.directory_modes[relative])
-    target.chmod(snapshot.root_mode)
-    receipt_path.parent.mkdir(parents=True, exist_ok=True)
-    receipt_path.write_bytes(snapshot.receipt_bytes)
-    receipt_path.chmod(snapshot.receipt_mode)
+    _assert_physical_root(destination, expected_identity)
+    _chmod_no_follow(target, snapshot.root_mode)
+    _write_bytes_atomic(receipt_path, snapshot.receipt_bytes, snapshot.receipt_mode)
     _validate_owned_install(destination, target, receipt_path, receipt)
 
 
 def _execute_uninstall(report: dict[str, Any]) -> tuple[dict[str, Any], int]:
     destination = Path(report["destination"])
-    _assert_physical_root(destination)
+    root_identity = _assert_physical_root(destination)
     target = destination / _PLUGIN_NAME
     receipt_path = _receipt_path()
+    _assert_receipt_path_safe(receipt_path)
     if not target.exists() and not receipt_path.exists():
         report["status"] = "ok"
         report["steps"][-1] = {"id": "uninstall", "status": "already_absent"}
@@ -680,7 +927,9 @@ def _execute_uninstall(report: dict[str, Any]) -> tuple[dict[str, Any], int]:
             "uninstall",
             str(lock_state.get("recommended_next_action", "GIMP restart required")),
         )
+    _assert_physical_root(destination, root_identity)
     owned_snapshot = _capture_owned_bytes(target, receipt_path, receipt)
+    _assert_physical_root(destination, root_identity)
     transaction = destination / (".dcc-mcp-gimp-uninstall-%s" % uuid.uuid4().hex)
     snapshot = transaction / "snapshot"
     quarantine = transaction / "quarantine"
@@ -691,15 +940,18 @@ def _execute_uninstall(report: dict[str, Any]) -> tuple[dict[str, Any], int]:
     try:
         snapshot.mkdir(parents=True)
         snapshot_manifest = _copy_validated_recovery(target, snapshot_target)
-        shutil.copy2(receipt_path, snapshot_receipt)
+        snapshot_receipt.write_bytes(owned_snapshot.receipt_bytes)
+        snapshot_receipt.chmod(owned_snapshot.receipt_mode)
         if (
             _recovery_manifest(snapshot_target) != snapshot_manifest
             or snapshot_receipt.read_bytes() != owned_snapshot.receipt_bytes
             or _path_mode(snapshot_receipt) != owned_snapshot.receipt_mode
         ):
             raise InstallFailure(EXIT_INSTALL, "uninstall", "Uninstall recovery validation failed")
-        _replace_path(target, quarantine_target)
+        _replace_path_owned(destination, root_identity, target, quarantine_target)
+        _assert_receipt_path_safe(receipt_path)
         _replace_path(receipt_path, quarantine_receipt)
+        _assert_physical_root(destination, root_identity)
         removed = _cleanup_tree(quarantine)
         if not removed.get("success"):
             raise InstallFailure(
@@ -712,12 +964,14 @@ def _execute_uninstall(report: dict[str, Any]) -> tuple[dict[str, Any], int]:
             raise InstallFailure(EXIT_INSTALL, "uninstall", "Uninstall snapshot cleanup failed")
     except BaseException as exc:
         try:
+            _assert_physical_root(destination, root_identity)
             _restore_owned_bytes(
                 destination,
                 target,
                 receipt_path,
                 receipt,
                 owned_snapshot,
+                root_identity,
             )
         except BaseException as restore_error:
             raise InstallFailure(

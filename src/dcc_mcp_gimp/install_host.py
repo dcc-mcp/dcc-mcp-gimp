@@ -85,8 +85,14 @@ def _resolve_python(value: Optional[Path], executable: Path) -> Path:
             ),
             Path(sys.executable),
         )
-    resolved = configured.expanduser().resolve()
-    if not resolved.is_file() or resolved.is_symlink() or resolved.stat().st_size <= 0:
+    try:
+        resolved = configured.expanduser().resolve()
+        valid = resolved.is_file() and not resolved.is_symlink() and resolved.stat().st_size > 0
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise InstallFailure(
+            EXIT_PREFLIGHT, "python", "Python interpreter path is unavailable"
+        ) from exc
+    if not valid:
         raise InstallFailure(
             EXIT_PREFLIGHT,
             "python",
@@ -114,17 +120,23 @@ def _resolve_gimp(value: Optional[Path]) -> Path:
         value = next((candidate for candidate in candidates if candidate.is_file()), None)
     if value is None:
         raise InstallFailure(EXIT_PREFLIGHT, "gimp", "GIMP 3 installation was not found")
-    resolved = value.expanduser().resolve()
-    if resolved.is_dir():
-        candidates = (
-            resolved / "gimp-3.0.exe",
-            resolved / "bin/gimp-3.0.exe",
-            resolved / "Contents/MacOS/gimp",
-            resolved / "gimp-3.0",
-            resolved / "gimp",
-        )
-        resolved = next((candidate for candidate in candidates if candidate.is_file()), resolved)
-    if not resolved.is_file() or resolved.is_symlink() or resolved.stat().st_size <= 0:
+    try:
+        resolved = value.expanduser().resolve()
+        if resolved.is_dir():
+            candidates = (
+                resolved / "gimp-3.0.exe",
+                resolved / "bin/gimp-3.0.exe",
+                resolved / "Contents/MacOS/gimp",
+                resolved / "gimp-3.0",
+                resolved / "gimp",
+            )
+            resolved = next(
+                (candidate for candidate in candidates if candidate.is_file()), resolved
+            )
+        valid = resolved.is_file() and not resolved.is_symlink() and resolved.stat().st_size > 0
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise InstallFailure(EXIT_PREFLIGHT, "gimp", "GIMP executable path is unavailable") from exc
+    if not valid:
         raise InstallFailure(EXIT_PREFLIGHT, "gimp", "GIMP executable not found: %s" % resolved)
     name = resolved.name.lower()
     is_appimage = name.endswith(".appimage") and "gimp" in name
@@ -288,11 +300,35 @@ print(
         reported_python = Path(str(versions["python_executable"])).resolve()
         core = versions["core"]
         adapter = versions["adapter"]
-    except (KeyError, TypeError, OSError) as exc:
+    except (KeyError, TypeError, OSError, RuntimeError, ValueError) as exc:
         raise InstallFailure(
             EXIT_PREFLIGHT, "python", "Target interpreter returned incomplete metadata"
         ) from exc
-    if reported_python != python.resolve():
+    if not isinstance(core, dict) or not isinstance(adapter, dict):
+        raise InstallFailure(
+            EXIT_PREFLIGHT,
+            "python",
+            "Target interpreter returned incomplete metadata",
+        )
+    for name, package in (("core", core), ("adapter", adapter)):
+        if (
+            not isinstance(package.get("version"), str)
+            or not isinstance(package.get("module_version"), str)
+            or not isinstance(package.get("module_path"), str)
+            or not isinstance(package.get("owned"), bool)
+        ):
+            raise InstallFailure(
+                EXIT_PREFLIGHT,
+                "python",
+                "Target interpreter returned incomplete %s metadata" % name,
+            )
+    try:
+        selected_python = python.resolve()
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise InstallFailure(
+            EXIT_PREFLIGHT, "python", "Target interpreter path is unavailable"
+        ) from exc
+    if reported_python != selected_python:
         raise InstallFailure(
             EXIT_PREFLIGHT, "python", "Target interpreter identity does not match --python"
         )
