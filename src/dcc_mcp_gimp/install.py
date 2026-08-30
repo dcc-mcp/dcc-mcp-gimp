@@ -201,6 +201,15 @@ def run(argv: Sequence[str]) -> tuple[dict[str, Any], int, bool]:
             report["gimp_version"],
             instance_id=args.instance_id,
             host_pid=args.host_pid,
+            expected_target_identity=(
+                tuple(report["_target_identity"])
+                if report.get("_target_identity") is not None
+                else None
+            ),
+            expected_file_identities={
+                relative: tuple(identity)
+                for relative, identity in report.get("_owned_file_identities", {}).items()
+            },
         )
         report["status"] = "ok" if report["verify"]["directly_usable"] else "failed"
         if report["status"] == "failed":

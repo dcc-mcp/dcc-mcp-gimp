@@ -17,6 +17,7 @@ from .install_contract import (
     _version_tuple,
 )
 from .install_files import (
+    _assert_owned_file_identities,
     _assert_physical_root,
     _assert_profile_writable,
     _assert_target_identity,
@@ -30,6 +31,7 @@ from .install_files import (
 )
 from .install_host import (
     _bootstrap_error_summary,
+    _executable_identity,
     _gimp_version,
     _process_executable_path,
     _process_start_identity,
@@ -149,6 +151,8 @@ def verify_install(
     *,
     instance_id: Optional[str] = None,
     host_pid: Optional[int] = None,
+    expected_target_identity: Optional[tuple[int, int]] = None,
+    expected_file_identities: Optional[Mapping[str, tuple[int, ...]]] = None,
 ) -> dict[str, Any]:
     target = destination / _PLUGIN_NAME
     result: dict[str, Any] = {
@@ -168,9 +172,23 @@ def verify_install(
         result.update(failure_stage="artifact", failure_reason="Plug-in or receipt is missing")
         return result
     try:
-        target_identity = _target_identity(target)
-    except InstallFailure as exc:
-        result.update(failure_stage=exc.stage, failure_reason=str(exc))
+        target_identity = (
+            tuple(expected_target_identity)
+            if expected_target_identity is not None
+            else _target_identity(target)
+        )
+        owned_file_identities = (
+            {relative: tuple(identity) for relative, identity in expected_file_identities.items()}
+            if expected_file_identities is not None
+            else _owned_file_identities(target, receipt)
+        )
+    except (InstallFailure, TypeError, ValueError) as exc:
+        if isinstance(exc, InstallFailure):
+            result.update(failure_stage=exc.stage, failure_reason=str(exc))
+        else:
+            result.update(
+                failure_stage="artifact", failure_reason="Install plan identity is invalid"
+            )
         return result
     try:
         _validate_owned_install(destination, target, _receipt_path(), receipt)
@@ -179,6 +197,7 @@ def verify_install(
         return result
     try:
         _assert_target_identity(target, target_identity)
+        _assert_owned_file_identities(target, owned_file_identities, "artifact")
     except InstallFailure as exc:
         result.update(failure_stage="artifact", failure_reason=str(exc))
         return result
@@ -209,6 +228,7 @@ def verify_install(
         return result
     try:
         _assert_target_identity(target, target_identity)
+        _assert_owned_file_identities(target, owned_file_identities, "artifact")
     except InstallFailure as exc:
         result.update(failure_stage="artifact", failure_reason=str(exc))
         return result
@@ -283,6 +303,7 @@ def verify_install(
         return result
     try:
         _assert_target_identity(target, target_identity)
+        _assert_owned_file_identities(target, owned_file_identities, "artifact")
     except InstallFailure as exc:
         result.update(failure_stage="artifact", failure_reason=str(exc))
         return result
@@ -367,8 +388,10 @@ def plan(
     _assert_profile_writable(root)
     executable = _resolve_gimp(dcc_path)
     python = _resolve_python(python_value, executable)
-    gimp_version = _gimp_version(executable)
-    versions = _target_versions(python)
+    gimp_identity = _executable_identity(executable)
+    python_identity = _executable_identity(python)
+    gimp_version = _gimp_version(executable, expected_identity=gimp_identity)
+    versions = _target_versions(python, expected_identity=python_identity)
     receipt = _read_receipt()
     if receipt is not None:
         owner = receipt.get("destination")

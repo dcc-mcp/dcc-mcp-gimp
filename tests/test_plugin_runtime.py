@@ -124,6 +124,17 @@ def test_runtime_captures_bridge_bootstrap_failure(runtime, tmp_path, monkeypatc
     assert record["message"] == "token bootstrap failed"
 
 
+def test_runtime_bounds_bootstrap_error_log(runtime, tmp_path, monkeypatch):
+    errors = tmp_path / "bootstrap-errors.jsonl"
+    monkeypatch.setenv("DCC_MCP_GIMP_BOOTSTRAP_ERRORS", str(errors))
+    capture = runtime["_capture_bootstrap_error"]
+
+    for index in range(5000):
+        capture("bridge-startup", RuntimeError("failure-%d" % index))
+
+    assert errors.stat().st_size <= 256 * 1024
+
+
 def test_plugin_captures_gi_import_failure(tmp_path, monkeypatch):
     errors = tmp_path / "bootstrap-errors.jsonl"
     monkeypatch.setenv("DCC_MCP_GIMP_BOOTSTRAP_ERRORS", str(errors))
