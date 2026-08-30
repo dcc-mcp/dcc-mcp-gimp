@@ -1144,6 +1144,97 @@ def test_receipt_atomic_temp_swap_cannot_publish_foreign(tmp_path, monkeypatch):
     assert not swapped
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Exercises POSIX receipt atomic-write failure")
+def test_receipt_atomic_write_failure_preserves_previous_bytes(tmp_path, monkeypatch):
+    from dcc_mcp_gimp import install_files
+
+    receipt = tmp_path / "gimp.json"
+    receipt.write_bytes(b"OLD-RECEIPT")
+    original_write = install_files.os.write
+    state = {"calls": 0, "failed": False}
+
+    def fail_after_temp(fd, data):
+        state["calls"] += 1
+        # The default POSIX path must stage the complete payload before the
+        # destination commit.  Fail on the second write, which is where the
+        # old in-place implementation had already truncated the receipt.
+        if state["calls"] == 2:
+            state["failed"] = True
+            if len(data) > 3:
+                original_write(fd, data[:3])
+            raise OSError("injected destination write failure")
+        return original_write(fd, data)
+
+    monkeypatch.setattr(install_files.os, "write", fail_after_temp)
+    try:
+        install_files._write_bytes_atomic(receipt, b"NEW-RECEIPT-CONTENT")
+    except install_files.InstallFailure:
+        pass
+
+    expected = b"OLD-RECEIPT" if state["failed"] else b"NEW-RECEIPT-CONTENT"
+    assert receipt.read_bytes() == expected
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Exercises POSIX bound receipt publication")
+def test_receipt_atomic_bound_temp_swap_preserves_previous_and_foreign(tmp_path, monkeypatch):
+    from dcc_mcp_gimp import install_files
+
+    receipt = tmp_path / "gimp.json"
+    foreign = tmp_path / "foreign.tmp"
+    receipt.write_bytes(b"OLD-RECEIPT")
+    foreign.write_bytes(b"FOREIGN")
+    original_rename = install_files._POSIX_RENAME
+    swapped = False
+
+    def race(source_name, destination_name, *args, **kwargs):
+        nonlocal swapped
+        if (
+            isinstance(source_name, str)
+            and source_name.startswith(".gimp.json.")
+            and source_name.endswith(".tmp")
+            and not swapped
+        ):
+            temporary = tmp_path / source_name
+            if temporary.exists():
+                temporary.rename(tmp_path / (temporary.name + ".owned"))
+                foreign.rename(temporary)
+                swapped = True
+        return original_rename(source_name, destination_name, *args, **kwargs)
+
+    monkeypatch.setattr(install_files, "_POSIX_RENAME", race)
+    with pytest.raises(install_files.InstallFailure):
+        install_files._write_bytes_atomic(receipt, b"NEW-RECEIPT")
+
+    assert swapped
+    assert receipt.read_bytes() == b"OLD-RECEIPT"
+    assert not foreign.exists()
+    assert any(item.name.endswith(".tmp.owned") for item in tmp_path.iterdir())
+    assert any(
+        item.name.startswith(".gimp.json.receipt-foreign-") and item.read_bytes() == b"FOREIGN"
+        for item in tmp_path.iterdir()
+    )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Exercises POSIX receipt tombstone cleanup")
+def test_receipt_success_does_not_leave_transaction_tombstones(tmp_path):
+    from dcc_mcp_gimp import install_files
+
+    source = tmp_path / "source.json"
+    destination = tmp_path / "quarantine.json"
+    source.write_bytes(b"OWNED")
+    install_files._replace_receipt_owned(source, destination, tmp_path, None)
+    destination.unlink()
+    source.write_bytes(b"OWNED")
+    install_files._unlink_receipt_owned(source)
+    receipt = tmp_path / "gimp.json"
+    install_files._write_bytes_atomic(receipt, b"OWNED")
+
+    assert not any(
+        "receipt-moved-" in item.name or "receipt-removed-" in item.name
+        for item in tmp_path.iterdir()
+    )
+
+
 def test_launch_preflight_rejects_changed_executable_identity(tmp_path):
     from dcc_mcp_gimp.install_contract import InstallFailure
     from dcc_mcp_gimp.install_host import _executable_identity, _gimp_version, _target_versions

@@ -26,6 +26,8 @@ _MAX_BOOTSTRAP_LOG_BYTES = 256 * 1024
 _BOOTSTRAP_WRITE_LOCK = threading.Lock()
 _BOOTSTRAP_RENAME_EXPECTED: Optional[tuple[int, int]] = None
 _BOOTSTRAP_RENAME_HANDLE: Any = None
+_BOOTSTRAP_POSIX_RENAME = os.rename
+_BOOTSTRAP_POSIX_UNLINK = os.unlink
 
 
 def _path_is_link_or_reparse(path: Path) -> bool:
@@ -262,6 +264,19 @@ def _capture_bootstrap_error(stage: str, error: BaseException) -> None:
         "error_type": type(error).__name__,
         "message": str(error)[:_MAX_BOOTSTRAP_RECORD_BYTES],
     }
+
+    def write_all(descriptor: int, data: bytes) -> None:
+        view = memoryview(data)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("short write")
+            view = view[written:]
+
+    # Keep AST-extracted smoke probes functional while production imports use
+    # the original primitives captured before any caller can replace os APIs.
+    posix_rename = globals().get("_BOOTSTRAP_POSIX_RENAME", os.rename)
+    posix_unlink = globals().get("_BOOTSTRAP_POSIX_UNLINK", os.unlink)
     try:
         # Serialize all readers/writers in this process.  Without this lock,
         # concurrent startup failures can each observe the old size and append
@@ -384,7 +399,14 @@ def _capture_bootstrap_error(stage: str, error: BaseException) -> None:
                             int(details.st_ino),
                         ):
                             return
-                        os.write(descriptor, line)
+                        try:
+                            write_all(descriptor, line)
+                            os.fsync(descriptor)
+                        except BaseException:
+                            if details is not None:
+                                os.ftruncate(descriptor, int(details.st_size))
+                                os.fsync(descriptor)
+                            raise
                     finally:
                         os.close(descriptor)
                     return
@@ -407,28 +429,131 @@ def _capture_bootstrap_error(stage: str, error: BaseException) -> None:
                 finally:
                     os.close(descriptor)
                 payload = rotate(existing, current_size)
-                # Commit the bounded rotation through the already-open log
-                # inode.  A pathname swap after this open cannot redirect
-                # the write into an external file.
-                descriptor = os.open(
-                    path.name,
-                    os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0),
+                # Stage the complete bounded payload before changing the log
+                # name.  This keeps a short write or disk-full error from
+                # truncating the previous diagnostics.  Move the old inode to
+                # a private backup so a raced temporary can be preserved and
+                # the previous log restored before the failure is swallowed.
+                temporary_name = ".%s.%s.tmp" % (path.name, uuid.uuid4().hex)
+                temporary_descriptor = os.open(
+                    temporary_name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o666,
                     dir_fd=parent_descriptor,
                 )
+                temporary_identity = None
+                backup_name = ".%s.bootstrap-backup-%s" % (path.name, uuid.uuid4().hex)
+                backup_identity = None
+                committed = False
                 try:
-                    opened = os.fstat(descriptor)
-                    if (int(opened.st_dev), int(opened.st_ino)) != (
-                        int(details.st_dev),
-                        int(details.st_ino),
-                    ):
-                        return
-                    os.ftruncate(descriptor, 0)
-                    view = memoryview(payload)
-                    while view:
-                        written = os.write(descriptor, view)
-                        view = view[written:]
+                    try:
+                        write_all(temporary_descriptor, payload)
+                        os.fsync(temporary_descriptor)
+                        temporary_details = os.fstat(temporary_descriptor)
+                        temporary_identity = (
+                            int(temporary_details.st_dev),
+                            int(temporary_details.st_ino),
+                        )
+                    except BaseException:
+                        try:
+                            posix_unlink(temporary_name, dir_fd=parent_descriptor)
+                        except OSError:
+                            pass
+                        raise
                 finally:
-                    os.close(descriptor)
+                    os.close(temporary_descriptor)
+                try:
+                    posix_rename(
+                        path.name,
+                        backup_name,
+                        src_dir_fd=parent_descriptor,
+                        dst_dir_fd=parent_descriptor,
+                    )
+                    backup_details = os.stat(
+                        backup_name, dir_fd=parent_descriptor, follow_symlinks=False
+                    )
+                    backup_identity = (
+                        int(backup_details.st_dev),
+                        int(backup_details.st_ino),
+                    )
+                    if backup_identity != (int(details.st_dev), int(details.st_ino)):
+                        raise OSError("bootstrap log changed identity")
+                    posix_rename(
+                        temporary_name,
+                        path.name,
+                        src_dir_fd=parent_descriptor,
+                        dst_dir_fd=parent_descriptor,
+                    )
+                    committed = True
+                    published = os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
+                    if (int(published.st_dev), int(published.st_ino)) != temporary_identity:
+                        raise OSError("bootstrap temporary changed identity")
+                    os.fsync(parent_descriptor)
+                except BaseException:
+                    if committed and temporary_identity is not None:
+                        try:
+                            published = os.stat(
+                                path.name, dir_fd=parent_descriptor, follow_symlinks=False
+                            )
+                        except OSError:
+                            published = None
+                        if (
+                            published is not None
+                            and (int(published.st_dev), int(published.st_ino)) != temporary_identity
+                        ):
+                            foreign_name = ".%s.bootstrap-foreign-%s" % (
+                                path.name,
+                                uuid.uuid4().hex,
+                            )
+                            try:
+                                posix_rename(
+                                    path.name,
+                                    foreign_name,
+                                    src_dir_fd=parent_descriptor,
+                                    dst_dir_fd=parent_descriptor,
+                                )
+                            except OSError:
+                                pass
+                    if backup_identity is not None:
+                        try:
+                            posix_rename(
+                                backup_name,
+                                path.name,
+                                src_dir_fd=parent_descriptor,
+                                dst_dir_fd=parent_descriptor,
+                            )
+                            backup_identity = None
+                        except OSError:
+                            pass
+                    raise
+                finally:
+                    try:
+                        if backup_identity is not None:
+                            backup_current = os.stat(
+                                backup_name, dir_fd=parent_descriptor, follow_symlinks=False
+                            )
+                            if (
+                                int(backup_current.st_dev),
+                                int(backup_current.st_ino),
+                            ) == backup_identity:
+                                posix_unlink(backup_name, dir_fd=parent_descriptor)
+                    except OSError:
+                        pass
+                    try:
+                        temporary_current = os.stat(
+                            temporary_name, dir_fd=parent_descriptor, follow_symlinks=False
+                        )
+                    except OSError:
+                        temporary_current = None
+                    if temporary_current is not None and temporary_identity is not None:
+                        if (
+                            int(temporary_current.st_dev),
+                            int(temporary_current.st_ino),
+                        ) == temporary_identity:
+                            try:
+                                posix_unlink(temporary_name, dir_fd=parent_descriptor)
+                            except OSError:
+                                pass
             finally:
                 os.close(parent_descriptor)
     except (OSError, RuntimeError, ValueError, AttributeError):
