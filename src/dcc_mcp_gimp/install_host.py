@@ -224,6 +224,10 @@ def _resolve_gimp(value: Optional[Path]) -> Path:
         valid = resolved.is_file() and not resolved.is_symlink() and resolved.stat().st_size > 0
     except InstallFailure:
         raise
+    except FileNotFoundError as exc:
+        raise InstallFailure(
+            EXIT_PREFLIGHT, "gimp", "GIMP executable not found: %s" % candidate
+        ) from exc
     except (OSError, RuntimeError, ValueError) as exc:
         raise InstallFailure(EXIT_PREFLIGHT, "gimp", "GIMP executable path is unavailable") from exc
     if not valid:

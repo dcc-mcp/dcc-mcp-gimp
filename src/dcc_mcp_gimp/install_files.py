@@ -34,6 +34,7 @@ from .install_host import default_plugin_dir
 
 _MAX_RECEIPT_BYTES = 1024 * 1024
 _MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024
+_DEFAULT_SAFE_REMOVE_TREE = safe_remove_tree
 
 
 def _source_file() -> Path:
@@ -432,39 +433,48 @@ def _replace_path_owned(
         _replace_path(source, destination)
         _assert_physical_root(root, expected_identity)
         return
+    source_descriptor = None
+    destination_descriptor = None
     try:
-        descriptor = _open_owned_root_fd(root, expected_identity)
-        source_name = source.relative_to(root).as_posix()
-        destination_name = destination.relative_to(root).as_posix()
-        if "/" in source_name or "/" in destination_name:
+        source_relative = source.relative_to(root)
+        destination_relative = destination.relative_to(root)
+        if not source_relative.parts or not destination_relative.parts:
             raise InstallFailure(EXIT_INSTALL, "install", "Managed rename escaped the profile root")
+
+        def open_parent(relative: Path) -> int:
+            parent_parts = relative.parts[:-1]
+            parent_relative = Path(*parent_parts).as_posix() if parent_parts else ""
+            return _open_relative_dir_nofollow(
+                root, expected_identity, parent_relative, create=False
+            )
+
+        source_descriptor = open_parent(source_relative)
+        destination_descriptor = open_parent(destination_relative)
         for attempt in range(6):
             try:
                 os.replace(
-                    source_name,
-                    destination_name,
-                    src_dir_fd=descriptor,
-                    dst_dir_fd=descriptor,
+                    source_relative.name,
+                    destination_relative.name,
+                    src_dir_fd=source_descriptor,
+                    dst_dir_fd=destination_descriptor,
                 )
                 break
             except PermissionError:
                 if attempt == 5:
                     raise
                 time.sleep(0.05 * (2**attempt))
-        details = os.fstat(descriptor)
-        if (
-            expected_identity is not None
-            and (int(details.st_dev), int(details.st_ino)) != expected_identity
-        ):
-            raise InstallFailure(EXIT_PREFLIGHT, "profile", "GIMP profile path changed identity")
+        _assert_physical_root(root, expected_identity)
     except InstallFailure:
         raise
     except (OSError, RuntimeError, ValueError) as exc:
         raise InstallFailure(EXIT_INSTALL, "install", "Managed profile rename failed") from exc
     finally:
         try:
-            os.close(descriptor)
-        except (UnboundLocalError, OSError):
+            if source_descriptor is not None:
+                os.close(source_descriptor)
+            if destination_descriptor is not None and destination_descriptor != source_descriptor:
+                os.close(destination_descriptor)
+        except OSError:
             pass
 
 
@@ -737,7 +747,11 @@ def _cleanup_tree_owned(
     root: Path, expected_identity: Optional[tuple[int, int]], path: Path
 ) -> dict[str, Any]:
     """Remove a transaction entry without following swapped path components."""
-    if _cleanup_tree is not _DEFAULT_CLEANUP_TREE or os.name == "nt":
+    if (
+        _cleanup_tree is not _DEFAULT_CLEANUP_TREE
+        or safe_remove_tree is not _DEFAULT_SAFE_REMOVE_TREE
+        or os.name == "nt"
+    ):
         _assert_physical_root(root, expected_identity)
         result = _cleanup_tree(path)
         if result.get("success"):
