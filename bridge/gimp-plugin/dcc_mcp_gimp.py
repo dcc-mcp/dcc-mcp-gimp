@@ -353,10 +353,19 @@ def _capture_bootstrap_error(stage: str, error: BaseException) -> None:
                             pass
                 return
 
+            parent_before = os.lstat(str(path.parent))
+            if not stat.S_ISDIR(parent_before.st_mode) or _path_is_link_or_reparse(path.parent):
+                return
             parent_descriptor = os.open(
                 str(path.parent),
                 os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
             )
+            parent_opened = os.fstat(parent_descriptor)
+            if (int(parent_opened.st_dev), int(parent_opened.st_ino)) != (
+                int(parent_before.st_dev),
+                int(parent_before.st_ino),
+            ):
+                return
             temporary_name = None
             try:
                 try:
@@ -425,7 +434,7 @@ def _capture_bootstrap_error(stage: str, error: BaseException) -> None:
                     int(temporary_identity.st_ino),
                 ):
                     return
-                os.replace(
+                os.rename(
                     temporary_name,
                     path.name,
                     src_dir_fd=parent_descriptor,
@@ -435,7 +444,7 @@ def _capture_bootstrap_error(stage: str, error: BaseException) -> None:
             finally:
                 if temporary_name is not None:
                     try:
-                        os.unlink(temporary_name, dir_fd=parent_descriptor)
+                        os.remove(temporary_name, dir_fd=parent_descriptor)
                     except (FileNotFoundError, OSError):
                         pass
                 os.close(parent_descriptor)

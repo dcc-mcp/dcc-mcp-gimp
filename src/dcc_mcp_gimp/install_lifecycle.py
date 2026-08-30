@@ -529,11 +529,14 @@ def doctor(destination: Optional[Path] = None) -> dict[str, object]:
         else None
     )
     version_matches = installed_version == __version__
+    plugin_script_exists = (
+        physical_error is None and script.is_file() and not target_linked and not script_linked
+    )
     return {
-        "ready": physical_error is None and script.is_file() and version_matches,
+        "ready": plugin_script_exists and version_matches,
         "destination": str(root),
         "plugin_script": str(script),
-        "plugin_script_exists": script.is_file() and not script_linked,
+        "plugin_script_exists": plugin_script_exists,
         "installed_adapter_version": installed_version,
         "expected_adapter_version": __version__,
         "version_matches": version_matches,

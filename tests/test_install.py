@@ -211,6 +211,25 @@ def test_doctor_does_not_read_script_through_linked_target(tmp_path):
     assert result["installed_adapter_version"] is None
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Symlink creation requires elevated Windows rights")
+def test_doctor_does_not_report_script_exists_through_linked_destination(tmp_path):
+    from dcc_mcp_gimp import install_lifecycle
+
+    actual = tmp_path / "actual-profile"
+    actual.mkdir()
+    target = actual / "dcc_mcp_gimp"
+    target.mkdir()
+    (target / "dcc_mcp_gimp.py").write_text('VERSION = "0.4.1"\n', encoding="utf-8")
+    linked = tmp_path / "linked-profile"
+    linked.symlink_to(actual, target_is_directory=True)
+
+    result = install_lifecycle.doctor(linked)
+
+    assert result["physical_path_error"]
+    assert result["plugin_script_exists"] is False
+    assert result["ready"] is False
+
+
 def test_status_preflight_records_gimp_profile_and_target_interpreter(lifecycle_env):
     from dcc_mcp_gimp.install import run
 
@@ -1302,6 +1321,94 @@ def test_manifest_rejects_entry_count_and_depth_limits(tmp_path):
     (current / "entry.txt").write_bytes(b"x")
     with pytest.raises(install_files.InstallFailure, match="too deep"):
         install_files._owned_root_manifest(shallow)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Exercises POSIX profile-root swap")
+def test_manifest_root_swap_fails_closed_before_recording_foreign_files(tmp_path, monkeypatch):
+    from dcc_mcp_gimp import install_files
+
+    root = tmp_path / "target"
+    root.mkdir()
+    (root / "owned.txt").write_text("owned", encoding="utf-8")
+    parked = tmp_path / "target-owned"
+    foreign = tmp_path / "external"
+    foreign.mkdir()
+    (foreign / "operator.txt").write_text("foreign", encoding="utf-8")
+    original_walk = install_files.os.walk
+    swapped = False
+
+    def race_walk(path, *args, **kwargs):
+        nonlocal swapped
+        if Path(path) == root and not swapped:
+            root.rename(parked)
+            foreign.rename(root)
+            swapped = True
+        yield from original_walk(path, *args, **kwargs)
+
+    monkeypatch.setattr(install_files.os, "walk", race_walk)
+    with pytest.raises(install_files.InstallFailure, match="changed identity"):
+        install_files._owned_root_manifest(root)
+    assert swapped
+
+
+def test_stage_path_swap_is_not_published(lifecycle_env, monkeypatch):
+    from dcc_mcp_gimp import install_files
+    from dcc_mcp_gimp.install import run
+
+    installed, code, _ = run(["install", "--yes", *lifecycle_env.common])
+    assert code == 0, installed
+    original_stage = install_files._stage_plugin
+    state = {}
+
+    def stage_then_swap(root):
+        stage = original_stage(root)
+        parked = root / (stage.name + ".owned")
+        foreign = root / (stage.name + ".foreign")
+        foreign.mkdir()
+        (foreign / "operator.txt").write_text("foreign", encoding="utf-8")
+        (foreign / "dcc_mcp_gimp.py").write_text('VERSION = "0.4.1"\n', encoding="utf-8")
+        stage.rename(parked)
+        foreign.rename(stage)
+        state["parked"] = parked
+        return stage
+
+    monkeypatch.setattr(install_files, "_stage_plugin", stage_then_swap)
+    report, code, _ = run(["upgrade", "--yes", *lifecycle_env.common])
+
+    assert code == 10, report
+    assert report["status"] == "failed"
+    assert not (lifecycle_env.plugins / "dcc_mcp_gimp" / "operator.txt").exists()
+    assert state["parked"].is_dir()
+
+
+def test_uninstall_transaction_path_swap_preserves_foreign_tree(lifecycle_env, monkeypatch):
+    from dcc_mcp_gimp import install_files
+    from dcc_mcp_gimp.install import run
+
+    installed, code, _ = run(["install", "--yes", *lifecycle_env.common])
+    assert code == 0, installed
+    original_create = install_files._create_private_transaction
+    external = lifecycle_env.plugins.parent / "foreign-transaction"
+    external.mkdir()
+    (external / "operator.txt").write_text("do not delete", encoding="utf-8")
+    state = {}
+
+    def create_then_swap(parent, name, stage):
+        transaction = original_create(parent, name, stage)
+        parked = parent / (transaction.name + ".owned")
+        transaction.rename(parked)
+        external.rename(transaction)
+        state["transaction"] = transaction
+        state["parked"] = parked
+        return transaction
+
+    monkeypatch.setattr(install_files, "_create_private_transaction", create_then_swap)
+    report, code, _ = run(["uninstall", "--yes", *lifecycle_env.common])
+
+    assert code == 10, report
+    assert report["status"] == "failed"
+    assert (state["transaction"] / "operator.txt").read_text(encoding="utf-8") == "do not delete"
+    assert state["parked"].is_dir()
 
 
 def test_verify_runtime_shape_failure_is_structured(lifecycle_env, monkeypatch):
