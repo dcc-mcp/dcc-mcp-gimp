@@ -40,6 +40,12 @@ _MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024
 _MAX_MANIFEST_ENTRIES = 4096
 _MAX_MANIFEST_DEPTH = 64
 _DEFAULT_SAFE_REMOVE_TREE = safe_remove_tree
+# Path-returning test seams cannot carry an inode identity by themselves.  Keep
+# the identity captured at the side-effect boundary so a caller that swaps the
+# returned pathname before publication fails closed instead of consuming the
+# replacement object.
+_BOUND_STAGE_IDENTITIES: dict[str, tuple[int, int, int, int, int, int]] = {}
+_BOUND_TRANSACTION_IDENTITIES: dict[str, tuple[int, int, int, int, int, int]] = {}
 
 
 def _source_file() -> Path:
@@ -171,11 +177,19 @@ def _owned_root_manifest(
         raise InstallFailure(
             EXIT_PREFLIGHT, "receipt", "Managed GIMP plug-in root is missing or linked"
         )
+    root_identity = _directory_identity(root, "receipt")
     directories: list[str] = []
     files: list[dict[str, Any]] = []
     links: list[str] = []
     total_bytes = 0
     for current, dirnames, filenames in os.walk(str(root), topdown=True, followlinks=False):
+        # ``os.walk`` receives a pathname, not an inode.  Revalidate the
+        # selected root before consuming each batch so a root swap cannot turn
+        # this manifest into an operator-owned external tree.
+        if _directory_identity(root, "receipt") != root_identity:
+            raise InstallFailure(
+                EXIT_PREFLIGHT, "receipt", "Managed GIMP plug-in root changed identity"
+            )
         current_path = Path(current)
         try:
             current_depth = len(current_path.relative_to(root).parts)
@@ -228,6 +242,10 @@ def _owned_root_manifest(
                     raise InstallFailure(EXIT_INSTALL, "recovery", "Managed recovery is too large")
                 total_bytes += file_size
                 files.append(_file_record(path, root))
+    if _directory_identity(root, "receipt") != root_identity:
+        raise InstallFailure(
+            EXIT_PREFLIGHT, "receipt", "Managed GIMP plug-in root changed identity"
+        )
     return sorted(directories), sorted(files, key=lambda item: item["path"]), sorted(links)
 
 
@@ -945,6 +963,7 @@ def _replace_path_owned(
     source: Path,
     destination: Path,
     expected_file_identities: Optional[Mapping[str, tuple[int, ...]]] = None,
+    expected_source_identity: Optional[tuple[int, ...]] = None,
 ) -> None:
     """Rename only while the selected profile still owns the pathname."""
     # Tests and callers may intentionally replace the primitive to inject a
@@ -962,6 +981,14 @@ def _replace_path_owned(
                 _assert_physical_root(root, expected_identity)
                 _assert_path_components_safe(source, "install")
                 _assert_path_components_safe(destination, "install")
+                if expected_source_identity is not None:
+                    if (
+                        _object_identity(source, "install")[:2]
+                        != tuple(expected_source_identity)[:2]
+                    ):
+                        raise InstallFailure(
+                            EXIT_PREFLIGHT, "install", "Managed stage changed identity"
+                        )
                 _replace_path(source, destination)
                 _assert_physical_root(root, expected_identity)
         return
@@ -971,6 +998,14 @@ def _replace_path_owned(
                 _assert_physical_root(root, expected_identity)
                 _assert_path_components_safe(source, "install")
                 _assert_path_components_safe(destination, "install")
+                if expected_source_identity is not None:
+                    if (
+                        _object_identity(source, "install")[:2]
+                        != tuple(expected_source_identity)[:2]
+                    ):
+                        raise InstallFailure(
+                            EXIT_PREFLIGHT, "install", "Managed stage changed identity"
+                        )
                 if expected_file_identities:
                     _assert_owned_file_identities(source, expected_file_identities, "install")
                 _windows_rename_by_handle(source, destination, replace=False)
@@ -1008,6 +1043,9 @@ def _replace_path_owned(
         )
         if expected_file_identities:
             _assert_owned_file_identities(source, expected_file_identities, "install")
+        if expected_source_identity is not None:
+            if _object_identity(source, "install")[:2] != tuple(expected_source_identity)[:2]:
+                raise InstallFailure(EXIT_PREFLIGHT, "install", "Managed stage changed identity")
         for attempt in range(6):
             try:
                 os.replace(
@@ -1102,8 +1140,17 @@ def _write_atomic_at_parent(path: Path, data: bytes, mode: Optional[int] = None)
     """Atomically write a file using one no-follow receipt-parent handle."""
     parent_descriptor = None
     created_temp = False
+    expected_parent_identity: Optional[tuple[int, int]] = None
     try:
+        if path.parent.exists():
+            expected_parent_identity = _directory_identity(path.parent, "receipt")
         parent_descriptor = _open_absolute_dir_nofollow(path.parent, create=True)
+        if expected_parent_identity is not None:
+            parent_details = os.fstat(parent_descriptor)
+            if (int(parent_details.st_dev), int(parent_details.st_ino)) != expected_parent_identity:
+                raise InstallFailure(
+                    EXIT_PREFLIGHT, "receipt", "Install receipt parent changed identity"
+                )
         with _posix_directory_lock(parent_descriptor):
             temporary_name = ".%s.%s.tmp" % (path.name, uuid.uuid4().hex)
             flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
@@ -1136,7 +1183,7 @@ def _write_atomic_at_parent(path: Path, data: bytes, mode: Optional[int] = None)
                 raise InstallFailure(
                     EXIT_PREFLIGHT, "receipt", "Managed receipt file changed identity"
                 )
-            os.replace(
+            os.rename(
                 temporary_name,
                 path.name,
                 src_dir_fd=parent_descriptor,
@@ -1156,7 +1203,7 @@ def _write_atomic_at_parent(path: Path, data: bytes, mode: Optional[int] = None)
     finally:
         if created_temp and "temporary_name" in locals() and parent_descriptor is not None:
             try:
-                os.unlink(temporary_name, dir_fd=parent_descriptor)
+                os.remove(temporary_name, dir_fd=parent_descriptor)
             except (FileNotFoundError, OSError):
                 pass
         if parent_descriptor is not None:
@@ -1295,7 +1342,14 @@ def _replace_receipt_owned(
     destination_descriptor = None
     try:
         _assert_receipt_path_safe(source)
+        expected_source_parent = _directory_identity(source.parent, "uninstall")
+        expected_destination_parent = _directory_identity(destination.parent, "uninstall")
         source_descriptor = _open_absolute_dir_nofollow(source.parent)
+        source_details = os.fstat(source_descriptor)
+        if (int(source_details.st_dev), int(source_details.st_ino)) != expected_source_parent:
+            raise InstallFailure(
+                EXIT_PREFLIGHT, "uninstall", "Receipt source parent changed identity"
+            )
         try:
             relative_parent = destination.parent.relative_to(root).as_posix()
         except ValueError:
@@ -1305,6 +1359,14 @@ def _replace_receipt_owned(
             destination_descriptor = _open_relative_dir_nofollow(
                 root, expected_identity, relative_parent, create=True
             )
+        destination_details = os.fstat(destination_descriptor)
+        if (
+            int(destination_details.st_dev),
+            int(destination_details.st_ino),
+        ) != expected_destination_parent:
+            raise InstallFailure(
+                EXIT_PREFLIGHT, "uninstall", "Receipt destination parent changed identity"
+            )
         with _posix_directory_locks(source_descriptor, destination_descriptor):
             _assert_receipt_descriptor_identity(
                 source_descriptor, source.name, source_identity, "uninstall"
@@ -1313,7 +1375,7 @@ def _replace_receipt_owned(
             _assert_receipt_name_identity(source, source_identity, "uninstall")
             _assert_receipt_file_identity(source, source_identity, "uninstall")
             _assert_receipt_file_identity_strict(source, source_identity, "uninstall")
-            os.replace(
+            os.rename(
                 source.name,
                 destination.name,
                 src_dir_fd=source_descriptor,
@@ -1364,7 +1426,7 @@ def _unlink_receipt_owned(path: Path) -> None:
             _assert_receipt_name_identity(path, expected_identity, "receipt")
             _assert_receipt_file_identity(path, expected_identity, "receipt")
             _assert_receipt_file_identity_strict(path, expected_identity, "receipt")
-            os.unlink(path.name, dir_fd=descriptor)
+            os.remove(path.name, dir_fd=descriptor)
     except FileNotFoundError:
         return
     except InstallFailure:
@@ -1430,6 +1492,7 @@ def _stage_plugin(root: Path) -> Path:
                 os.fchmod(script_fd, 0o755)
             finally:
                 os.close(script_fd)
+            _BOUND_STAGE_IDENTITIES[str(stage.absolute())] = _object_identity(stage, "install")
             return stage
         with _windows_directory_lease(root, "install"):
             _assert_physical_root(root, root_identity)
@@ -1437,6 +1500,7 @@ def _stage_plugin(root: Path) -> Path:
             script = stage / ("%s.py" % _PLUGIN_NAME)
             shutil.copy2(source, script)
             _assert_physical_root(root, root_identity)
+        _BOUND_STAGE_IDENTITIES[str(stage.absolute())] = _object_identity(stage, "install")
         return stage
     except InstallFailure:
         raise
@@ -1525,6 +1589,40 @@ def _posix_stable_directory(path: Path, stage: str):
                 os.close(descriptor)
             except OSError:
                 pass
+
+
+def _open_fd_backed_directory(
+    path: Path,
+    stage: str,
+    expected_identity: Optional[tuple[int, int]] = None,
+) -> tuple[int, Path]:
+    """Open a directory without following links and expose its fd pathname.
+
+    macOS does not always make ``Path(/proc/self/fd/N)`` discoverable via
+    ``is_dir``.  When the platform still provides a ``/dev/fd`` view, using
+    that view keeps copytree bound to the opened directory inode; otherwise we
+    fail closed instead of copying through a swappable pathname.
+    """
+    if os.name == "nt":
+        raise InstallFailure(EXIT_PREFLIGHT, stage, "Descriptor-bound directory is unavailable")
+    descriptor = _open_absolute_dir_nofollow(path)
+    details = os.fstat(descriptor)
+    actual_identity = (int(details.st_dev), int(details.st_ino))
+    if expected_identity is not None and actual_identity != expected_identity:
+        os.close(descriptor)
+        raise InstallFailure(EXIT_PREFLIGHT, stage, "Managed directory changed identity")
+    for prefix in ("/proc/self/fd", "/dev/fd"):
+        candidate = Path(prefix) / str(descriptor)
+        try:
+            if candidate.is_dir():
+                return descriptor, candidate
+        except (OSError, RuntimeError, ValueError):
+            continue
+    try:
+        os.close(descriptor)
+    except OSError:
+        pass
+    raise InstallFailure(EXIT_PREFLIGHT, stage, "Descriptor-bound recovery staging is unavailable")
 
 
 def _remove_entry_at(
@@ -1742,6 +1840,9 @@ def _create_private_transaction(parent: Path, name: str, stage: str) -> Path:
                 )
             if _directory_identity(transaction, stage) == parent_identity:
                 raise InstallFailure(EXIT_INSTALL, stage, "Private transaction identity is invalid")
+            _BOUND_TRANSACTION_IDENTITIES[str(transaction.absolute())] = _object_identity(
+                transaction, stage
+            )
             return transaction
     descriptor = None
     try:
@@ -1758,7 +1859,11 @@ def _create_private_transaction(parent: Path, name: str, stage: str) -> Path:
             raise InstallFailure(
                 EXIT_PREFLIGHT, stage, "Managed transaction parent changed identity"
             )
-        return parent / name
+        transaction = parent / name
+        _BOUND_TRANSACTION_IDENTITIES[str(transaction.absolute())] = _object_identity(
+            transaction, stage
+        )
+        return transaction
     except FileExistsError as exc:
         raise InstallFailure(EXIT_INSTALL, stage, "Private transaction already exists") from exc
     except InstallFailure:
@@ -2163,16 +2268,54 @@ def _copy_validated_recovery(
             raise InstallFailure(
                 EXIT_PREFLIGHT, "recovery", "Recovery staging parent changed identity"
             )
-        try:
-            staging_root = Path(
-                tempfile.mkdtemp(prefix=".dcc-mcp-gimp-recovery-", dir=str(staging_parent))
-            )
-        except OSError as exc:
-            raise InstallFailure(
-                EXIT_INSTALL,
-                "recovery",
-                "Recovery staging directory could not be created",
-            ) from exc
+        if os.name != "nt":
+            descriptor = None
+            try:
+                descriptor = _open_absolute_dir_nofollow(staging_parent)
+                details = os.fstat(descriptor)
+                if (int(details.st_dev), int(details.st_ino)) != staging_parent_identity:
+                    raise InstallFailure(
+                        EXIT_PREFLIGHT, "recovery", "Recovery staging parent changed identity"
+                    )
+                for _attempt in range(8):
+                    candidate_name = ".dcc-mcp-gimp-recovery-%s" % uuid.uuid4().hex
+                    try:
+                        os.mkdir(candidate_name, 0o700, dir_fd=descriptor)
+                    except FileExistsError:
+                        continue
+                    staging_root = staging_parent / candidate_name
+                    break
+                if staging_root is None:
+                    raise InstallFailure(
+                        EXIT_INSTALL,
+                        "recovery",
+                        "Recovery staging directory could not be created",
+                    )
+            except InstallFailure:
+                raise
+            except OSError as exc:
+                raise InstallFailure(
+                    EXIT_INSTALL,
+                    "recovery",
+                    "Recovery staging directory could not be created",
+                ) from exc
+            finally:
+                if descriptor is not None:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
+        else:
+            try:
+                staging_root = Path(
+                    tempfile.mkdtemp(prefix=".dcc-mcp-gimp-recovery-", dir=str(staging_parent))
+                )
+            except OSError as exc:
+                raise InstallFailure(
+                    EXIT_INSTALL,
+                    "recovery",
+                    "Recovery staging directory could not be created",
+                ) from exc
         if _directory_identity(staging_parent, "recovery") != staging_parent_identity:
             raise InstallFailure(
                 EXIT_PREFLIGHT, "recovery", "Recovery staging parent changed identity"
@@ -2187,9 +2330,23 @@ def _copy_validated_recovery(
                     EXIT_PREFLIGHT, "recovery", "Recovery staging parent changed identity"
                 )
             with _posix_stable_directory(staging_parent, "recovery") as stable_parent:
-                copy_parent = stable_parent or staging_parent
-                copy_destination = copy_parent / staging_root.name / recovery.name
-                shutil.copytree(source, copy_destination, symlinks=True, copy_function=shutil.copy2)
+                fd_backed_descriptor = None
+                try:
+                    if stable_parent is None and os.name != "nt":
+                        fd_backed_descriptor, stable_parent = _open_fd_backed_directory(
+                            staging_parent, "recovery", staging_parent_identity
+                        )
+                    copy_parent = stable_parent or staging_parent
+                    copy_destination = copy_parent / staging_root.name / recovery.name
+                    shutil.copytree(
+                        source, copy_destination, symlinks=True, copy_function=shutil.copy2
+                    )
+                finally:
+                    if fd_backed_descriptor is not None:
+                        try:
+                            os.close(fd_backed_descriptor)
+                        except OSError:
+                            pass
             if _directory_identity(staging_parent, "recovery") != staging_parent_identity:
                 raise InstallFailure(
                     EXIT_PREFLIGHT, "recovery", "Recovery staging parent changed identity"
@@ -2275,6 +2432,7 @@ def _replace_plugin(root: Path) -> Path:
     root_identity = _assert_physical_root(root)
     target = root / _PLUGIN_NAME
     stage = _stage_plugin(root)
+    _BOUND_STAGE_IDENTITIES.pop(str(stage.absolute()), None)
     backup = root / (".%s.%s.backup" % (_PLUGIN_NAME, uuid.uuid4().hex))
     try:
         if target.exists():
@@ -2685,6 +2843,9 @@ def _begin_replace_plugin(root: Path, report: Mapping[str, Any]) -> InstallTrans
             EXIT_INSTALL, "receipt", "Unowned or changed GIMP plug-in state cannot be overwritten"
         )
     stage = _stage_plugin(root)
+    stage_identity = _BOUND_STAGE_IDENTITIES.pop(str(stage.absolute()), None)
+    if stage_identity is None:
+        stage_identity = _object_identity(stage, "install")
     try:
         _assert_physical_root(root, root_identity)
     except BaseException:
@@ -2732,7 +2893,13 @@ def _begin_replace_plugin(root: Path, report: Mapping[str, Any]) -> InstallTrans
             if planned_file_identities:
                 _assert_owned_file_identities(backup, planned_file_identities, "install")
         _assert_physical_root(root, root_identity)
-        _replace_path_owned(root, root_identity, stage, target)
+        _replace_path_owned(
+            root,
+            root_identity,
+            stage,
+            target,
+            expected_source_identity=stage_identity,
+        )
         transaction.replacement_moved = True
         _assert_physical_root(root, root_identity)
         _write_json_atomic(receipt_path, _receipt_payload(root, target, report))
@@ -2927,8 +3094,19 @@ def _execute_uninstall(report: dict[str, Any]) -> tuple[dict[str, Any], int]:
             "uninstall",
         )
         transaction_created = True
+        transaction_identity = _BOUND_TRANSACTION_IDENTITIES.pop(str(transaction.absolute()), None)
+        if transaction_identity is None:
+            transaction_identity = _object_identity(transaction, "uninstall")
+        if _object_identity(transaction, "uninstall")[:2] != tuple(transaction_identity)[:2]:
+            raise InstallFailure(
+                EXIT_PREFLIGHT, "uninstall", "Managed transaction changed identity"
+            )
         snapshot.mkdir()
         quarantine.mkdir()
+        if _object_identity(transaction, "uninstall")[:2] != tuple(transaction_identity)[:2]:
+            raise InstallFailure(
+                EXIT_PREFLIGHT, "uninstall", "Managed transaction changed identity"
+            )
         if target_tree_identities is not None:
             quarantine_expected_identities = {"": _object_identity(quarantine, "uninstall")}
             for relative, identity in target_tree_identities.items():
