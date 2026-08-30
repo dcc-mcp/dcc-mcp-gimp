@@ -41,6 +41,12 @@ _MAX_MANIFEST_ENTRIES = 4096
 _MAX_MANIFEST_DEPTH = 64
 _DEFAULT_SAFE_REMOVE_TREE = safe_remove_tree
 _DEFAULT_COPYTREE = shutil.copytree
+# Keep the interpreter's original POSIX primitives before any lifecycle test
+# or caller can replace attributes on the shared ``os`` module.  All callers
+# still pass held no-follow directory descriptors and revalidate identities;
+# this prevents an injectable pathname wrapper from running between those
+# checks and the syscall.
+_POSIX_RENAME = os.rename
 # Path-returning test seams cannot carry an inode identity by themselves.  Keep
 # the identity captured at the side-effect boundary so a caller that swaps the
 # returned pathname before publication fails closed instead of consuming the
@@ -105,14 +111,22 @@ def _is_link(path: Path) -> bool:
     return bool(int(attributes) & 0x400)
 
 
-def _file_record(path: Path, root: Path) -> dict[str, Any]:
+def _file_record(
+    path: Path,
+    root: Path,
+    *,
+    parent_descriptor: Optional[int] = None,
+) -> dict[str, Any]:
     descriptor = None
-    parent_descriptor = None
+    owns_parent_descriptor = parent_descriptor is None
     object_lease = None
     directory_lease = None
     try:
-        before = os.lstat(str(path))
-        if not stat.S_ISREG(before.st_mode) or _is_link(path):
+        if parent_descriptor is None:
+            before = os.lstat(str(path))
+        else:
+            before = os.lstat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
+        if not stat.S_ISREG(before.st_mode) or (parent_descriptor is None and _is_link(path)):
             raise InstallFailure(
                 EXIT_PREFLIGHT, "receipt", "Managed GIMP file is missing or linked"
             )
@@ -129,7 +143,9 @@ def _file_record(path: Path, root: Path) -> dict[str, Any]:
             object_lease.__enter__()
             descriptor = os.open(str(path), flags)
         else:
-            parent_descriptor = _open_absolute_dir_nofollow(path.parent)
+            if parent_descriptor is None:
+                parent_descriptor = _open_absolute_dir_nofollow(path.parent)
+                owns_parent_descriptor = True
             descriptor = os.open(path.name, flags, dir_fd=parent_descriptor)
         opened = os.fstat(descriptor)
         if (int(opened.st_dev), int(opened.st_ino)) != (
@@ -153,7 +169,7 @@ def _file_record(path: Path, root: Path) -> dict[str, Any]:
                 os.close(descriptor)
             except OSError:
                 pass
-        if parent_descriptor is not None:
+        if parent_descriptor is not None and owns_parent_descriptor:
             try:
                 os.close(parent_descriptor)
             except OSError:
@@ -257,10 +273,22 @@ def _owned_root_manifest(
                     raise InstallFailure(EXIT_INSTALL, "recovery", "Managed recovery is too large")
                 total_bytes += file_size
                 files.append(_file_record(path, root))
-    if _directory_identity(root, "receipt") != root_identity:
-        raise InstallFailure(
-            EXIT_PREFLIGHT, "receipt", "Managed GIMP plug-in root changed identity"
-        )
+        # The current directory may be replaced after its initial identity
+        # check but before the file batch is consumed.  Recheck it at the
+        # batch boundary so no bytes from a pathname-swapped tree become
+        # receipt-owned metadata.
+        if _directory_identity(current_path, "receipt") != expected_current_identity:
+            raise InstallFailure(
+                EXIT_PREFLIGHT, "receipt", "Managed manifest directory changed identity"
+            )
+    for relative, expected_identity in directory_identities.items():
+        selected = root if not relative else root / relative
+        if _directory_identity(selected, "receipt") != expected_identity:
+            raise InstallFailure(
+                EXIT_PREFLIGHT,
+                "receipt",
+                "Managed manifest directory changed identity",
+            )
     return sorted(directories), sorted(files, key=lambda item: item["path"]), sorted(links)
 
 
@@ -1152,8 +1180,17 @@ def _write_bytes_atomic_legacy(path: Path, data: bytes, mode: Optional[int] = No
 
 
 def _write_atomic_at_parent(path: Path, data: bytes, mode: Optional[int] = None) -> None:
-    """Atomically write a file using one no-follow receipt-parent handle."""
+    """Write through a held no-follow parent and a bound destination fd.
+
+    POSIX has no portable rename primitive that accepts a source inode rather
+    than a source name.  Once the destination is opened and its identity is
+    checked, writing through that descriptor cannot be redirected by a later
+    pathname swap.  A missing destination is created with ``O_EXCL`` so an
+    operator-created replacement is rejected instead of overwritten.
+    """
     parent_descriptor = None
+    temporary_path: Optional[Path] = None
+    temporary_descriptor = None
     created_temp = False
     expected_parent_identity: Optional[tuple[int, int]] = None
     try:
@@ -1167,43 +1204,65 @@ def _write_atomic_at_parent(path: Path, data: bytes, mode: Optional[int] = None)
                     EXIT_PREFLIGHT, "receipt", "Install receipt parent changed identity"
                 )
         with _posix_directory_lock(parent_descriptor):
-            temporary_name = ".%s.%s.tmp" % (path.name, uuid.uuid4().hex)
-            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
-            file_descriptor = os.open(temporary_name, flags, 0o666, dir_fd=parent_descriptor)
+            temporary_path = path.with_name(".%s.%s.tmp" % (path.name, uuid.uuid4().hex))
+            temporary_descriptor = os.open(
+                temporary_path.name,
+                os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
+                0o666,
+                dir_fd=parent_descriptor,
+            )
             created_temp = True
+            view = memoryview(data)
+            while view:
+                written = os.write(temporary_descriptor, view)
+                view = view[written:]
+            if mode is not None:
+                os.fchmod(temporary_descriptor, mode)
+            os.lseek(temporary_descriptor, 0, os.SEEK_SET)
             try:
-                view = memoryview(data)
-                while view:
-                    written = os.write(file_descriptor, view)
-                    view = view[written:]
+                existing = os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
+            except FileNotFoundError:
+                existing = None
+            if existing is not None and not stat.S_ISREG(existing.st_mode):
+                raise InstallFailure(
+                    EXIT_PREFLIGHT, "receipt", "Install receipt file is linked or not regular"
+                )
+            flags = os.O_WRONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+            if existing is None:
+                flags |= os.O_CREAT | os.O_EXCL
+            file_descriptor = os.open(path.name, flags, 0o666, dir_fd=parent_descriptor)
+            try:
+                opened = os.fstat(file_descriptor)
+                if existing is not None and (int(opened.st_dev), int(opened.st_ino)) != (
+                    int(existing.st_dev),
+                    int(existing.st_ino),
+                ):
+                    raise InstallFailure(
+                        EXIT_PREFLIGHT, "receipt", "Managed receipt file changed identity"
+                    )
+                if existing is not None:
+                    os.ftruncate(file_descriptor, 0)
+                view = memoryview(b"")
+                while True:
+                    chunk = os.read(temporary_descriptor, 1024 * 1024)
+                    if not chunk:
+                        break
+                    view = memoryview(chunk)
+                    while view:
+                        written = os.write(file_descriptor, view)
+                        view = view[written:]
+                if mode is not None:
+                    os.fchmod(file_descriptor, mode)
+                final = os.fstat(file_descriptor)
+                if (int(final.st_dev), int(final.st_ino)) != (
+                    int(opened.st_dev),
+                    int(opened.st_ino),
+                ):
+                    raise InstallFailure(
+                        EXIT_PREFLIGHT, "receipt", "Managed receipt file changed identity"
+                    )
             finally:
                 os.close(file_descriptor)
-            if mode is not None:
-                os.chmod(temporary_name, mode, dir_fd=parent_descriptor, follow_symlinks=False)
-            temporary_identity = os.stat(
-                temporary_name, dir_fd=parent_descriptor, follow_symlinks=False
-            )
-            expected_inode = (int(temporary_identity.st_dev), int(temporary_identity.st_ino))
-            current_temp = os.stat(temporary_name, dir_fd=parent_descriptor, follow_symlinks=False)
-            if (int(current_temp.st_dev), int(current_temp.st_ino)) != expected_inode:
-                raise InstallFailure(
-                    EXIT_PREFLIGHT, "receipt", "Managed receipt file changed identity"
-                )
-            # Re-check the descriptor-bound entry while holding the directory
-            # transaction lock immediately before the rename.  Writers in
-            # this package use the same lock, so no lifecycle operation can
-            # substitute the temporary or destination between these checks.
-            current_temp = os.stat(temporary_name, dir_fd=parent_descriptor, follow_symlinks=False)
-            if (int(current_temp.st_dev), int(current_temp.st_ino)) != expected_inode:
-                raise InstallFailure(
-                    EXIT_PREFLIGHT, "receipt", "Managed receipt file changed identity"
-                )
-            _posix_rename_at(temporary_name, path.name, parent_descriptor, parent_descriptor)
-            current_target = os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
-            if (int(current_target.st_dev), int(current_target.st_ino)) != expected_inode:
-                raise InstallFailure(
-                    EXIT_PREFLIGHT, "receipt", "Managed receipt file changed identity"
-                )
     except InstallFailure:
         raise
     except (OSError, RuntimeError, ValueError) as exc:
@@ -1211,10 +1270,15 @@ def _write_atomic_at_parent(path: Path, data: bytes, mode: Optional[int] = None)
             EXIT_INSTALL, "receipt", "Install receipt could not be written"
         ) from exc
     finally:
-        if created_temp and "temporary_name" in locals() and parent_descriptor is not None:
+        if temporary_descriptor is not None:
             try:
-                _posix_unlink_at(parent_descriptor, temporary_name)
-            except (FileNotFoundError, OSError):
+                os.close(temporary_descriptor)
+            except OSError:
+                pass
+        if created_temp and temporary_path is not None:
+            try:
+                _unlink_receipt_owned(temporary_path)
+            except InstallFailure:
                 pass
         if parent_descriptor is not None:
             try:
@@ -1257,43 +1321,12 @@ def _posix_rename_at(
     """
     if os.name == "nt":
         raise OSError("POSIX descriptor rename is unavailable")
-    import ctypes
-
-    libc = ctypes.CDLL(None, use_errno=True)
-    try:
-        renameat = libc.renameat
-    except AttributeError as exc:
-        raise OSError("POSIX descriptor rename is unavailable") from exc
-    renameat.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p]
-    renameat.restype = ctypes.c_int
-    result = renameat(
-        int(source_descriptor),
-        os.fsencode(source_name),
-        int(destination_descriptor),
-        os.fsencode(destination_name),
+    _POSIX_RENAME(
+        source_name,
+        destination_name,
+        src_dir_fd=source_descriptor,
+        dst_dir_fd=destination_descriptor,
     )
-    if result != 0:
-        error = ctypes.get_errno()
-        raise OSError(error, os.strerror(error), destination_name)
-
-
-def _posix_unlink_at(parent_descriptor: int, name: str) -> None:
-    """Unlink a descriptor-relative name through libc, bypassing patched os APIs."""
-    if os.name == "nt":
-        raise OSError("POSIX descriptor unlink is unavailable")
-    import ctypes
-
-    libc = ctypes.CDLL(None, use_errno=True)
-    try:
-        unlinkat = libc.unlinkat
-    except AttributeError as exc:
-        raise OSError("POSIX descriptor unlink is unavailable") from exc
-    unlinkat.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
-    unlinkat.restype = ctypes.c_int
-    result = unlinkat(int(parent_descriptor), os.fsencode(name), 0)
-    if result != 0:
-        error = ctypes.get_errno()
-        raise OSError(error, os.strerror(error), name)
 
 
 def _replace_path(source: Path, destination: Path) -> None:
@@ -1401,6 +1434,7 @@ def _replace_receipt_owned(
         return
     source_descriptor = None
     destination_descriptor = None
+    source_file_descriptor = None
     try:
         _assert_receipt_path_safe(source)
         expected_source_parent = _directory_identity(source.parent, "uninstall")
@@ -1436,14 +1470,75 @@ def _replace_receipt_owned(
             _assert_receipt_name_identity(source, source_identity, "uninstall")
             _assert_receipt_file_identity(source, source_identity, "uninstall")
             _assert_receipt_file_identity_strict(source, source_identity, "uninstall")
+            # First move the selected name to a private tombstone in the same
+            # source directory.  If a final-name race substitutes an
+            # unowned file, the post-move identity check restores that file to
+            # its original name and fails closed; it is never promoted to the
+            # destination or deleted.
+            tombstone_name = ".%s.receipt-moved-%s" % (source.name, uuid.uuid4().hex)
             _posix_rename_at(
                 source.name,
-                destination.name,
+                tombstone_name,
                 source_descriptor,
-                destination_descriptor,
+                source_descriptor,
             )
+            moved_identity = _receipt_descriptor_identity(
+                source_descriptor, tombstone_name, "uninstall"
+            )
+            if moved_identity[:2] != source_identity[:2]:
+                _posix_rename_at(
+                    tombstone_name,
+                    source.name,
+                    source_descriptor,
+                    source_descriptor,
+                )
+                raise InstallFailure(
+                    EXIT_PREFLIGHT, "uninstall", "Managed receipt file changed identity"
+                )
+            source_file_descriptor = os.open(
+                tombstone_name,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=source_descriptor,
+            )
+            opened_source = os.fstat(source_file_descriptor)
+            if (int(opened_source.st_dev), int(opened_source.st_ino)) != source_identity[:2]:
+                raise InstallFailure(
+                    EXIT_PREFLIGHT, "uninstall", "Managed receipt file changed identity"
+                )
+            try:
+                os.stat(destination.name, dir_fd=destination_descriptor, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise InstallFailure(
+                    EXIT_PREFLIGHT, "uninstall", "Receipt destination already exists"
+                )
+            destination_file_descriptor = os.open(
+                destination.name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                stat.S_IMODE(opened_source.st_mode),
+                dir_fd=destination_descriptor,
+            )
+            try:
+                while True:
+                    chunk = os.read(source_file_descriptor, 1024 * 1024)
+                    if not chunk:
+                        break
+                    view = memoryview(chunk)
+                    while view:
+                        written = os.write(destination_file_descriptor, view)
+                        view = view[written:]
+                os.fchmod(destination_file_descriptor, stat.S_IMODE(opened_source.st_mode))
+                published = os.fstat(destination_file_descriptor)
+            finally:
+                os.close(destination_file_descriptor)
+            published_identity = (int(published.st_dev), int(published.st_ino))
+            if published_identity == source_identity[:2]:
+                raise InstallFailure(
+                    EXIT_PREFLIGHT, "uninstall", "Receipt destination identity was reused"
+                )
             _assert_receipt_descriptor_identity(
-                destination_descriptor, destination.name, source_identity[:2], "uninstall"
+                destination_descriptor, destination.name, published_identity, "uninstall"
             )
         _assert_physical_root(root, expected_identity)
     except InstallFailure:
@@ -1451,6 +1546,11 @@ def _replace_receipt_owned(
     except (OSError, RuntimeError, ValueError) as exc:
         raise InstallFailure(EXIT_INSTALL, "uninstall", "Install receipt move failed") from exc
     finally:
+        if source_file_descriptor is not None:
+            try:
+                os.close(source_file_descriptor)
+            except OSError:
+                pass
         if source_descriptor is not None:
             os.close(source_descriptor)
         if destination_descriptor is not None:
@@ -1487,7 +1587,19 @@ def _unlink_receipt_owned(path: Path) -> None:
             _assert_receipt_name_identity(path, expected_identity, "receipt")
             _assert_receipt_file_identity(path, expected_identity, "receipt")
             _assert_receipt_file_identity_strict(path, expected_identity, "receipt")
-            _posix_unlink_at(descriptor, path.name)
+            # POSIX cannot unlink a pathname conditional on an inode.  Move
+            # the selected name to a private tombstone and verify the moved
+            # inode instead.  A late swap therefore moves the foreign file to
+            # the tombstone, which is preserved, while the original name is
+            # restored before failing closed.
+            tombstone_name = ".%s.receipt-removed-%s" % (path.name, uuid.uuid4().hex)
+            _posix_rename_at(path.name, tombstone_name, descriptor, descriptor)
+            moved_identity = _receipt_descriptor_identity(descriptor, tombstone_name, "receipt")
+            if moved_identity[:2] != expected_identity[:2]:
+                _posix_rename_at(tombstone_name, path.name, descriptor, descriptor)
+                raise InstallFailure(
+                    EXIT_PREFLIGHT, "receipt", "Managed receipt file changed identity"
+                )
     except FileNotFoundError:
         return
     except InstallFailure:
