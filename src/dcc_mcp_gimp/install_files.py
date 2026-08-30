@@ -491,9 +491,14 @@ def _assert_physical_root(
             "profile",
             "GIMP profile path resolves through a link or changed identity",
         )
-    if root.exists() and (_is_link(root) or not root.is_dir()):
+    try:
+        exists = root.exists()
+        invalid_directory = exists and (_is_link(root) or not root.is_dir())
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise InstallFailure(EXIT_PREFLIGHT, "profile", "GIMP profile path is unavailable") from exc
+    if invalid_directory:
         raise InstallFailure(EXIT_PREFLIGHT, "profile", "GIMP profile path is not a directory")
-    if not root.exists():
+    if not exists:
         if expected_identity is not None:
             raise InstallFailure(EXIT_PREFLIGHT, "profile", "GIMP profile path changed identity")
         return None
