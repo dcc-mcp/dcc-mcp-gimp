@@ -452,10 +452,7 @@ def plan(
     if target.is_dir():
         target_identity = _target_identity(target)
         if receipt is not None:
-            try:
-                owned_file_identities = _owned_file_identities(target, receipt)
-            except InstallFailure:
-                owned_file_identities = None
+            owned_file_identities = _owned_file_identities(target, receipt)
     return {
         "schema_version": SCHEMA_VERSION,
         "status": "planned",
