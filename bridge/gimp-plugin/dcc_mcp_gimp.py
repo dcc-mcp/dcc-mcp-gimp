@@ -434,7 +434,7 @@ def _capture_bootstrap_error(stage: str, error: BaseException) -> None:
                     int(temporary_identity.st_ino),
                 ):
                     return
-                os.rename(
+                (os.replace if sys.platform == "darwin" else os.rename)(
                     temporary_name,
                     path.name,
                     src_dir_fd=parent_descriptor,
@@ -444,7 +444,9 @@ def _capture_bootstrap_error(stage: str, error: BaseException) -> None:
             finally:
                 if temporary_name is not None:
                     try:
-                        os.remove(temporary_name, dir_fd=parent_descriptor)
+                        (os.unlink if sys.platform == "darwin" else os.remove)(
+                            temporary_name, dir_fd=parent_descriptor
+                        )
                     except (FileNotFoundError, OSError):
                         pass
                 os.close(parent_descriptor)

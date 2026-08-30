@@ -1183,7 +1183,7 @@ def _write_atomic_at_parent(path: Path, data: bytes, mode: Optional[int] = None)
                 raise InstallFailure(
                     EXIT_PREFLIGHT, "receipt", "Managed receipt file changed identity"
                 )
-            os.rename(
+            (os.replace if sys.platform == "darwin" else os.rename)(
                 temporary_name,
                 path.name,
                 src_dir_fd=parent_descriptor,
@@ -1203,7 +1203,9 @@ def _write_atomic_at_parent(path: Path, data: bytes, mode: Optional[int] = None)
     finally:
         if created_temp and "temporary_name" in locals() and parent_descriptor is not None:
             try:
-                os.remove(temporary_name, dir_fd=parent_descriptor)
+                (os.unlink if sys.platform == "darwin" else os.remove)(
+                    temporary_name, dir_fd=parent_descriptor
+                )
             except (FileNotFoundError, OSError):
                 pass
         if parent_descriptor is not None:
@@ -1375,7 +1377,7 @@ def _replace_receipt_owned(
             _assert_receipt_name_identity(source, source_identity, "uninstall")
             _assert_receipt_file_identity(source, source_identity, "uninstall")
             _assert_receipt_file_identity_strict(source, source_identity, "uninstall")
-            os.rename(
+            (os.replace if sys.platform == "darwin" else os.rename)(
                 source.name,
                 destination.name,
                 src_dir_fd=source_descriptor,
@@ -1426,7 +1428,7 @@ def _unlink_receipt_owned(path: Path) -> None:
             _assert_receipt_name_identity(path, expected_identity, "receipt")
             _assert_receipt_file_identity(path, expected_identity, "receipt")
             _assert_receipt_file_identity_strict(path, expected_identity, "receipt")
-            os.remove(path.name, dir_fd=descriptor)
+            (os.unlink if sys.platform == "darwin" else os.remove)(path.name, dir_fd=descriptor)
     except FileNotFoundError:
         return
     except InstallFailure:
