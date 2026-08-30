@@ -136,9 +136,14 @@ Only `verify.directly_usable: true` proves the adapter is ready. A failed
 report includes `failure_stage`, `failure_reason`, and structured
 `next_steps[]`.
 
-The receipt is stored at `~/.dcc-mcp/receipts/gimp.json`. `status --json`
-classifies the profile as `fresh`, `current`, `upgrade`, `repair`, or
-`partial`.
+The receipt is stored at `~/.dcc-mcp/receipts/gimp.json`. This v1 contract
+allows one receipted GIMP profile per user: if `--destination` selects a
+different profile while that receipt exists, the operation fails closed with
+exit `10` and leaves the existing profile untouched. `status --json`
+classifies the selected profile as `fresh`, `current`, `upgrade`, `repair`, or
+`partial`. The receipt binds the complete owned manifest and the plug-in entry
+point executable bit (POSIX); a chmod-only drift is reported as `repair` or a
+failed artifact verification.
 
 ## Upgrade
 

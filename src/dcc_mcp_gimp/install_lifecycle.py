@@ -9,7 +9,13 @@ from typing import Any, Mapping, Optional
 from dcc_mcp_core.install_lifecycle import query_runtime_state, wait_for_sidecar_ready
 
 from .__version__ import __version__
-from .install_contract import _PLUGIN_NAME, SCHEMA_VERSION, InstallFailure, _version_tuple
+from .install_contract import (
+    _PLUGIN_NAME,
+    EXIT_PREFLIGHT,
+    SCHEMA_VERSION,
+    InstallFailure,
+    _version_tuple,
+)
 from .install_files import (
     _installation_state,
     _plugin_version,
@@ -311,11 +317,28 @@ def plan(
     python_value: Optional[Path],
     dcc_path: Optional[Path],
 ) -> dict[str, Any]:
-    root = (destination or default_plugin_dir()).expanduser().resolve()
+    try:
+        root = (destination or default_plugin_dir()).expanduser().resolve()
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise InstallFailure(
+            EXIT_PREFLIGHT,
+            "profile",
+            "GIMP profile path could not be resolved",
+        ) from exc
     executable = _resolve_gimp(dcc_path)
     python = _resolve_python(python_value, executable)
     gimp_version = _gimp_version(executable)
     versions = _target_versions(python)
+    receipt = _read_receipt()
+    if receipt is not None:
+        owner = receipt.get("destination")
+        if isinstance(owner, str) and os.path.normcase(owner) != os.path.normcase(str(root)):
+            raise InstallFailure(
+                EXIT_PREFLIGHT,
+                "receipt",
+                "An install receipt already belongs to another GIMP profile; "
+                "multi-profile installs are not supported",
+            )
     state = _installation_state(root)
     installed_version = _plugin_version(root / _PLUGIN_NAME / ("%s.py" % _PLUGIN_NAME))
     return {
