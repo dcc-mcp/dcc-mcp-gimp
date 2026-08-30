@@ -627,6 +627,28 @@ def test_install_returns_executable_next_steps_until_live_readiness(lifecycle_en
         str(lifecycle_env.plugins.resolve()),
     ):
         assert value in verify_command
+    assert report["next_steps"][0]["profile_selector"] == str(lifecycle_env.plugins.resolve())
+    assert report["next_steps"][0]["environment"]["GIMP3_DIRECTORY"] == str(
+        lifecycle_env.plugins.resolve().parent
+    )
+
+
+def test_install_readiness_is_bound_to_the_transaction_target(lifecycle_env, monkeypatch):
+    import dcc_mcp_gimp.install as install_module
+
+    captured = {}
+    original = install_module.verify_install
+
+    def wrapped(*args, **kwargs):
+        captured.update(kwargs)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(install_module, "verify_install", wrapped)
+    report, code, _ = install_module.run(["install", "--yes", *lifecycle_env.common])
+
+    assert code in {0, 50}
+    assert captured["expected_target_identity"] is not None
+    assert captured["expected_file_identities"]
 
 
 def test_next_steps_retain_explicit_instance_and_host_identity(lifecycle_env, monkeypatch):

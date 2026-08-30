@@ -318,6 +318,8 @@ def _next_steps(report: dict[str, Any]) -> list[dict[str, Any]]:
         launch.append("--appimage-extract-and-run")
     launch.append("--new-instance")
     selected_python = str(report["python"])
+    profile_directory = str(Path(report["destination"]).parent)
+    profile_environment = {"GIMP3_DIRECTORY": profile_directory}
     start_adapter = [selected_python, "-m", "dcc_mcp_gimp"]
     verify = [
         selected_python,
@@ -344,6 +346,8 @@ def _next_steps(report: dict[str, Any]) -> list[dict[str, Any]]:
                 "procedure starts automatically."
             ),
             "command": launch,
+            "environment": profile_environment,
+            "profile_selector": str(report["destination"]),
             "why": (
                 "A new process discovers the receipted plug-in without reusing a foreign instance."
             ),
@@ -352,12 +356,16 @@ def _next_steps(report: dict[str, Any]) -> list[dict[str, Any]]:
             "id": "start-selected-adapter",
             "description": "Start the adapter with the exact selected Python interpreter.",
             "command": start_adapter,
+            "environment": profile_environment,
+            "profile_selector": str(report["destination"]),
             "why": "The adapter must register before the exact readiness probe can run.",
         },
         {
             "id": "verify-selected-gimp",
             "description": "Verify the exact selected GIMP instance and authenticated bridge.",
             "command": verify,
+            "environment": profile_environment,
+            "profile_selector": str(report["destination"]),
             "why": (
                 "A typed PID-, origin-, endpoint-, and instance-bound probe is required before use."
             ),
@@ -452,7 +460,12 @@ def plan(
 
 
 def doctor(destination: Optional[Path] = None) -> dict[str, object]:
-    root = (destination or default_plugin_dir()).expanduser().resolve()
+    root = (destination or default_plugin_dir()).expanduser().absolute()
+    physical_error: Optional[str] = None
+    try:
+        _assert_physical_root(root)
+    except InstallFailure as exc:
+        physical_error = str(exc)
     script = root / _PLUGIN_NAME / ("%s.py" % _PLUGIN_NAME)
     roots = [
         str(Path(item).expanduser().resolve())
@@ -472,7 +485,7 @@ def doctor(destination: Optional[Path] = None) -> dict[str, object]:
     installed_version = _plugin_version(script) if script.is_file() else None
     version_matches = installed_version == __version__
     return {
-        "ready": script.is_file() and version_matches,
+        "ready": physical_error is None and script.is_file() and version_matches,
         "destination": str(root),
         "plugin_script": str(script),
         "plugin_script_exists": script.is_file(),
@@ -485,4 +498,5 @@ def doctor(destination: Optional[Path] = None) -> dict[str, object]:
         "token_file_exists": token_file.is_file(),
         "bootstrap_errors": _bootstrap_error_summary(),
         "restart_required_after_install": True,
+        "physical_path_error": physical_error,
     }

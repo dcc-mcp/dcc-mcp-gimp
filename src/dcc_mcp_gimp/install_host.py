@@ -207,11 +207,71 @@ def _bootstrap_error_path() -> Path:
     return Path.home().joinpath(".dcc-mcp", "gimp-bootstrap-errors.jsonl").absolute()
 
 
+def _read_bootstrap_bytes(path: Path) -> tuple[bytes, int]:
+    """Read a bootstrap log through a no-follow descriptor and bounded tail."""
+    try:
+        before = os.lstat(str(path))
+        if not stat.S_ISREG(before.st_mode) or _path_is_link_or_reparse(path):
+            raise InstallFailure(EXIT_PREFLIGHT, "bootstrap", "Bootstrap error path is linked")
+        if _parent_has_reparse(path):
+            raise InstallFailure(
+                EXIT_PREFLIGHT, "bootstrap", "Bootstrap error parent is linked or reparse"
+            )
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        parent_descriptor = None
+        lease = (
+            _windows_executable_lease(path, "bootstrap")
+            if os.name == "nt"
+            else contextlib.nullcontext()
+        )
+        with lease:
+            if _parent_has_reparse(path):
+                raise InstallFailure(
+                    EXIT_PREFLIGHT, "bootstrap", "Bootstrap error parent is linked or reparse"
+                )
+            if os.name == "nt":
+                descriptor = os.open(str(path), flags)
+            else:
+                parent_descriptor = os.open(
+                    str(path.parent),
+                    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+                )
+                descriptor = os.open(path.name, flags, dir_fd=parent_descriptor)
+        try:
+            opened = os.fstat(descriptor)
+            if (int(opened.st_dev), int(opened.st_ino)) != (
+                int(before.st_dev),
+                int(before.st_ino),
+            ) or not stat.S_ISREG(opened.st_mode):
+                raise InstallFailure(
+                    EXIT_PREFLIGHT, "bootstrap", "Bootstrap error path changed identity"
+                )
+            total_bytes = int(opened.st_size)
+            os.lseek(descriptor, max(0, total_bytes - _MAX_BOOTSTRAP_LOG_BYTES), os.SEEK_SET)
+            bounded = os.read(descriptor, _MAX_BOOTSTRAP_LOG_BYTES)
+            after = os.fstat(descriptor)
+            if (int(after.st_dev), int(after.st_ino)) != (int(before.st_dev), int(before.st_ino)):
+                raise InstallFailure(
+                    EXIT_PREFLIGHT, "bootstrap", "Bootstrap error path changed identity"
+                )
+            return bounded, total_bytes
+        finally:
+            os.close(descriptor)
+            if parent_descriptor is not None:
+                os.close(parent_descriptor)
+    except InstallFailure:
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise InstallFailure(
+            EXIT_PREFLIGHT, "bootstrap", "Bootstrap error log is unavailable"
+        ) from exc
+
+
 def _bootstrap_error_summary() -> dict[str, Any]:
     path = _bootstrap_error_path()
     records = []
     try:
-        linked = _path_is_link_or_reparse(path)
+        linked = _path_is_link_or_reparse(path) or _parent_has_reparse(path)
         is_file = path.is_file()
     except (OSError, RuntimeError, ValueError) as exc:
         return {
@@ -229,39 +289,35 @@ def _bootstrap_error_summary() -> dict[str, Any]:
         }
     if is_file:
         try:
-            with path.open("rb") as stream:
-                stream.seek(0, os.SEEK_END)
-                total_bytes = stream.tell()
-                offset = max(0, total_bytes - _MAX_BOOTSTRAP_LOG_BYTES)
-                stream.seek(offset)
-                bounded = stream.read(_MAX_BOOTSTRAP_LOG_BYTES)
-                lines = bounded.splitlines(keepends=True)
-                if offset and b"\n" in bounded and len(lines) > 1:
-                    lines = lines[1:]
-                for raw_line in lines[-_MAX_BOOTSTRAP_RECORDS:]:
-                    if not raw_line:
-                        continue
-                    oversized = len(
-                        raw_line
-                    ) > _MAX_BOOTSTRAP_RECORD_BYTES or not raw_line.endswith(b"\n")
-                    line = raw_line[:_MAX_BOOTSTRAP_RECORD_BYTES].decode("utf-8", errors="replace")
-                    if oversized:
-                        records.append(
-                            {
-                                "stage": "unknown",
-                                "message": line[:_MAX_BOOTSTRAP_RECORD_BYTES],
-                                "truncated": True,
-                            }
-                        )
-                        continue
-                    try:
-                        record = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if isinstance(record, dict):
-                        if isinstance(record.get("message"), str):
-                            record["message"] = record["message"][:_MAX_BOOTSTRAP_RECORD_BYTES]
-                        records.append(record)
+            bounded, total_bytes = _read_bootstrap_bytes(path)
+            offset = max(0, total_bytes - _MAX_BOOTSTRAP_LOG_BYTES)
+            lines = bounded.splitlines(keepends=True)
+            if offset and b"\n" in bounded and len(lines) > 1:
+                lines = lines[1:]
+            for raw_line in lines[-_MAX_BOOTSTRAP_RECORDS:]:
+                if not raw_line:
+                    continue
+                oversized = len(raw_line) > _MAX_BOOTSTRAP_RECORD_BYTES or not raw_line.endswith(
+                    b"\n"
+                )
+                line = raw_line[:_MAX_BOOTSTRAP_RECORD_BYTES].decode("utf-8", errors="replace")
+                if oversized:
+                    records.append(
+                        {
+                            "stage": "unknown",
+                            "message": line[:_MAX_BOOTSTRAP_RECORD_BYTES],
+                            "truncated": True,
+                        }
+                    )
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(record, dict):
+                    if isinstance(record.get("message"), str):
+                        record["message"] = record["message"][:_MAX_BOOTSTRAP_RECORD_BYTES]
+                    records.append(record)
         except (OSError, RuntimeError, ValueError) as exc:
             return {
                 "path": str(path),
