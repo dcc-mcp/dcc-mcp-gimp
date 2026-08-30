@@ -1845,7 +1845,12 @@ def _copy_validated_recovery(
     # pathname swap must not be able to redirect copytree writes into an
     # attacker-controlled junction.  The final move remains identity-bound
     # and fails closed if the destination is on another filesystem.
-    staging_parent = Path(tempfile.gettempdir())
+    try:
+        staging_parent = Path(tempfile.gettempdir()).resolve(strict=True)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise InstallFailure(
+            EXIT_PREFLIGHT, "recovery", "Recovery staging parent is unavailable"
+        ) from exc
     _assert_path_components_safe(staging_parent, "recovery")
     staging_parent_identity = _directory_identity(staging_parent, "recovery")
     try:
