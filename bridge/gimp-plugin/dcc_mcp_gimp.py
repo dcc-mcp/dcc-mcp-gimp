@@ -133,7 +133,10 @@ def _windows_object_handle(path: Path, *, access: int = 0x80):
         0x1 | 0x2,
         None,
         3,
-        0x02000000,
+        # FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT:
+        # inspect the named object itself and never traverse a swapped
+        # junction/reparse point while holding the lease.
+        0x02000000 | 0x00200000,
         None,
     )
     invalid = ctypes.c_void_p(-1).value
@@ -142,7 +145,7 @@ def _windows_object_handle(path: Path, *, access: int = 0x80):
     try:
         if _path_is_link_or_reparse(path):
             raise OSError("bootstrap file is linked")
-        yield
+        yield handle
     finally:
         kernel32.CloseHandle(handle)
 
@@ -190,7 +193,9 @@ def _windows_rename_by_handle(
             ctypes.c_uint32,
         ]
         kernel32.SetFileInformationByHandle.restype = ctypes.c_int
-        if not kernel32.SetFileInformationByHandle(handle, 3, payload, len(payload)):
+        if not kernel32.SetFileInformationByHandle(
+            handle, 3, ctypes.byref(payload), ctypes.sizeof(payload)
+        ):
             raise OSError(ctypes.get_last_error(), "bootstrap rename failed")
 
     bound_handle = _BOOTSTRAP_RENAME_HANDLE

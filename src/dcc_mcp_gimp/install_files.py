@@ -400,12 +400,23 @@ def _object_identity(path: Path, stage: str) -> tuple[int, int, int, int, int, i
     )
 
 
-def _windows_rename_by_handle(source: Path, destination: Path, *, replace: bool = False) -> None:
+def _windows_rename_by_handle(
+    source: Path,
+    destination: Path,
+    *,
+    replace: bool = False,
+    _bound_handle: Any = None,
+) -> None:
     """Rename a child through its held handle, preventing pathname swaps."""
     import ctypes
 
     source_before = _object_identity(source, "install")
-    with _windows_object_handle(source, "install", access=0x00010000 | 0x80) as source_handle:
+    handle_context = (
+        contextlib.nullcontext(_bound_handle)
+        if _bound_handle is not None
+        else _windows_object_handle(source, "install", access=0x00010000 | 0x80)
+    )
+    with handle_context as source_handle:
         if _object_identity(source, "install") != source_before:
             raise InstallFailure(EXIT_PREFLIGHT, "install", "Managed path changed identity")
         _assert_path_components_safe(destination, "install")
@@ -1206,6 +1217,7 @@ def _replace_receipt_owned(
                 _assert_receipt_parent_identity(source, source_parent_identity)
                 _assert_receipt_file_identity(source, source_identity, "uninstall")
                 _assert_receipt_name_identity(source, source_identity, "uninstall")
+                _assert_receipt_file_identity(source, source_identity, "uninstall")
                 if (
                     _directory_identity(destination.parent, "uninstall")
                     != destination_parent_identity
@@ -1217,7 +1229,15 @@ def _replace_receipt_owned(
                 _assert_physical_root(root, expected_identity)
                 _assert_receipt_path_safe(source)
                 if os.name == "nt" and _replace_path is _DEFAULT_REPLACE_PATH:
-                    _windows_rename_by_handle(source, destination, replace=False)
+                    with _windows_object_handle(
+                        source, "uninstall", access=0x00010000 | 0x80
+                    ) as source_handle:
+                        _windows_rename_by_handle(
+                            source,
+                            destination,
+                            replace=False,
+                            _bound_handle=source_handle,
+                        )
                 else:
                     _replace_path(source, destination)
                 _assert_receipt_file_identity(destination, source_identity[:2], "uninstall")
@@ -1242,6 +1262,7 @@ def _replace_receipt_owned(
         )
         _assert_receipt_file_identity(source, source_identity, "uninstall")
         _assert_receipt_name_identity(source, source_identity, "uninstall")
+        _assert_receipt_file_identity(source, source_identity, "uninstall")
         os.replace(
             source.name,
             destination.name,
@@ -1278,7 +1299,9 @@ def _unlink_receipt_owned(path: Path) -> None:
             _assert_receipt_parent_identity(path, parent_identity)
             _assert_receipt_file_identity(path, expected_identity, "receipt")
             _assert_receipt_name_identity(path, expected_identity, "receipt")
-            path.unlink(missing_ok=True)
+            _assert_receipt_file_identity(path, expected_identity, "receipt")
+            with _windows_object_handle(path, "receipt", access=0x00010000 | 0x80) as handle:
+                _windows_delete_handle(handle)
         return
     descriptor = None
     try:
@@ -1287,6 +1310,7 @@ def _unlink_receipt_owned(path: Path) -> None:
         _assert_receipt_descriptor_identity(descriptor, path.name, expected_identity, "receipt")
         _assert_receipt_file_identity(path, expected_identity, "receipt")
         _assert_receipt_name_identity(path, expected_identity, "receipt")
+        _assert_receipt_file_identity(path, expected_identity, "receipt")
         os.unlink(path.name, dir_fd=descriptor)
     except FileNotFoundError:
         return
@@ -1451,6 +1475,25 @@ def _cleanup_private_tree(
                 )
                 _assert_private_tree_identities(path, expected, stage)
                 _windows_remove_tree(path, stage, expected=expected)
+                return {"success": True, "requires_restart": False}
+            if (
+                os.name != "nt"
+                and _cleanup_tree is _DEFAULT_CLEANUP_TREE
+                and safe_remove_tree is _DEFAULT_SAFE_REMOVE_TREE
+            ):
+                parent_descriptor = _open_absolute_dir_nofollow(path.parent)
+                try:
+                    parent_details = os.fstat(parent_descriptor)
+                    if (int(parent_details.st_dev), int(parent_details.st_ino)) != parent_identity:
+                        raise InstallFailure(
+                            EXIT_PREFLIGHT, stage, "Managed directory changed identity"
+                        )
+                    try:
+                        _remove_entry_at(parent_descriptor, path.name)
+                    except FileNotFoundError:
+                        return {"success": True, "requires_restart": False}
+                finally:
+                    os.close(parent_descriptor)
                 return {"success": True, "requires_restart": False}
             result = _cleanup_tree(path)
     except BaseException as exc:
@@ -1798,12 +1841,26 @@ def _copy_validated_recovery(
     expected = _recovery_manifest(source)
     destination_parent = recovery.parent
     destination_parent_identity = _directory_identity(destination_parent, "recovery")
-    staging_parent = destination_parent.parent
+    # Keep the snapshot outside the destination tree.  A destination-parent
+    # pathname swap must not be able to redirect copytree writes into an
+    # attacker-controlled junction.  The final move remains identity-bound
+    # and fails closed if the destination is on another filesystem.
+    staging_parent = Path(tempfile.gettempdir())
     _assert_path_components_safe(staging_parent, "recovery")
     staging_parent_identity = _directory_identity(staging_parent, "recovery")
-    staging_root = Path(tempfile.mkdtemp(prefix=".dcc-mcp-gimp-recovery-", dir=str(staging_parent)))
+    try:
+        staging_root = Path(
+            tempfile.mkdtemp(prefix=".dcc-mcp-gimp-recovery-", dir=str(staging_parent))
+        )
+    except OSError as exc:
+        raise InstallFailure(
+            EXIT_INSTALL, "recovery", "Recovery staging directory could not be created"
+        ) from exc
     if _directory_identity(staging_parent, "recovery") != staging_parent_identity:
-        shutil.rmtree(staging_root, ignore_errors=True)
+        try:
+            _cleanup_private_tree(staging_root, "recovery")
+        except InstallFailure:
+            pass
         raise InstallFailure(EXIT_PREFLIGHT, "recovery", "Recovery staging parent changed identity")
     staged_recovery = staging_root / recovery.name
     try:
@@ -1812,11 +1869,18 @@ def _copy_validated_recovery(
         # a junction or foreign directory.
         shutil.copytree(source, staged_recovery, symlinks=True, copy_function=shutil.copy2)
     except OSError as exc:
-        shutil.rmtree(staging_root, ignore_errors=True)
+        try:
+            _cleanup_private_tree(staging_root, "recovery")
+        except InstallFailure:
+            pass
         raise InstallFailure(
             EXIT_INSTALL, "recovery", "Recovery snapshot could not be created"
         ) from exc
     try:
+        if _directory_identity(staging_parent, "recovery") != staging_parent_identity:
+            raise InstallFailure(
+                EXIT_PREFLIGHT, "recovery", "Recovery staging parent changed identity"
+            )
         if owner_root is not None:
             _assert_physical_root(owner_root, expected_identity)
         if _recovery_manifest(staged_recovery) != expected:
@@ -1851,7 +1915,13 @@ def _copy_validated_recovery(
             EXIT_INSTALL, "recovery", "Recovery snapshot validation failed"
         ) from exc
     finally:
-        shutil.rmtree(staging_root, ignore_errors=True)
+        try:
+            _cleanup_private_tree(staging_root, "recovery")
+        except InstallFailure:
+            # Never follow an untrusted staging pathname during cleanup.  A
+            # failed identity proof leaves the private temporary for manual
+            # cleanup instead of risking deletion outside the transaction.
+            pass
 
 
 def _replace_plugin(root: Path) -> Path:

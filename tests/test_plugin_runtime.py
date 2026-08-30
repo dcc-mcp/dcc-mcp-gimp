@@ -192,6 +192,19 @@ def test_runtime_windows_bootstrap_rotation_rejects_temp_swap(runtime, tmp_path,
     assert b"new failure" not in errors.read_bytes()
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Exercises Windows bootstrap handle rotation")
+def test_runtime_windows_bootstrap_rotation_publishes_new_record(runtime, tmp_path, monkeypatch):
+    errors = tmp_path / "bootstrap-errors.jsonl"
+    errors.write_bytes(b"x" * (260 * 1024))
+    monkeypatch.setenv("DCC_MCP_GIMP_BOOTSTRAP_ERRORS", str(errors))
+
+    runtime["_capture_bootstrap_error"]("bridge-startup", RuntimeError("fresh failure"))
+
+    payload = errors.read_bytes()
+    assert len(payload) <= 256 * 1024
+    assert b"fresh failure" in payload
+
+
 def test_plugin_captures_gi_import_failure(tmp_path, monkeypatch):
     errors = tmp_path / "bootstrap-errors.jsonl"
     monkeypatch.setenv("DCC_MCP_GIMP_BOOTSTRAP_ERRORS", str(errors))

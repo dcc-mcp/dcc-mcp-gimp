@@ -292,20 +292,36 @@ def verify_install(
             failure_reason="Selected GIMP registry entry omitted its instance id",
         )
         return result
-    readiness = wait_for_sidecar_ready(
-        os.environ.get("DCC_MCP_REGISTRY_DIR"),
-        dcc_type="gimp",
-        instance_id=selected_instance,
-        timeout_secs=max(0.05, timeout),
-        poll_interval_secs=min(max(0.05, timeout), 0.1),
-        probe_tool=_READINESS_TOOL,
-        probe_timeout_secs=max(0.05, timeout),
-    )
+    try:
+        readiness = wait_for_sidecar_ready(
+            os.environ.get("DCC_MCP_REGISTRY_DIR"),
+            dcc_type="gimp",
+            instance_id=selected_instance,
+            timeout_secs=max(0.05, timeout),
+            poll_interval_secs=min(max(0.05, timeout), 0.1),
+            probe_tool=_READINESS_TOOL,
+            probe_timeout_secs=max(0.05, timeout),
+        )
+    except Exception:
+        readiness = {
+            "success": False,
+            "message": "GIMP sidecar readiness probe failed",
+        }
     result["readiness"] = readiness
-    if not readiness.get("success"):
+    if not isinstance(readiness, Mapping):
         result.update(
             failure_stage="readiness",
-            failure_reason=readiness.get("message", "Typed GIMP readiness probe failed"),
+            failure_reason="GIMP sidecar readiness payload is invalid",
+        )
+        return result
+    if readiness.get("success") is not True:
+        result.update(
+            failure_stage="readiness",
+            failure_reason=(
+                readiness.get("message")
+                if isinstance(readiness.get("message"), str)
+                else "Typed GIMP readiness probe failed"
+            ),
         )
         return result
     failure = _runtime_identity_failure(
