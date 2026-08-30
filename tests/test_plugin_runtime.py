@@ -171,12 +171,13 @@ def test_runtime_bootstrap_concurrent_writers_remain_bounded(runtime, tmp_path, 
     assert errors.stat().st_size <= 256 * 1024
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Exercises POSIX bootstrap publication")
 def test_runtime_bootstrap_rotation_ignores_swapped_python_rename(runtime, tmp_path, monkeypatch):
     errors = tmp_path / "bootstrap-errors.jsonl"
-    errors.write_bytes((b'{"stage":"old"}\n' * 400))
+    errors.write_bytes((b'{"stage":"old"}\n' * 20000))
     monkeypatch.setenv("DCC_MCP_GIMP_BOOTSTRAP_ERRORS", str(errors))
     capture = runtime["_capture_bootstrap_error"]
-    original_rename = os.rename
+    original_link = capture.__globals__["_BOOTSTRAP_POSIX_LINK"]
     swapped = False
 
     def race(source, destination, *args, **kwargs):
@@ -192,14 +193,16 @@ def test_runtime_bootstrap_rotation_ignores_swapped_python_rename(runtime, tmp_p
                 foreign.write_bytes(b"FOREIGN\n")
                 foreign.rename(temporary)
                 swapped = True
-        return original_rename(source, destination, *args, **kwargs)
+        return original_link(source, destination, *args, **kwargs)
 
-    monkeypatch.setattr(os, "rename", race)
-    monkeypatch.setattr(os, "replace", race)
+    monkeypatch.setitem(capture.__globals__, "_BOOTSTRAP_POSIX_LINK", race)
     capture("rotation", RuntimeError("probe"))
 
-    assert not swapped
+    assert swapped
     assert b"FOREIGN\n" not in errors.read_bytes()
+    assert any(
+        item.read_bytes() == b"FOREIGN\n" for item in errors.parent.iterdir() if item.is_file()
+    )
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Exercises POSIX bootstrap rotation")

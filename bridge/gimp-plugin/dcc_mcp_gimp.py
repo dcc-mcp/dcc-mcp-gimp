@@ -28,6 +28,7 @@ _BOOTSTRAP_RENAME_EXPECTED: Optional[tuple[int, int]] = None
 _BOOTSTRAP_RENAME_HANDLE: Any = None
 _BOOTSTRAP_POSIX_RENAME = os.rename
 _BOOTSTRAP_POSIX_UNLINK = os.unlink
+_BOOTSTRAP_POSIX_LINK = os.link
 
 
 def _path_is_link_or_reparse(path: Path) -> bool:
@@ -248,6 +249,35 @@ def _windows_create_new_file(path: Path, mode: int = 0o666) -> int:
     return descriptor
 
 
+def _windows_delete_handle(handle: Any) -> None:
+    import ctypes
+
+    class _FileDisposition(ctypes.Structure):
+        _fields_ = [("delete_file", ctypes.c_ubyte)]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.SetFileInformationByHandle.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+    ]
+    kernel32.SetFileInformationByHandle.restype = ctypes.c_int
+    if not kernel32.SetFileInformationByHandle(handle, 4, ctypes.byref(_FileDisposition(1)), 1):
+        raise OSError(ctypes.get_last_error(), "bootstrap delete failed")
+
+
+def _delete_bootstrap_owned(path: Path, expected_identity: tuple[int, int]) -> None:
+    """Delete a Windows bootstrap temp through its identity-bound handle."""
+    with _windows_object_handle(path, access=0x00010000 | 0x80) as handle:
+        if _bootstrap_object_identity(path) != tuple(expected_identity)[:2]:
+            raise OSError("bootstrap temporary changed identity")
+        if os.name == "nt":
+            _windows_delete_handle(handle)
+        else:
+            path.unlink()
+
+
 def _bootstrap_error_path() -> Path:
     configured = os.environ.get("DCC_MCP_GIMP_BOOTSTRAP_ERRORS")
     if configured:
@@ -277,6 +307,36 @@ def _capture_bootstrap_error(stage: str, error: BaseException) -> None:
     # the original primitives captured before any caller can replace os APIs.
     posix_rename = globals().get("_BOOTSTRAP_POSIX_RENAME", os.rename)
     posix_unlink = globals().get("_BOOTSTRAP_POSIX_UNLINK", os.unlink)
+    posix_link = globals().get("_BOOTSTRAP_POSIX_LINK", os.link)
+
+    def unlink_bound(name: str, expected: tuple[int, int]) -> None:
+        """Remove a descriptor-relative name without consuming a swap."""
+        cleanup_name = ".%s.bootstrap-cleanup-%s" % (name, uuid.uuid4().hex)
+        try:
+            posix_rename(
+                name,
+                cleanup_name,
+                src_dir_fd=parent_descriptor,
+                dst_dir_fd=parent_descriptor,
+            )
+        except FileNotFoundError:
+            return
+        moved = os.stat(cleanup_name, dir_fd=parent_descriptor, follow_symlinks=False)
+        moved_identity = (int(moved.st_dev), int(moved.st_ino))
+        if moved_identity != tuple(expected)[:2]:
+            try:
+                posix_link(
+                    cleanup_name,
+                    name,
+                    src_dir_fd=parent_descriptor,
+                    dst_dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+            except OSError:
+                pass
+            raise OSError("bootstrap object changed identity")
+        posix_unlink(cleanup_name, dir_fd=parent_descriptor)
+
     try:
         # Serialize all readers/writers in this process.  Without this lock,
         # concurrent startup failures can each observe the old size and append
@@ -363,7 +423,7 @@ def _capture_bootstrap_error(stage: str, error: BaseException) -> None:
                         _BOOTSTRAP_RENAME_EXPECTED = None
                         try:
                             if _bootstrap_object_identity(temporary) == temporary_identity:
-                                temporary.unlink()
+                                _delete_bootstrap_owned(temporary, temporary_identity)
                         except (FileNotFoundError, OSError):
                             pass
                 return
@@ -441,22 +501,22 @@ def _capture_bootstrap_error(stage: str, error: BaseException) -> None:
                     0o666,
                     dir_fd=parent_descriptor,
                 )
-                temporary_identity = None
+                temporary_opened = os.fstat(temporary_descriptor)
+                temporary_identity = (
+                    int(temporary_opened.st_dev),
+                    int(temporary_opened.st_ino),
+                )
                 backup_name = ".%s.bootstrap-backup-%s" % (path.name, uuid.uuid4().hex)
                 backup_identity = None
                 committed = False
+                publication_succeeded = False
                 try:
                     try:
                         write_all(temporary_descriptor, payload)
                         os.fsync(temporary_descriptor)
-                        temporary_details = os.fstat(temporary_descriptor)
-                        temporary_identity = (
-                            int(temporary_details.st_dev),
-                            int(temporary_details.st_ino),
-                        )
                     except BaseException:
                         try:
-                            posix_unlink(temporary_name, dir_fd=parent_descriptor)
+                            unlink_bound(temporary_name, temporary_identity)
                         except OSError:
                             pass
                         raise
@@ -478,17 +538,19 @@ def _capture_bootstrap_error(stage: str, error: BaseException) -> None:
                     )
                     if backup_identity != (int(details.st_dev), int(details.st_ino)):
                         raise OSError("bootstrap log changed identity")
-                    posix_rename(
+                    posix_link(
                         temporary_name,
                         path.name,
                         src_dir_fd=parent_descriptor,
                         dst_dir_fd=parent_descriptor,
+                        follow_symlinks=False,
                     )
                     committed = True
                     published = os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
                     if (int(published.st_dev), int(published.st_ino)) != temporary_identity:
                         raise OSError("bootstrap temporary changed identity")
                     os.fsync(parent_descriptor)
+                    publication_succeeded = True
                 except BaseException:
                     if committed and temporary_identity is not None:
                         try:
@@ -516,19 +578,34 @@ def _capture_bootstrap_error(stage: str, error: BaseException) -> None:
                                 pass
                     if backup_identity is not None:
                         try:
-                            posix_rename(
-                                backup_name,
-                                path.name,
-                                src_dir_fd=parent_descriptor,
-                                dst_dir_fd=parent_descriptor,
-                            )
-                            backup_identity = None
+                            os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
                         except OSError:
-                            pass
+                            try:
+                                posix_link(
+                                    backup_name,
+                                    path.name,
+                                    src_dir_fd=parent_descriptor,
+                                    dst_dir_fd=parent_descriptor,
+                                    follow_symlinks=False,
+                                )
+                                backup_current = os.stat(
+                                    path.name,
+                                    dir_fd=parent_descriptor,
+                                    follow_symlinks=False,
+                                )
+                                if (
+                                    int(backup_current.st_dev),
+                                    int(backup_current.st_ino),
+                                ) != backup_identity:
+                                    raise OSError("bootstrap backup changed identity")
+                                unlink_bound(backup_name, backup_identity)
+                                backup_identity = None
+                            except OSError:
+                                pass
                     raise
                 finally:
                     try:
-                        if backup_identity is not None:
+                        if publication_succeeded and backup_identity is not None:
                             backup_current = os.stat(
                                 backup_name, dir_fd=parent_descriptor, follow_symlinks=False
                             )
@@ -536,7 +613,7 @@ def _capture_bootstrap_error(stage: str, error: BaseException) -> None:
                                 int(backup_current.st_dev),
                                 int(backup_current.st_ino),
                             ) == backup_identity:
-                                posix_unlink(backup_name, dir_fd=parent_descriptor)
+                                unlink_bound(backup_name, backup_identity)
                     except OSError:
                         pass
                     try:
@@ -551,7 +628,7 @@ def _capture_bootstrap_error(stage: str, error: BaseException) -> None:
                             int(temporary_current.st_ino),
                         ) == temporary_identity:
                             try:
-                                posix_unlink(temporary_name, dir_fd=parent_descriptor)
+                                unlink_bound(temporary_name, temporary_identity)
                             except OSError:
                                 pass
             finally:
