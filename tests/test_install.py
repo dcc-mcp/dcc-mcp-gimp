@@ -12,6 +12,7 @@ from jsonschema import Draft202012Validator
 
 from dcc_mcp_gimp.__version__ import __version__
 from dcc_mcp_gimp.install import doctor, install
+from dcc_mcp_gimp.install_contract import InstallFailure
 
 
 def _target_metadata(python_path):
@@ -171,6 +172,25 @@ def test_doctor_rejects_a_stale_installed_plugin_version(tmp_path):
     assert result["installed_adapter_version"] == "0.0.0"
     assert result["expected_adapter_version"] == __version__
     assert result["version_matches"] is False
+
+
+def test_doctor_rejects_linked_plugin_child(tmp_path, monkeypatch):
+    from dcc_mcp_gimp import install_files
+
+    root = tmp_path / "plugins"
+    target = install(root)
+    script = target / "dcc_mcp_gimp.py"
+    original = install_files._is_link
+    monkeypatch.setattr(
+        "dcc_mcp_gimp.install_lifecycle._is_link",
+        lambda path: path in {target, script} or original(path),
+    )
+
+    result = doctor(root)
+
+    assert result["ready"] is False
+    assert result["physical_path_error"] == "Managed GIMP plug-in path is linked"
+    assert result["plugin_script_exists"] is False
 
 
 def test_status_preflight_records_gimp_profile_and_target_interpreter(lifecycle_env):
@@ -1010,6 +1030,108 @@ def test_uninstall_root_swap_does_not_write_foreign_recovery(lifecycle_env, monk
     assert code != 0, report
     assert (destination / "sentinel.txt").read_text(encoding="utf-8") == "keep"
     assert foreign_receipt is not None and not foreign_receipt.exists()
+
+
+def test_receipt_child_identity_swap_fails_closed(monkeypatch, tmp_path):
+    from dcc_mcp_gimp import install_files
+
+    source = tmp_path / "receipt.json"
+    parked = tmp_path / "receipt.owned"
+    foreign = tmp_path / "foreign.json"
+    source.write_bytes(b"owned")
+    foreign.write_bytes(b"FOREIGN")
+    original = install_files._assert_receipt_file_identity
+    swapped = False
+
+    def late(path, expected, stage="receipt"):
+        nonlocal swapped
+        result = original(path, expected, stage)
+        if path == source and not swapped:
+            source.rename(parked)
+            foreign.rename(source)
+            swapped = True
+        return result
+
+    monkeypatch.setattr(install_files, "_assert_receipt_file_identity", late)
+    with pytest.raises(InstallFailure, match="identity"):
+        install_files._unlink_receipt_owned(source)
+    assert source.read_bytes() == b"FOREIGN"
+    assert parked.read_bytes() == b"owned"
+
+
+def test_receipt_move_identity_swap_fails_closed(monkeypatch, tmp_path):
+    from dcc_mcp_gimp import install_files
+
+    source = tmp_path / "source.json"
+    parked = tmp_path / "source.owned"
+    foreign = tmp_path / "foreign.json"
+    destination = tmp_path / "quarantine.json"
+    source.write_bytes(b"owned")
+    foreign.write_bytes(b"FOREIGN")
+    original = install_files._assert_receipt_file_identity
+    swapped = False
+
+    def late(path, expected, stage="receipt"):
+        nonlocal swapped
+        result = original(path, expected, stage)
+        if path == source and not swapped:
+            source.rename(parked)
+            foreign.rename(source)
+            swapped = True
+        return result
+
+    monkeypatch.setattr(install_files, "_assert_receipt_file_identity", late)
+    with pytest.raises(InstallFailure, match="identity"):
+        install_files._replace_receipt_owned(source, destination, tmp_path, None)
+    assert source.read_bytes() == b"FOREIGN"
+    assert parked.read_bytes() == b"owned"
+    assert not destination.exists()
+
+
+def test_recovery_copy_destination_swap_does_not_write_external(tmp_path, monkeypatch):
+    from dcc_mcp_gimp import install_files
+
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "owned.txt").write_text("owned", encoding="utf-8")
+    destination_parent = tmp_path / "transaction" / "snapshot"
+    destination_parent.mkdir(parents=True)
+    recovery = destination_parent / "dcc_mcp_gimp"
+    external = tmp_path / "external"
+    external.mkdir()
+    parked = tmp_path / "snapshot-owned"
+    original = install_files.shutil.copytree
+    swapped = False
+
+    def race(src, dst, *args, **kwargs):
+        nonlocal swapped
+        if not swapped:
+            destination_parent.rename(parked)
+            destination_parent.symlink_to(external, target_is_directory=True)
+            swapped = True
+        return original(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(install_files.shutil, "copytree", race)
+    with pytest.raises(InstallFailure):
+        install_files._copy_validated_recovery(source, recovery)
+    assert swapped
+    assert not (external / "dcc_mcp_gimp" / "owned.txt").exists()
+
+
+def test_verify_runtime_shape_failure_is_structured(lifecycle_env, monkeypatch):
+    from dcc_mcp_gimp.install import run
+
+    installed, code, _ = run(["install", "--yes", *lifecycle_env.common])
+    assert code == 0, installed
+    monkeypatch.setattr(
+        "dcc_mcp_gimp.install_lifecycle.query_runtime_state", lambda *_args, **_kwargs: None
+    )
+    report, code, _ = run(["verify", *lifecycle_env.common])
+    assert code != 0
+    assert report["status"] == "failed"
+    assert report["verify"]["directly_usable"] is False
+    assert report["verify"]["failure_stage"] == "readiness"
+    assert "runtime" in report["verify"]["failure_reason"].lower()
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Exercises Windows directory lease")

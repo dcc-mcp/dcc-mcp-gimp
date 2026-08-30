@@ -22,6 +22,7 @@ from .install_files import (
     _assert_profile_writable,
     _assert_target_identity,
     _installation_state,
+    _is_link,
     _owned_file_identities,
     _plugin_version,
     _read_receipt,
@@ -248,16 +249,32 @@ def verify_install(
             failure_reason="GIMP recorded a plug-in bootstrap failure; inspect the doctor report",
         )
         return result
-    runtime = query_runtime_state(
-        os.environ.get("DCC_MCP_REGISTRY_DIR"),
-        dcc_type="gimp",
-        include_dead=False,
-    )
-    entries = [
-        entry
-        for entry in runtime.get("entries", [])
-        if isinstance(entry, dict) and entry.get("mcp_url")
-    ]
+    try:
+        runtime = query_runtime_state(
+            os.environ.get("DCC_MCP_REGISTRY_DIR"),
+            dcc_type="gimp",
+            include_dead=False,
+        )
+    except Exception:
+        result.update(
+            failure_stage="readiness",
+            failure_reason="GIMP runtime state is unavailable",
+        )
+        return result
+    if not isinstance(runtime, Mapping):
+        result.update(
+            failure_stage="readiness",
+            failure_reason="GIMP runtime state is unavailable",
+        )
+        return result
+    raw_entries = runtime.get("entries", [])
+    if not isinstance(raw_entries, list):
+        result.update(
+            failure_stage="readiness",
+            failure_reason="GIMP runtime state entries are invalid",
+        )
+        return result
+    entries = [entry for entry in raw_entries if isinstance(entry, dict) and entry.get("mcp_url")]
     if instance_id is not None:
         entries = [entry for entry in entries if entry.get("instance_id") == instance_id]
     if len(entries) != 1:
@@ -467,6 +484,11 @@ def doctor(destination: Optional[Path] = None) -> dict[str, object]:
     except InstallFailure as exc:
         physical_error = str(exc)
     script = root / _PLUGIN_NAME / ("%s.py" % _PLUGIN_NAME)
+    target = root / _PLUGIN_NAME
+    target_linked = _is_link(target)
+    script_linked = _is_link(script)
+    if physical_error is None and (target_linked or script_linked):
+        physical_error = "Managed GIMP plug-in path is linked"
     roots = [
         str(Path(item).expanduser().resolve())
         for item in os.environ.get("DCC_MCP_GIMP_ALLOWED_ROOTS", "").split(os.pathsep)
@@ -482,13 +504,13 @@ def doctor(destination: Optional[Path] = None) -> dict[str, object]:
         .expanduser()
         .resolve()
     )
-    installed_version = _plugin_version(script) if script.is_file() else None
+    installed_version = _plugin_version(script) if script.is_file() and not script_linked else None
     version_matches = installed_version == __version__
     return {
         "ready": physical_error is None and script.is_file() and version_matches,
         "destination": str(root),
         "plugin_script": str(script),
-        "plugin_script_exists": script.is_file(),
+        "plugin_script_exists": script.is_file() and not script_linked,
         "installed_adapter_version": installed_version,
         "expected_adapter_version": __version__,
         "version_matches": version_matches,

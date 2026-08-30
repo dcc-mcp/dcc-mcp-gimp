@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import stat
+import tempfile
 import time
 import uuid
 from dataclasses import dataclass
@@ -595,6 +596,13 @@ def _assert_receipt_file_identity(
         matches = actual == tuple(expected)
     if not matches:
         raise InstallFailure(EXIT_PREFLIGHT, stage, "Managed receipt file changed identity")
+
+
+def _assert_receipt_name_identity(
+    path: Path, expected: tuple[int, ...], stage: str = "receipt"
+) -> None:
+    """Re-check the pathname itself after descriptor checks and race hooks."""
+    _assert_receipt_file_identity(path, expected, stage)
 
 
 def _receipt_descriptor_identity(
@@ -1191,6 +1199,7 @@ def _replace_receipt_owned(
                 _assert_receipt_path_safe(source)
                 _assert_receipt_parent_identity(source, source_parent_identity)
                 _assert_receipt_file_identity(source, source_identity, "uninstall")
+                _assert_receipt_name_identity(source, source_identity, "uninstall")
                 if (
                     _directory_identity(destination.parent, "uninstall")
                     != destination_parent_identity
@@ -1225,6 +1234,7 @@ def _replace_receipt_owned(
         _assert_receipt_descriptor_identity(
             source_descriptor, source.name, source_identity, "uninstall"
         )
+        _assert_receipt_name_identity(source, source_identity, "uninstall")
         os.replace(
             source.name,
             destination.name,
@@ -1260,6 +1270,7 @@ def _unlink_receipt_owned(path: Path) -> None:
             _assert_receipt_path_safe(path)
             _assert_receipt_parent_identity(path, parent_identity)
             _assert_receipt_file_identity(path, expected_identity, "receipt")
+            _assert_receipt_name_identity(path, expected_identity, "receipt")
             path.unlink(missing_ok=True)
         return
     descriptor = None
@@ -1267,6 +1278,7 @@ def _unlink_receipt_owned(path: Path) -> None:
         _assert_receipt_path_safe(path)
         descriptor = _open_absolute_dir_nofollow(path.parent)
         _assert_receipt_descriptor_identity(descriptor, path.name, expected_identity, "receipt")
+        _assert_receipt_name_identity(path, expected_identity, "receipt")
         os.unlink(path.name, dir_fd=descriptor)
     except FileNotFoundError:
         return
@@ -1756,7 +1768,11 @@ def _copy_validated_recovery(
 ) -> dict[str, Any]:
     """Create a separate recovery tree and prove that its bytes and modes match."""
 
+    recovery_installed = False
+
     def cleanup_recovery() -> None:
+        if not recovery_installed:
+            return
         if owner_root is None:
             _cleanup_tree(recovery)
             return
@@ -1770,19 +1786,56 @@ def _copy_validated_recovery(
     if owner_root is not None:
         _assert_physical_root(owner_root, expected_identity)
     expected = _recovery_manifest(source)
+    destination_parent = recovery.parent
+    destination_parent_identity = _directory_identity(destination_parent, "recovery")
+    staging_root = Path(tempfile.mkdtemp(prefix="dcc-mcp-gimp-recovery-"))
+    staged_recovery = staging_root / recovery.name
     try:
-        shutil.copytree(source, recovery, symlinks=True, copy_function=shutil.copy2)
+        # Build the snapshot outside the managed tree.  A pathname swap of the
+        # eventual destination therefore cannot redirect copytree writes into
+        # a junction or foreign directory.
+        shutil.copytree(source, staged_recovery, symlinks=True, copy_function=shutil.copy2)
     except OSError as exc:
-        cleanup_recovery()
+        shutil.rmtree(staging_root, ignore_errors=True)
         raise InstallFailure(
             EXIT_INSTALL, "recovery", "Recovery snapshot could not be created"
         ) from exc
-    if owner_root is not None:
-        _assert_physical_root(owner_root, expected_identity)
-    if _recovery_manifest(recovery) != expected:
+    try:
+        if owner_root is not None:
+            _assert_physical_root(owner_root, expected_identity)
+        if _recovery_manifest(staged_recovery) != expected:
+            raise InstallFailure(EXIT_INSTALL, "recovery", "Recovery snapshot validation failed")
+        if _directory_identity(destination_parent, "recovery") != destination_parent_identity:
+            raise InstallFailure(
+                EXIT_PREFLIGHT, "recovery", "Recovery destination changed identity"
+            )
+        _assert_path_components_safe(recovery, "recovery")
+        _replace_path_owned(
+            destination_parent,
+            destination_parent_identity,
+            staged_recovery,
+            recovery,
+        )
+        recovery_installed = True
+        if owner_root is not None:
+            _assert_physical_root(owner_root, expected_identity)
+        if _directory_identity(destination_parent, "recovery") != destination_parent_identity:
+            raise InstallFailure(
+                EXIT_PREFLIGHT, "recovery", "Recovery destination changed identity"
+            )
+        if _recovery_manifest(recovery) != expected:
+            raise InstallFailure(EXIT_INSTALL, "recovery", "Recovery snapshot validation failed")
+        return expected
+    except InstallFailure:
         cleanup_recovery()
-        raise InstallFailure(EXIT_INSTALL, "recovery", "Recovery snapshot validation failed")
-    return expected
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        cleanup_recovery()
+        raise InstallFailure(
+            EXIT_INSTALL, "recovery", "Recovery snapshot validation failed"
+        ) from exc
+    finally:
+        shutil.rmtree(staging_root, ignore_errors=True)
 
 
 def _replace_plugin(root: Path) -> Path:
