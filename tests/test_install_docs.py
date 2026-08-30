@@ -47,3 +47,6 @@ def test_core_floor_is_projected_into_public_install_surfaces():
     assert "dcc-mcp-core>=0.19.91,<1.0.0" in pyproject
     assert "0.19.91 or newer, below 1.0" in guide
     assert "dcc-mcp-core 0.19.91+" in skill
+    assert "dcc-mcp-gimp install --dry-run --json" in skill
+    assert "verify.directly_usable: true" in skill
+    assert "exit 50" in skill

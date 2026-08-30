@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -20,6 +22,255 @@ _GIMP_VERSION_PATTERN = re.compile(
 )
 _GIMP_EXECUTABLES = frozenset(("gimp", "gimp.exe", "gimp-3.0", "gimp-3.0.exe"))
 _MAX_PROBE_OUTPUT = 16 * 1024
+_MAX_METADATA_OUTPUT = 256 * 1024
+_MAX_BOOTSTRAP_RECORD_BYTES = 64 * 1024
+_MAX_BOOTSTRAP_RECORDS = 1024
+_MAX_BOOTSTRAP_LOG_BYTES = 256 * 1024
+
+
+def _path_is_link_or_reparse(path: Path) -> bool:
+    try:
+        is_junction = getattr(path, "is_junction", None)
+        if path.is_symlink() or bool(is_junction and is_junction()):
+            return True
+        if os.name != "nt":
+            return False
+        import ctypes
+
+        attributes = ctypes.windll.kernel32.GetFileAttributesW(str(path))
+        if int(attributes) in (-1, 0xFFFFFFFF):
+            return False
+        return bool(int(attributes) & 0x400)
+    except AttributeError:
+        return False
+    except (OSError, RuntimeError, ValueError):
+        return True
+
+
+def _parent_has_reparse(path: Path) -> bool:
+    parent = path.parent
+    while True:
+        if _path_is_link_or_reparse(parent):
+            return True
+        next_parent = parent.parent
+        if next_parent == parent:
+            return False
+        parent = next_parent
+
+
+def _executable_identity(path: Path) -> tuple[int, int, int, int]:
+    """Capture a physical executable identity for a preflight-to-launch lease."""
+    try:
+        details = os.lstat(str(path))
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise InstallFailure(
+            EXIT_PREFLIGHT, "executable", "Selected executable identity is unavailable"
+        ) from exc
+    if not stat.S_ISREG(details.st_mode) or _path_is_link_or_reparse(path):
+        raise InstallFailure(
+            EXIT_PREFLIGHT, "executable", "Selected executable path is linked or not regular"
+        )
+    return (
+        int(details.st_dev),
+        int(details.st_ino),
+        int(details.st_size),
+        int(getattr(details, "st_mtime_ns", int(details.st_mtime * 1_000_000_000))),
+    )
+
+
+def _assert_executable_identity(
+    path: Path,
+    expected: Optional[tuple[int, int, int, int]],
+    stage: str,
+) -> None:
+    if expected is None:
+        return
+    actual = _executable_identity(path)
+    if actual != tuple(expected):
+        raise InstallFailure(EXIT_PREFLIGHT, stage, "Selected executable changed identity")
+
+
+@contextlib.contextmanager
+def _posix_executable_binding(
+    path: Path,
+    expected: Optional[tuple[int, int, int, int]],
+    stage: str,
+) -> Any:
+    """Bind a POSIX child launch to the executable object selected by preflight."""
+    if os.name == "nt":
+        yield {}
+        return
+    descriptor = None
+    try:
+        descriptor = os.open(
+            str(path),
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0),
+        )
+        details = os.fstat(descriptor)
+        actual = (
+            int(details.st_dev),
+            int(details.st_ino),
+            int(details.st_size),
+            int(getattr(details, "st_mtime_ns", int(details.st_mtime * 1_000_000_000))),
+        )
+        if not stat.S_ISREG(details.st_mode) or (
+            expected is not None and actual != tuple(expected)
+        ):
+            raise InstallFailure(EXIT_PREFLIGHT, stage, "Selected executable changed identity")
+        launch_path = None
+        for descriptor_root in (Path("/proc/self/fd"), Path("/dev/fd")):
+            candidate = descriptor_root / str(descriptor)
+            candidate_descriptor = None
+            try:
+                candidate_descriptor = os.open(
+                    str(candidate),
+                    os.O_RDONLY | getattr(os, "O_CLOEXEC", 0),
+                )
+                candidate_details = os.fstat(candidate_descriptor)
+            except OSError:
+                continue
+            finally:
+                if candidate_descriptor is not None:
+                    try:
+                        os.close(candidate_descriptor)
+                    except OSError:
+                        pass
+            candidate_identity = (
+                int(candidate_details.st_dev),
+                int(candidate_details.st_ino),
+                int(candidate_details.st_size),
+                int(
+                    getattr(
+                        candidate_details,
+                        "st_mtime_ns",
+                        int(candidate_details.st_mtime * 1_000_000_000),
+                    )
+                ),
+            )
+            if stat.S_ISREG(candidate_details.st_mode) and candidate_identity == actual:
+                launch_path = candidate
+                break
+        if launch_path is None:
+            raise InstallFailure(
+                EXIT_PREFLIGHT,
+                stage,
+                "POSIX identity-bound executable launch is unavailable",
+            )
+        yield {"executable": str(launch_path), "pass_fds": (descriptor,)}
+    except InstallFailure:
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise InstallFailure(
+            EXIT_PREFLIGHT,
+            stage,
+            "POSIX identity-bound executable launch is unavailable",
+        ) from exc
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+@contextlib.contextmanager
+def _windows_executable_lease(path: Path, stage: str) -> Any:
+    """Hold the executable parent against a Windows rename/reparse swap."""
+    if os.name != "nt":
+        yield
+        return
+    handle = None
+    try:
+        import ctypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateFileW.argtypes = [
+            ctypes.c_wchar_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+        ]
+        kernel32.CreateFileW.restype = ctypes.c_void_p
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = ctypes.c_int
+        handle = kernel32.CreateFileW(
+            str(path.parent),
+            0x80 | 0x20,
+            0x1 | 0x2,
+            None,
+            3,
+            0x02000000 | 0x00200000,
+            None,
+        )
+        invalid = ctypes.c_void_p(-1).value
+        if handle in (None, invalid):
+            error = ctypes.get_last_error()
+            raise OSError(error, "CreateFileW executable lease failed", str(path.parent))
+    except InstallFailure:
+        raise
+    except (OSError, AttributeError, RuntimeError, ValueError) as exc:
+        raise InstallFailure(EXIT_PREFLIGHT, stage, "Windows executable lease unavailable") from exc
+    try:
+        yield
+    finally:
+        if handle not in (None,):
+            try:
+                kernel32.CloseHandle(handle)
+            except (OSError, AttributeError):
+                pass
+
+
+@contextlib.contextmanager
+def _windows_executable_handle(path: Path, stage: str) -> Any:
+    """Hold the selected executable itself against rename/reparse swaps."""
+    if os.name != "nt":
+        yield
+        return
+    handle = None
+    try:
+        import ctypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateFileW.argtypes = [
+            ctypes.c_wchar_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+        ]
+        kernel32.CreateFileW.restype = ctypes.c_void_p
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = ctypes.c_int
+        handle = kernel32.CreateFileW(
+            str(path),
+            0x80,
+            0x1 | 0x2,
+            None,
+            3,
+            0x02000000,
+            None,
+        )
+        invalid = ctypes.c_void_p(-1).value
+        if handle in (None, invalid):
+            error = ctypes.get_last_error()
+            raise OSError(error, "CreateFileW executable handle failed", str(path))
+    except (OSError, AttributeError, RuntimeError, ValueError) as exc:
+        raise InstallFailure(
+            EXIT_PREFLIGHT, stage, "Selected executable handle unavailable"
+        ) from exc
+    try:
+        yield
+    finally:
+        if handle not in (None,):
+            try:
+                kernel32.CloseHandle(handle)
+            except (OSError, AttributeError):
+                pass
 
 
 def default_plugin_dir() -> Path:
@@ -35,23 +286,122 @@ def default_plugin_dir() -> Path:
 def _bootstrap_error_path() -> Path:
     configured = os.environ.get("DCC_MCP_GIMP_BOOTSTRAP_ERRORS")
     if configured:
-        return Path(configured).expanduser().resolve()
-    return Path.home().joinpath(".dcc-mcp", "gimp-bootstrap-errors.jsonl").resolve()
+        return Path(configured).expanduser().absolute()
+    return Path.home().joinpath(".dcc-mcp", "gimp-bootstrap-errors.jsonl").absolute()
+
+
+def _read_bootstrap_bytes(path: Path) -> tuple[bytes, int]:
+    """Read a bootstrap log through a no-follow descriptor and bounded tail."""
+    try:
+        before = os.lstat(str(path))
+        if not stat.S_ISREG(before.st_mode) or _path_is_link_or_reparse(path):
+            raise InstallFailure(EXIT_PREFLIGHT, "bootstrap", "Bootstrap error path is linked")
+        if _parent_has_reparse(path):
+            raise InstallFailure(
+                EXIT_PREFLIGHT, "bootstrap", "Bootstrap error parent is linked or reparse"
+            )
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        parent_descriptor = None
+        lease = (
+            _windows_executable_lease(path, "bootstrap")
+            if os.name == "nt"
+            else contextlib.nullcontext()
+        )
+        with lease:
+            if _parent_has_reparse(path):
+                raise InstallFailure(
+                    EXIT_PREFLIGHT, "bootstrap", "Bootstrap error parent is linked or reparse"
+                )
+            if os.name == "nt":
+                descriptor = os.open(str(path), flags)
+            else:
+                parent_descriptor = os.open(
+                    str(path.parent),
+                    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+                )
+                descriptor = os.open(path.name, flags, dir_fd=parent_descriptor)
+        try:
+            opened = os.fstat(descriptor)
+            if (int(opened.st_dev), int(opened.st_ino)) != (
+                int(before.st_dev),
+                int(before.st_ino),
+            ) or not stat.S_ISREG(opened.st_mode):
+                raise InstallFailure(
+                    EXIT_PREFLIGHT, "bootstrap", "Bootstrap error path changed identity"
+                )
+            total_bytes = int(opened.st_size)
+            os.lseek(descriptor, max(0, total_bytes - _MAX_BOOTSTRAP_LOG_BYTES), os.SEEK_SET)
+            bounded = os.read(descriptor, _MAX_BOOTSTRAP_LOG_BYTES)
+            after = os.fstat(descriptor)
+            if (int(after.st_dev), int(after.st_ino)) != (int(before.st_dev), int(before.st_ino)):
+                raise InstallFailure(
+                    EXIT_PREFLIGHT, "bootstrap", "Bootstrap error path changed identity"
+                )
+            return bounded, total_bytes
+        finally:
+            os.close(descriptor)
+            if parent_descriptor is not None:
+                os.close(parent_descriptor)
+    except InstallFailure:
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise InstallFailure(
+            EXIT_PREFLIGHT, "bootstrap", "Bootstrap error log is unavailable"
+        ) from exc
 
 
 def _bootstrap_error_summary() -> dict[str, Any]:
     path = _bootstrap_error_path()
     records = []
-    if path.is_file():
+    try:
+        linked = _path_is_link_or_reparse(path) or _parent_has_reparse(path)
+        is_file = path.is_file()
+    except (OSError, RuntimeError, ValueError) as exc:
+        return {
+            "path": str(path),
+            "count": 0,
+            "latest": None,
+            "read_error": str(exc),
+        }
+    if linked:
+        return {
+            "path": str(path),
+            "count": 0,
+            "latest": None,
+            "read_error": "Bootstrap error path is linked",
+        }
+    if is_file:
         try:
-            for line in path.read_text(encoding="utf-8").splitlines():
+            bounded, total_bytes = _read_bootstrap_bytes(path)
+            offset = max(0, total_bytes - _MAX_BOOTSTRAP_LOG_BYTES)
+            lines = bounded.splitlines(keepends=True)
+            if offset and b"\n" in bounded and len(lines) > 1:
+                lines = lines[1:]
+            for raw_line in lines[-_MAX_BOOTSTRAP_RECORDS:]:
+                if not raw_line:
+                    continue
+                oversized = len(raw_line) > _MAX_BOOTSTRAP_RECORD_BYTES or not raw_line.endswith(
+                    b"\n"
+                )
+                line = raw_line[:_MAX_BOOTSTRAP_RECORD_BYTES].decode("utf-8", errors="replace")
+                if oversized:
+                    records.append(
+                        {
+                            "stage": "unknown",
+                            "message": line[:_MAX_BOOTSTRAP_RECORD_BYTES],
+                            "truncated": True,
+                        }
+                    )
+                    continue
                 try:
                     record = json.loads(line)
                 except json.JSONDecodeError:
                     continue
                 if isinstance(record, dict):
+                    if isinstance(record.get("message"), str):
+                        record["message"] = record["message"][:_MAX_BOOTSTRAP_RECORD_BYTES]
                     records.append(record)
-        except OSError as exc:
+        except (OSError, RuntimeError, ValueError) as exc:
             return {
                 "path": str(path),
                 "count": 0,
@@ -84,8 +434,25 @@ def _resolve_python(value: Optional[Path], executable: Path) -> Path:
             ),
             Path(sys.executable),
         )
-    resolved = configured.expanduser().resolve()
-    if not resolved.is_file() or resolved.is_symlink() or resolved.stat().st_size <= 0:
+    try:
+        candidate = configured.expanduser().absolute()
+        if _parent_has_reparse(candidate):
+            raise InstallFailure(EXIT_PREFLIGHT, "python", "Python interpreter parent is linked")
+        resolved = candidate.resolve(strict=True)
+        # A normal file symlink is accepted, but a junction/reparse directory
+        # or a non-regular target is never an executable identity.
+        if candidate.is_dir() and _path_is_link_or_reparse(candidate):
+            raise InstallFailure(EXIT_PREFLIGHT, "python", "Python interpreter path is linked")
+        if _path_is_link_or_reparse(resolved):
+            raise InstallFailure(EXIT_PREFLIGHT, "python", "Python interpreter target is linked")
+        valid = resolved.is_file() and resolved.stat().st_size > 0
+    except InstallFailure:
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise InstallFailure(
+            EXIT_PREFLIGHT, "python", "Python interpreter path is unavailable"
+        ) from exc
+    if not valid:
         raise InstallFailure(
             EXIT_PREFLIGHT,
             "python",
@@ -113,17 +480,36 @@ def _resolve_gimp(value: Optional[Path]) -> Path:
         value = next((candidate for candidate in candidates if candidate.is_file()), None)
     if value is None:
         raise InstallFailure(EXIT_PREFLIGHT, "gimp", "GIMP 3 installation was not found")
-    resolved = value.expanduser().resolve()
-    if resolved.is_dir():
-        candidates = (
-            resolved / "gimp-3.0.exe",
-            resolved / "bin/gimp-3.0.exe",
-            resolved / "Contents/MacOS/gimp",
-            resolved / "gimp-3.0",
-            resolved / "gimp",
-        )
-        resolved = next((candidate for candidate in candidates if candidate.is_file()), resolved)
-    if not resolved.is_file() or resolved.is_symlink() or resolved.stat().st_size <= 0:
+    try:
+        candidate = value.expanduser().absolute()
+        if _parent_has_reparse(candidate):
+            raise InstallFailure(EXIT_PREFLIGHT, "gimp", "GIMP executable parent is linked")
+        resolved = candidate.resolve(strict=True)
+        if candidate.is_dir() and _path_is_link_or_reparse(candidate):
+            raise InstallFailure(EXIT_PREFLIGHT, "gimp", "GIMP executable path is linked")
+        if _path_is_link_or_reparse(resolved):
+            raise InstallFailure(EXIT_PREFLIGHT, "gimp", "GIMP executable target is linked")
+        if resolved.is_dir():
+            candidates = (
+                resolved / "gimp-3.0.exe",
+                resolved / "bin/gimp-3.0.exe",
+                resolved / "Contents/MacOS/gimp",
+                resolved / "gimp-3.0",
+                resolved / "gimp",
+            )
+            resolved = next(
+                (candidate for candidate in candidates if candidate.is_file()), resolved
+            )
+        valid = resolved.is_file() and not resolved.is_symlink() and resolved.stat().st_size > 0
+    except InstallFailure:
+        raise
+    except FileNotFoundError as exc:
+        raise InstallFailure(
+            EXIT_PREFLIGHT, "gimp", "GIMP executable not found: %s" % candidate
+        ) from exc
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise InstallFailure(EXIT_PREFLIGHT, "gimp", "GIMP executable path is unavailable") from exc
+    if not valid:
         raise InstallFailure(EXIT_PREFLIGHT, "gimp", "GIMP executable not found: %s" % resolved)
     name = resolved.name.lower()
     is_appimage = name.endswith(".appimage") and "gimp" in name
@@ -134,19 +520,32 @@ def _resolve_gimp(value: Optional[Path]) -> Path:
     return resolved
 
 
-def _gimp_version(executable: Path) -> str:
+def _gimp_version(
+    executable: Path,
+    *,
+    expected_identity: Optional[tuple[int, int, int, int]] = None,
+) -> str:
+    _assert_executable_identity(executable, expected_identity, "gimp_version")
     command = [str(executable)]
     if executable.name.lower().endswith(".appimage"):
         command.append("--appimage-extract-and-run")
     command.append("--version")
     try:
-        completed = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=15,
-            check=False,
-        )
+        with _posix_executable_binding(
+            executable, expected_identity, "gimp_version"
+        ) as launch_options:
+            with _windows_executable_lease(executable, "gimp_version"):
+                with _windows_executable_handle(executable, "gimp_version"):
+                    _assert_executable_identity(executable, expected_identity, "gimp_version")
+                    completed = subprocess.run(
+                        command,
+                        capture_output=True,
+                        text=True,
+                        timeout=15,
+                        check=False,
+                        **launch_options,
+                    )
+                    _assert_executable_identity(executable, expected_identity, "gimp_version")
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise InstallFailure(EXIT_PREFLIGHT, "gimp_version", str(exc)) from exc
     output = "%s\n%s" % (completed.stdout, completed.stderr)
@@ -168,7 +567,12 @@ def _gimp_version(executable: Path) -> str:
     return version
 
 
-def _target_versions(python: Path) -> dict[str, str]:
+def _target_versions(
+    python: Path,
+    *,
+    expected_identity: Optional[tuple[int, int, int, int]] = None,
+) -> dict[str, str]:
+    _assert_executable_identity(python, expected_identity, "python")
     code = r"""
 import importlib.metadata as metadata
 import json
@@ -249,26 +653,36 @@ print(
         }
     )
 )
-""".strip()
+    """.strip()
     try:
-        completed = subprocess.run(
-            [str(python), "-c", code],
-            capture_output=True,
-            text=True,
-            timeout=15,
-            check=False,
-        )
+        with _posix_executable_binding(python, expected_identity, "python") as launch_options:
+            with _windows_executable_lease(python, "python"):
+                with _windows_executable_handle(python, "python"):
+                    _assert_executable_identity(python, expected_identity, "python")
+                    completed = subprocess.run(
+                        [str(python), "-c", code],
+                        capture_output=True,
+                        text=True,
+                        timeout=15,
+                        check=False,
+                        **launch_options,
+                    )
+                    _assert_executable_identity(python, expected_identity, "python")
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise InstallFailure(EXIT_PREFLIGHT, "python", str(exc)) from exc
     if completed.returncode:
-        reason = completed.stderr.strip().splitlines()
+        stderr = completed.stderr if isinstance(completed.stderr, str) else ""
+        reason = stderr[:_MAX_METADATA_OUTPUT].strip().splitlines()
         raise InstallFailure(
             EXIT_PREFLIGHT,
             "python",
             reason[-1] if reason else "Target package metadata query failed",
         )
+    stdout = completed.stdout if isinstance(completed.stdout, str) else ""
+    if len(stdout.encode("utf-8", errors="replace")) > _MAX_METADATA_OUTPUT:
+        raise InstallFailure(EXIT_PREFLIGHT, "python", "Target interpreter metadata is unbounded")
     try:
-        versions = json.loads(completed.stdout.strip())
+        versions = json.loads(stdout.strip())
     except (json.JSONDecodeError, UnicodeError) as exc:
         raise InstallFailure(
             EXIT_PREFLIGHT,
@@ -283,11 +697,35 @@ print(
         reported_python = Path(str(versions["python_executable"])).resolve()
         core = versions["core"]
         adapter = versions["adapter"]
-    except (KeyError, TypeError, OSError) as exc:
+    except (KeyError, TypeError, OSError, RuntimeError, ValueError) as exc:
         raise InstallFailure(
             EXIT_PREFLIGHT, "python", "Target interpreter returned incomplete metadata"
         ) from exc
-    if reported_python != python.resolve():
+    if not isinstance(core, dict) or not isinstance(adapter, dict):
+        raise InstallFailure(
+            EXIT_PREFLIGHT,
+            "python",
+            "Target interpreter returned incomplete metadata",
+        )
+    for name, package in (("core", core), ("adapter", adapter)):
+        if (
+            not isinstance(package.get("version"), str)
+            or not isinstance(package.get("module_version"), str)
+            or not isinstance(package.get("module_path"), str)
+            or not isinstance(package.get("owned"), bool)
+        ):
+            raise InstallFailure(
+                EXIT_PREFLIGHT,
+                "python",
+                "Target interpreter returned incomplete %s metadata" % name,
+            )
+    try:
+        selected_python = python.resolve()
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise InstallFailure(
+            EXIT_PREFLIGHT, "python", "Target interpreter path is unavailable"
+        ) from exc
+    if reported_python != selected_python:
         raise InstallFailure(
             EXIT_PREFLIGHT, "python", "Target interpreter identity does not match --python"
         )
@@ -325,9 +763,13 @@ print(
     }
 
 
-def _python_import_check(python: Path) -> dict[str, Any]:
+def _python_import_check(
+    python: Path,
+    *,
+    expected_identity: Optional[tuple[int, int, int, int]] = None,
+) -> dict[str, Any]:
     try:
-        versions = _target_versions(python)
+        versions = _target_versions(python, expected_identity=expected_identity)
     except InstallFailure as exc:
         return {"success": False, "reason": str(exc)}
     return {

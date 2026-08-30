@@ -78,7 +78,14 @@ def _failure_verification(failure: InstallFailure) -> dict[str, Any]:
 def run(argv: Sequence[str]) -> tuple[dict[str, Any], int, bool]:
     args = _parser().parse_args(list(argv))
     try:
-        report = plan(args.verb, args.destination, args.python, args.dcc_path)
+        report = plan(
+            args.verb,
+            args.destination,
+            args.python,
+            args.dcc_path,
+            instance_id=args.instance_id,
+            host_pid=args.host_pid,
+        )
     except InstallFailure as failure:
         return (
             {
@@ -133,10 +140,22 @@ def run(argv: Sequence[str]) -> tuple[dict[str, Any], int, bool]:
                 report["gimp_version"],
                 instance_id=args.instance_id,
                 host_pid=args.host_pid,
+                expected_python_identity=(
+                    tuple(report["_python_identity"])
+                    if report.get("_python_identity") is not None
+                    else None
+                ),
+                expected_target_identity=transaction.target_identity,
+                expected_file_identities=transaction.file_identities,
             )
         except InstallFailure as failure:
             if transaction is not None and not transaction.closed:
-                transaction.rollback()
+                try:
+                    transaction.rollback()
+                except InstallFailure as rollback_failure:
+                    report["status"] = "failed"
+                    report["verify"] = _failure_verification(rollback_failure)
+                    return report, rollback_failure.exit_code, args.as_json
             report["status"] = (
                 "requires_restart" if failure.exit_code == EXIT_REQUIRES_RESTART else "failed"
             )
@@ -155,7 +174,12 @@ def run(argv: Sequence[str]) -> tuple[dict[str, Any], int, bool]:
             return report, EXIT_OK, args.as_json
         report["next_steps"] = _next_steps(report)
         if transaction.previous_moved:
-            transaction.rollback()
+            try:
+                transaction.rollback()
+            except InstallFailure as failure:
+                report["status"] = "failed"
+                report["verify"] = _failure_verification(failure)
+                return report, failure.exit_code, args.as_json
             report["status"] = "failed"
             report["previous_install_restored"] = True
             return report, EXIT_VERIFY, args.as_json
@@ -170,7 +194,12 @@ def run(argv: Sequence[str]) -> tuple[dict[str, Any], int, bool]:
                 return report, failure.exit_code, args.as_json
             report["status"] = "requires_restart"
             return report, EXIT_REQUIRES_RESTART, args.as_json
-        transaction.rollback()
+        try:
+            transaction.rollback()
+        except InstallFailure as failure:
+            report["status"] = "failed"
+            report["verify"] = _failure_verification(failure)
+            return report, failure.exit_code, args.as_json
         report["status"] = "failed"
         return report, EXIT_VERIFY, args.as_json
     if args.verb == "uninstall":
@@ -194,6 +223,20 @@ def run(argv: Sequence[str]) -> tuple[dict[str, Any], int, bool]:
             report["gimp_version"],
             instance_id=args.instance_id,
             host_pid=args.host_pid,
+            expected_python_identity=(
+                tuple(report["_python_identity"])
+                if report.get("_python_identity") is not None
+                else None
+            ),
+            expected_target_identity=(
+                tuple(report["_target_identity"])
+                if report.get("_target_identity") is not None
+                else None
+            ),
+            expected_file_identities={
+                relative: tuple(identity)
+                for relative, identity in report.get("_owned_file_identities", {}).items()
+            },
         )
         report["status"] = "ok" if report["verify"]["directly_usable"] else "failed"
         if report["status"] == "failed":

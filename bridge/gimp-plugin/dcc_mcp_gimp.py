@@ -10,46 +10,753 @@ import os
 import secrets
 import socket
 import socketserver
+import stat
 import sys
 import threading
 import time
+import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Optional
+
+_MAX_BOOTSTRAP_RECORD_BYTES = 64 * 1024
+_MAX_BOOTSTRAP_RECORDS = 1024
+_MAX_BOOTSTRAP_LOG_BYTES = 256 * 1024
+_BOOTSTRAP_WRITE_LOCK = threading.Lock()
+_BOOTSTRAP_RENAME_EXPECTED: Optional[tuple[int, int]] = None
+_BOOTSTRAP_RENAME_HANDLE: Any = None
+_BOOTSTRAP_POSIX_RENAME = os.rename
+_BOOTSTRAP_POSIX_UNLINK = os.unlink
+_BOOTSTRAP_POSIX_LINK = os.link
+
+
+def _path_is_link_or_reparse(path: Path) -> bool:
+    """Fail closed for symlinks and Windows reparse points (including junctions)."""
+    try:
+        if path.is_symlink():
+            return True
+        if os.name != "nt":
+            return False
+        import ctypes
+
+        attributes = ctypes.windll.kernel32.GetFileAttributesW(str(path))
+        if int(attributes) in (-1, 0xFFFFFFFF):
+            return False
+        return bool(int(attributes) & 0x400)
+    except (AttributeError, OSError, RuntimeError, ValueError):
+        return True
+
+
+def _bootstrap_path_safe(path: Path) -> bool:
+    """Check the file and every existing parent without resolving links."""
+    candidate = path
+    while True:
+        if _path_is_link_or_reparse(candidate):
+            return False
+        parent = candidate.parent
+        if parent == candidate:
+            return True
+        candidate = parent
+
+
+@contextmanager
+def _windows_directory_lease(path: Path):
+    """Hold a bootstrap parent without allowing pathname replacement."""
+    if os.name != "nt":
+        yield
+        return
+    import ctypes
+
+    try:
+        before = os.lstat(str(path))
+        if _path_is_link_or_reparse(path):
+            raise OSError("bootstrap parent is linked")
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateFileW.argtypes = [
+            ctypes.c_wchar_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+        ]
+        kernel32.CreateFileW.restype = ctypes.c_void_p
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = ctypes.c_int
+        handle = kernel32.CreateFileW(
+            str(path),
+            0x80 | 0x20,
+            0x1 | 0x2,
+            None,
+            3,
+            0x02000000 | 0x00200000,
+            None,
+        )
+        invalid = ctypes.c_void_p(-1).value
+        if handle in (None, invalid):
+            raise OSError(ctypes.get_last_error(), "bootstrap parent lease failed")
+        after = os.lstat(str(path))
+        if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+            kernel32.CloseHandle(handle)
+            raise OSError("bootstrap parent changed identity")
+    except (AttributeError, OSError, RuntimeError, ValueError):
+        raise
+    try:
+        yield
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+@contextmanager
+def _windows_object_handle(path: Path, *, access: int = 0x80):
+    """Hold one bootstrap file with delete sharing disabled."""
+    if os.name != "nt":
+        yield
+        return
+    import ctypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+    ]
+    kernel32.CreateFileW.restype = ctypes.c_void_p
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+    handle = kernel32.CreateFileW(
+        str(path),
+        access,
+        0x1 | 0x2,
+        None,
+        3,
+        # FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT:
+        # inspect the named object itself and never traverse a swapped
+        # junction/reparse point while holding the lease.
+        0x02000000 | 0x00200000,
+        None,
+    )
+    invalid = ctypes.c_void_p(-1).value
+    if handle in (None, invalid):
+        raise OSError(ctypes.get_last_error(), "bootstrap file handle failed")
+    try:
+        if _path_is_link_or_reparse(path):
+            raise OSError("bootstrap file is linked")
+        yield handle
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _bootstrap_object_identity(path: Path) -> tuple[int, int]:
+    details = os.lstat(str(path))
+    if not stat.S_ISREG(details.st_mode) or _path_is_link_or_reparse(path):
+        raise OSError("bootstrap file is linked or not regular")
+    return int(details.st_dev), int(details.st_ino)
+
+
+def _windows_rename_by_handle(
+    source: Path, destination: Path, *, expected_identity: Optional[tuple[int, int]] = None
+) -> None:
+    """Atomically rename a bootstrap file without replacing the destination."""
+    import ctypes
+
+    class _FileRenameInfo(ctypes.Structure):
+        _fields_ = [
+            ("replace_if_exists", ctypes.c_uint32),
+            ("root_directory", ctypes.c_void_p),
+            ("file_name_length", ctypes.c_uint32),
+            ("file_name", ctypes.c_ubyte * 2),
+        ]
+
+    encoded = str(destination).encode("utf-16-le") + b"\x00\x00"
+    header = _FileRenameInfo(0, None, len(encoded) - 2, (ctypes.c_ubyte * 2)())
+    offset = _FileRenameInfo.file_name.offset
+    payload = (ctypes.c_ubyte * (offset + len(encoded)))()
+    ctypes.memmove(payload, ctypes.byref(header), ctypes.sizeof(header))
+    ctypes.memmove(ctypes.addressof(payload) + offset, encoded, len(encoded))
+    source_identity = _bootstrap_object_identity(source)
+    bound_identity = expected_identity or _BOOTSTRAP_RENAME_EXPECTED
+    if bound_identity is not None and source_identity != tuple(bound_identity):
+        raise OSError("bootstrap temporary changed identity")
+
+    def rename_with_handle(handle: Any) -> None:
+        if _bootstrap_object_identity(source) != source_identity:
+            raise OSError("bootstrap temporary changed identity")
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.SetFileInformationByHandle.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+        ]
+        kernel32.SetFileInformationByHandle.restype = ctypes.c_int
+        if not kernel32.SetFileInformationByHandle(
+            handle, 3, ctypes.byref(payload), ctypes.sizeof(payload)
+        ):
+            raise OSError(ctypes.get_last_error(), "bootstrap rename failed")
+
+    bound_handle = _BOOTSTRAP_RENAME_HANDLE
+    if bound_handle is not None:
+        rename_with_handle(bound_handle)
+    else:
+        with _windows_object_handle(source, access=0x00010000 | 0x80) as handle:
+            rename_with_handle(handle)
+
+
+def _windows_create_new_file(path: Path, mode: int = 0o666) -> int:
+    """Create a file with CREATE_NEW and OPEN_REPARSE_POINT semantics."""
+    if os.name != "nt":
+        raise OSError("Windows file creation is unavailable")
+    import ctypes
+    import msvcrt
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+    ]
+    kernel32.CreateFileW.restype = ctypes.c_void_p
+    handle = kernel32.CreateFileW(
+        str(path),
+        0x40000000,
+        0x1 | 0x2,
+        None,
+        1,  # CREATE_NEW
+        0x80 | 0x00200000,  # FILE_ATTRIBUTE_NORMAL | OPEN_REPARSE_POINT
+        None,
+    )
+    invalid = ctypes.c_void_p(-1).value
+    if handle in (None, invalid):
+        raise OSError(ctypes.get_last_error(), "bootstrap file create failed")
+    try:
+        descriptor = msvcrt.open_osfhandle(int(handle), os.O_WRONLY | os.O_BINARY)
+    except BaseException:
+        kernel32.CloseHandle(handle)
+        raise
+    if mode != 0o666:
+        os.chmod(path, mode)
+    return descriptor
+
+
+def _windows_delete_handle(handle: Any) -> None:
+    import ctypes
+
+    class _FileDisposition(ctypes.Structure):
+        _fields_ = [("delete_file", ctypes.c_ubyte)]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.SetFileInformationByHandle.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+    ]
+    kernel32.SetFileInformationByHandle.restype = ctypes.c_int
+    if not kernel32.SetFileInformationByHandle(handle, 4, ctypes.byref(_FileDisposition(1)), 1):
+        raise OSError(ctypes.get_last_error(), "bootstrap delete failed")
+
+
+def _delete_bootstrap_owned(path: Path, expected_identity: tuple[int, int]) -> None:
+    """Delete a Windows bootstrap temp through its identity-bound handle."""
+    with _windows_object_handle(path, access=0x00010000 | 0x80) as handle:
+        if _bootstrap_object_identity(path) != tuple(expected_identity)[:2]:
+            raise OSError("bootstrap temporary changed identity")
+        if os.name == "nt":
+            _windows_delete_handle(handle)
+        else:
+            path.unlink()
 
 
 def _bootstrap_error_path() -> Path:
     configured = os.environ.get("DCC_MCP_GIMP_BOOTSTRAP_ERRORS")
     if configured:
-        return Path(configured).expanduser().resolve()
-    return Path.home().joinpath(".dcc-mcp", "gimp-bootstrap-errors.jsonl").resolve()
+        return Path(configured).expanduser().absolute()
+    return Path.home().joinpath(".dcc-mcp", "gimp-bootstrap-errors.jsonl").absolute()
 
 
 def _capture_bootstrap_error(stage: str, error: BaseException) -> None:
+    global _BOOTSTRAP_RENAME_EXPECTED, _BOOTSTRAP_RENAME_HANDLE
     path = _bootstrap_error_path()
     record = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "stage": stage,
         "error_type": type(error).__name__,
-        "message": str(error),
+        "message": str(error)[:_MAX_BOOTSTRAP_RECORD_BYTES],
     }
+
+    def write_all(descriptor: int, data: bytes) -> None:
+        view = memoryview(data)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("short write")
+            view = view[written:]
+
+    # Keep AST-extracted smoke probes functional while production imports use
+    # the original primitives captured before any caller can replace os APIs.
+    posix_rename = globals().get("_BOOTSTRAP_POSIX_RENAME", os.rename)
+    posix_unlink = globals().get("_BOOTSTRAP_POSIX_UNLINK", os.unlink)
+    posix_link = globals().get("_BOOTSTRAP_POSIX_LINK", os.link)
+
+    def unlink_bound(name: str, expected: tuple[int, int]) -> None:
+        """Remove a descriptor-relative name without consuming a swap."""
+        cleanup_name = ".%s.bootstrap-cleanup-%s" % (name, uuid.uuid4().hex)
+        try:
+            posix_rename(
+                name,
+                cleanup_name,
+                src_dir_fd=parent_descriptor,
+                dst_dir_fd=parent_descriptor,
+            )
+        except FileNotFoundError:
+            return
+        moved = os.stat(cleanup_name, dir_fd=parent_descriptor, follow_symlinks=False)
+        moved_identity = (int(moved.st_dev), int(moved.st_ino))
+        if moved_identity != tuple(expected)[:2]:
+            try:
+                posix_link(
+                    cleanup_name,
+                    name,
+                    src_dir_fd=parent_descriptor,
+                    dst_dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+            except OSError:
+                pass
+            raise OSError("bootstrap object changed identity")
+        posix_unlink(cleanup_name, dir_fd=parent_descriptor)
+
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
-    except OSError:
+        # Serialize all readers/writers in this process.  Without this lock,
+        # concurrent startup failures can each observe the old size and append
+        # past the bounded log cap.
+        with _BOOTSTRAP_WRITE_LOCK:
+            if not _bootstrap_path_safe(path):
+                return
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if not _bootstrap_path_safe(path):
+                return
+            line = (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode(
+                "utf-8"
+            )
+
+            def rotate(existing: bytes, current_size: int) -> bytes:
+                lines = existing.splitlines(keepends=True)
+                if current_size > _MAX_BOOTSTRAP_LOG_BYTES and b"\n" in existing:
+                    lines = lines[1:]
+                lines = lines[-(_MAX_BOOTSTRAP_RECORDS - 1) :]
+                while (
+                    lines
+                    and sum(len(item) for item in lines) + len(line) > _MAX_BOOTSTRAP_LOG_BYTES
+                ):
+                    lines.pop(0)
+                return b"".join(lines) + line
+
+            if os.name == "nt":
+                with _windows_directory_lease(path.parent):
+                    if not _bootstrap_path_safe(path):
+                        return
+                    try:
+                        details = os.lstat(str(path))
+                    except FileNotFoundError:
+                        details = None
+                    if details is not None and (
+                        not os.path.isfile(path) or _path_is_link_or_reparse(path)
+                    ):
+                        return
+                    current_size = int(details.st_size) if details is not None else 0
+                    if current_size + len(line) <= _MAX_BOOTSTRAP_LOG_BYTES:
+                        if details is None:
+                            descriptor = _windows_create_new_file(path)
+                            created = os.fstat(descriptor)
+                            created_identity = (int(created.st_dev), int(created.st_ino))
+                            try:
+                                try:
+                                    write_all(descriptor, line)
+                                    os.fsync(descriptor)
+                                finally:
+                                    os.close(descriptor)
+                            except BaseException:
+                                try:
+                                    _delete_bootstrap_owned(path, created_identity)
+                                except (FileNotFoundError, OSError):
+                                    pass
+                                raise
+                        else:
+                            before = (int(details.st_dev), int(details.st_ino))
+                            with _windows_object_handle(path):
+                                opened = os.lstat(str(path))
+                                if (int(opened.st_dev), int(opened.st_ino)) != before:
+                                    return
+                                descriptor = os.open(
+                                    str(path),
+                                    os.O_WRONLY | os.O_APPEND | getattr(os, "O_BINARY", 0),
+                                )
+                                try:
+                                    descriptor_details = os.fstat(descriptor)
+                                    if (
+                                        int(descriptor_details.st_dev),
+                                        int(descriptor_details.st_ino),
+                                    ) != before:
+                                        return
+                                    try:
+                                        write_all(descriptor, line)
+                                        os.fsync(descriptor)
+                                    except BaseException:
+                                        os.ftruncate(descriptor, current_size)
+                                        os.fsync(descriptor)
+                                        raise
+                                finally:
+                                    os.close(descriptor)
+                                after = os.lstat(str(path))
+                                if (int(after.st_dev), int(after.st_ino)) != before:
+                                    return
+                        return
+                    with _windows_object_handle(path):
+                        with path.open("rb") as stream:
+                            stream.seek(max(0, current_size - _MAX_BOOTSTRAP_LOG_BYTES))
+                            existing = stream.read(_MAX_BOOTSTRAP_LOG_BYTES)
+                    payload = rotate(existing, current_size)
+                    temporary = path.with_name(".%s.%s.tmp" % (path.name, uuid.uuid4().hex))
+                    if not _bootstrap_path_safe(temporary):
+                        return
+                    temporary_descriptor = _windows_create_new_file(temporary)
+                    temporary_details = os.fstat(temporary_descriptor)
+                    temporary_identity = (
+                        int(temporary_details.st_dev),
+                        int(temporary_details.st_ino),
+                    )
+                    try:
+                        try:
+                            write_all(temporary_descriptor, payload)
+                            os.fsync(temporary_descriptor)
+                        finally:
+                            os.close(temporary_descriptor)
+                    except BaseException:
+                        try:
+                            _delete_bootstrap_owned(temporary, temporary_identity)
+                        except (FileNotFoundError, OSError):
+                            pass
+                        raise
+                    if _bootstrap_object_identity(temporary) != temporary_identity:
+                        raise OSError("bootstrap temporary changed identity")
+                    backup = path.with_name(
+                        ".%s.bootstrap-backup-%s" % (path.name, uuid.uuid4().hex)
+                    )
+                    backup_identity = None
+                    publication_succeeded = False
+                    try:
+                        if _bootstrap_path_safe(path):
+                            existing_identity = (int(details.st_dev), int(details.st_ino))
+                            _BOOTSTRAP_RENAME_EXPECTED = existing_identity
+                            with _windows_object_handle(
+                                path, access=0x00010000 | 0x80
+                            ) as existing_handle:
+                                _BOOTSTRAP_RENAME_HANDLE = existing_handle
+                                _windows_rename_by_handle(
+                                    path,
+                                    backup,
+                                    expected_identity=existing_identity,
+                                )
+                            _BOOTSTRAP_RENAME_HANDLE = None
+                            _BOOTSTRAP_RENAME_EXPECTED = None
+                            backup_identity = _bootstrap_object_identity(backup)
+                            if backup_identity != existing_identity:
+                                raise OSError("bootstrap log changed identity")
+                            _BOOTSTRAP_RENAME_EXPECTED = temporary_identity
+                            with _windows_object_handle(
+                                temporary, access=0x00010000 | 0x80
+                            ) as temporary_handle:
+                                _BOOTSTRAP_RENAME_HANDLE = temporary_handle
+                                _windows_rename_by_handle(
+                                    temporary,
+                                    path,
+                                    expected_identity=temporary_identity,
+                                )
+                            _BOOTSTRAP_RENAME_HANDLE = None
+                            _BOOTSTRAP_RENAME_EXPECTED = None
+                            if _bootstrap_object_identity(path) != temporary_identity:
+                                raise OSError("bootstrap temporary changed identity")
+                            publication_succeeded = True
+                    except BaseException:
+                        _BOOTSTRAP_RENAME_HANDLE = None
+                        _BOOTSTRAP_RENAME_EXPECTED = None
+                        if backup_identity is not None:
+                            try:
+                                _bootstrap_object_identity(path)
+                            except (FileNotFoundError, OSError):
+                                try:
+                                    _BOOTSTRAP_RENAME_EXPECTED = backup_identity
+                                    with _windows_object_handle(
+                                        backup, access=0x00010000 | 0x80
+                                    ) as backup_handle:
+                                        _BOOTSTRAP_RENAME_HANDLE = backup_handle
+                                        _windows_rename_by_handle(
+                                            backup,
+                                            path,
+                                            expected_identity=backup_identity,
+                                        )
+                                    _BOOTSTRAP_RENAME_HANDLE = None
+                                    _BOOTSTRAP_RENAME_EXPECTED = None
+                                    if _bootstrap_object_identity(path) != backup_identity:
+                                        raise OSError("bootstrap rollback changed identity")
+                                    backup_identity = None
+                                except OSError:
+                                    pass
+                        raise
+                    finally:
+                        _BOOTSTRAP_RENAME_HANDLE = None
+                        _BOOTSTRAP_RENAME_EXPECTED = None
+                        if publication_succeeded and backup_identity is not None:
+                            try:
+                                _delete_bootstrap_owned(backup, backup_identity)
+                            except (FileNotFoundError, OSError):
+                                pass
+                        try:
+                            if _bootstrap_object_identity(temporary) == temporary_identity:
+                                _delete_bootstrap_owned(temporary, temporary_identity)
+                        except (FileNotFoundError, OSError):
+                            pass
+                return
+
+            parent_before = os.lstat(str(path.parent))
+            if not stat.S_ISDIR(parent_before.st_mode) or _path_is_link_or_reparse(path.parent):
+                return
+            parent_descriptor = os.open(
+                str(path.parent),
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+            )
+            parent_opened = os.fstat(parent_descriptor)
+            if (int(parent_opened.st_dev), int(parent_opened.st_ino)) != (
+                int(parent_before.st_dev),
+                int(parent_before.st_ino),
+            ):
+                return
+            try:
+                try:
+                    details = os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
+                except FileNotFoundError:
+                    details = None
+                if details is not None and not stat.S_ISREG(details.st_mode):
+                    return
+                current_size = int(details.st_size) if details is not None else 0
+                if current_size + len(line) <= _MAX_BOOTSTRAP_LOG_BYTES:
+                    flags = os.O_WRONLY | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+                    if details is None:
+                        flags |= os.O_CREAT | os.O_EXCL
+                    descriptor = os.open(path.name, flags, 0o666, dir_fd=parent_descriptor)
+                    try:
+                        opened = os.fstat(descriptor)
+                        if details is not None and (int(opened.st_dev), int(opened.st_ino)) != (
+                            int(details.st_dev),
+                            int(details.st_ino),
+                        ):
+                            return
+                        try:
+                            write_all(descriptor, line)
+                            os.fsync(descriptor)
+                        except BaseException:
+                            if details is not None:
+                                os.ftruncate(descriptor, int(details.st_size))
+                                os.fsync(descriptor)
+                            raise
+                    finally:
+                        os.close(descriptor)
+                    return
+                descriptor = os.open(
+                    path.name,
+                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=parent_descriptor,
+                )
+                try:
+                    opened = os.fstat(descriptor)
+                    if (int(opened.st_dev), int(opened.st_ino)) != (
+                        int(details.st_dev),
+                        int(details.st_ino),
+                    ):
+                        return
+                    os.lseek(
+                        descriptor, max(0, current_size - _MAX_BOOTSTRAP_LOG_BYTES), os.SEEK_SET
+                    )
+                    existing = os.read(descriptor, _MAX_BOOTSTRAP_LOG_BYTES)
+                finally:
+                    os.close(descriptor)
+                payload = rotate(existing, current_size)
+                # Stage the complete bounded payload before changing the log
+                # name.  This keeps a short write or disk-full error from
+                # truncating the previous diagnostics.  Move the old inode to
+                # a private backup so a raced temporary can be preserved and
+                # the previous log restored before the failure is swallowed.
+                temporary_name = ".%s.%s.tmp" % (path.name, uuid.uuid4().hex)
+                temporary_descriptor = os.open(
+                    temporary_name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o666,
+                    dir_fd=parent_descriptor,
+                )
+                temporary_opened = os.fstat(temporary_descriptor)
+                temporary_identity = (
+                    int(temporary_opened.st_dev),
+                    int(temporary_opened.st_ino),
+                )
+                backup_name = ".%s.bootstrap-backup-%s" % (path.name, uuid.uuid4().hex)
+                backup_identity = None
+                committed = False
+                publication_succeeded = False
+                try:
+                    try:
+                        write_all(temporary_descriptor, payload)
+                        os.fsync(temporary_descriptor)
+                    except BaseException:
+                        try:
+                            unlink_bound(temporary_name, temporary_identity)
+                        except OSError:
+                            pass
+                        raise
+                finally:
+                    os.close(temporary_descriptor)
+                try:
+                    posix_rename(
+                        path.name,
+                        backup_name,
+                        src_dir_fd=parent_descriptor,
+                        dst_dir_fd=parent_descriptor,
+                    )
+                    backup_details = os.stat(
+                        backup_name, dir_fd=parent_descriptor, follow_symlinks=False
+                    )
+                    backup_identity = (
+                        int(backup_details.st_dev),
+                        int(backup_details.st_ino),
+                    )
+                    if backup_identity != (int(details.st_dev), int(details.st_ino)):
+                        raise OSError("bootstrap log changed identity")
+                    posix_link(
+                        temporary_name,
+                        path.name,
+                        src_dir_fd=parent_descriptor,
+                        dst_dir_fd=parent_descriptor,
+                        follow_symlinks=False,
+                    )
+                    committed = True
+                    published = os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
+                    if (int(published.st_dev), int(published.st_ino)) != temporary_identity:
+                        raise OSError("bootstrap temporary changed identity")
+                    os.fsync(parent_descriptor)
+                    publication_succeeded = True
+                except BaseException:
+                    if committed and temporary_identity is not None:
+                        try:
+                            published = os.stat(
+                                path.name, dir_fd=parent_descriptor, follow_symlinks=False
+                            )
+                        except OSError:
+                            published = None
+                        if (
+                            published is not None
+                            and (int(published.st_dev), int(published.st_ino)) != temporary_identity
+                        ):
+                            foreign_name = ".%s.bootstrap-foreign-%s" % (
+                                path.name,
+                                uuid.uuid4().hex,
+                            )
+                            try:
+                                posix_rename(
+                                    path.name,
+                                    foreign_name,
+                                    src_dir_fd=parent_descriptor,
+                                    dst_dir_fd=parent_descriptor,
+                                )
+                            except OSError:
+                                pass
+                    if backup_identity is not None:
+                        try:
+                            os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
+                        except OSError:
+                            try:
+                                posix_link(
+                                    backup_name,
+                                    path.name,
+                                    src_dir_fd=parent_descriptor,
+                                    dst_dir_fd=parent_descriptor,
+                                    follow_symlinks=False,
+                                )
+                                backup_current = os.stat(
+                                    path.name,
+                                    dir_fd=parent_descriptor,
+                                    follow_symlinks=False,
+                                )
+                                if (
+                                    int(backup_current.st_dev),
+                                    int(backup_current.st_ino),
+                                ) != backup_identity:
+                                    raise OSError("bootstrap backup changed identity")
+                                unlink_bound(backup_name, backup_identity)
+                                backup_identity = None
+                            except OSError:
+                                pass
+                    raise
+                finally:
+                    try:
+                        if publication_succeeded and backup_identity is not None:
+                            backup_current = os.stat(
+                                backup_name, dir_fd=parent_descriptor, follow_symlinks=False
+                            )
+                            if (
+                                int(backup_current.st_dev),
+                                int(backup_current.st_ino),
+                            ) == backup_identity:
+                                unlink_bound(backup_name, backup_identity)
+                    except OSError:
+                        pass
+                    try:
+                        temporary_current = os.stat(
+                            temporary_name, dir_fd=parent_descriptor, follow_symlinks=False
+                        )
+                    except OSError:
+                        temporary_current = None
+                    if temporary_current is not None and temporary_identity is not None:
+                        if (
+                            int(temporary_current.st_dev),
+                            int(temporary_current.st_ino),
+                        ) == temporary_identity:
+                            try:
+                                unlink_bound(temporary_name, temporary_identity)
+                            except OSError:
+                                pass
+            finally:
+                os.close(parent_descriptor)
+    except (OSError, RuntimeError, ValueError, AttributeError):
         pass
 
 
-try:
+@contextmanager
+def capture_bootstrap_errors(stage: str):
+    """Record and re-raise startup failures while GIMP loads the plug-in."""
+    try:
+        yield
+    except BaseException as exc:
+        _capture_bootstrap_error(stage, exc)
+        raise
+
+
+with capture_bootstrap_errors("gi-import"):
     import gi
 
     gi.require_version("Gegl", "0.4")
     gi.require_version("Gimp", "3.0")
     from gi.repository import Gegl, Gimp, Gio, GLib  # noqa: E402
-except BaseException as exc:
-    _capture_bootstrap_error("gi-import", exc)
-    raise
 
 
 VERSION = "0.4.1"  # x-release-please-version
@@ -779,11 +1486,8 @@ class DccMcpGimp(Gimp.PlugIn):
 
     @staticmethod
     def _run(procedure: Any, run_mode: Any, config: Any, plugin: Any) -> Any:
-        try:
+        with capture_bootstrap_errors("bridge-startup"):
             return DccMcpGimp._run_bridge(procedure, run_mode, config, plugin)
-        except BaseException as exc:
-            _capture_bootstrap_error("bridge-startup", exc)
-            raise
 
     @staticmethod
     def _run_bridge(procedure: Any, run_mode: Any, config: Any, plugin: Any) -> Any:

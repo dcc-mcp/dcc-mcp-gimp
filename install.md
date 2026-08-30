@@ -136,9 +136,27 @@ Only `verify.directly_usable: true` proves the adapter is ready. A failed
 report includes `failure_stage`, `failure_reason`, and structured
 `next_steps[]`.
 
-The receipt is stored at `~/.dcc-mcp/receipts/gimp.json`. `status --json`
-classifies the profile as `fresh`, `current`, `upgrade`, `repair`, or
-`partial`.
+The receipt is stored at `~/.dcc-mcp/receipts/gimp.json`. This v1 contract
+allows one receipted GIMP profile per user: if `--destination` selects a
+different profile while that receipt exists, the operation fails closed with
+exit `10` and leaves the existing profile untouched. `status --json`
+classifies the selected profile as `fresh`, `current`, `upgrade`, `repair`, or
+`partial`. The receipt binds the complete owned manifest and the plug-in entry
+point executable bit (POSIX); a chmod-only drift is reported as `repair` or a
+failed artifact verification.
+
+Receipts created by an earlier v1 build that do not contain
+`entry_point_executable` are treated as legacy and are never silently migrated:
+`status` reports `repair` (exit `40`), `upgrade --yes` refuses replacement
+(exit `30`), and `uninstall --yes` refuses deletion (exit `10`). Run a fresh
+`install --yes` after reviewing the profile if the old installation is yours.
+All lifecycle mutations re-check the selected profile and every receipted file
+by physical identity immediately before changing or removing it; a pathname
+or junction/symlink swap fails closed and leaves the foreign object untouched.
+
+When an explicit `--instance-id` or `--host-pid` is supplied, the same values
+are retained in the plan and emitted in the `verify-selected-gimp` command in
+`next_steps[]`; execute that command verbatim.
 
 ## Upgrade
 
