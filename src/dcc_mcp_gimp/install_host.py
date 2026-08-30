@@ -44,6 +44,17 @@ def _path_is_link_or_reparse(path: Path) -> bool:
         return True
 
 
+def _parent_has_reparse(path: Path) -> bool:
+    parent = path.parent
+    while True:
+        if _path_is_link_or_reparse(parent):
+            return True
+        next_parent = parent.parent
+        if next_parent == parent:
+            return False
+        parent = next_parent
+
+
 def default_plugin_dir() -> Path:
     if sys.platform == "darwin":
         return Path.home() / "Library/Application Support/GIMP/3.0/plug-ins"
@@ -146,11 +157,15 @@ def _resolve_python(value: Optional[Path], executable: Path) -> Path:
         )
     try:
         candidate = configured.expanduser().absolute()
-        if _path_is_link_or_reparse(candidate):
+        if _parent_has_reparse(candidate):
+            raise InstallFailure(EXIT_PREFLIGHT, "python", "Python interpreter parent is linked")
+        resolved = candidate.resolve(strict=True)
+        # A normal file symlink is accepted, but a junction/reparse directory
+        # or a non-regular target is never an executable identity.
+        if candidate.is_dir() and _path_is_link_or_reparse(candidate):
             raise InstallFailure(EXIT_PREFLIGHT, "python", "Python interpreter path is linked")
-        resolved = candidate.resolve()
-        if os.path.normcase(str(resolved)) != os.path.normcase(str(candidate)):
-            raise InstallFailure(EXIT_PREFLIGHT, "python", "Python interpreter path is linked")
+        if _path_is_link_or_reparse(resolved):
+            raise InstallFailure(EXIT_PREFLIGHT, "python", "Python interpreter target is linked")
         valid = resolved.is_file() and resolved.stat().st_size > 0
     except InstallFailure:
         raise
@@ -188,11 +203,13 @@ def _resolve_gimp(value: Optional[Path]) -> Path:
         raise InstallFailure(EXIT_PREFLIGHT, "gimp", "GIMP 3 installation was not found")
     try:
         candidate = value.expanduser().absolute()
-        if _path_is_link_or_reparse(candidate):
+        if _parent_has_reparse(candidate):
+            raise InstallFailure(EXIT_PREFLIGHT, "gimp", "GIMP executable parent is linked")
+        resolved = candidate.resolve(strict=True)
+        if candidate.is_dir() and _path_is_link_or_reparse(candidate):
             raise InstallFailure(EXIT_PREFLIGHT, "gimp", "GIMP executable path is linked")
-        resolved = candidate.resolve()
-        if os.path.normcase(str(resolved)) != os.path.normcase(str(candidate)):
-            raise InstallFailure(EXIT_PREFLIGHT, "gimp", "GIMP executable path is linked")
+        if _path_is_link_or_reparse(resolved):
+            raise InstallFailure(EXIT_PREFLIGHT, "gimp", "GIMP executable target is linked")
         if resolved.is_dir():
             candidates = (
                 resolved / "gimp-3.0.exe",
