@@ -609,6 +609,15 @@ def _assert_receipt_file_identity(
         raise InstallFailure(EXIT_PREFLIGHT, stage, "Managed receipt file changed identity")
 
 
+def _assert_receipt_file_identity_strict(
+    path: Path, expected: tuple[int, ...], stage: str = "receipt"
+) -> None:
+    """Recheck a receipt inode without going through the injectable seam."""
+    actual = _receipt_file_identity(path, stage)
+    if (actual[:2] if len(expected) == 2 else actual) != tuple(expected):
+        raise InstallFailure(EXIT_PREFLIGHT, stage, "Managed receipt file changed identity")
+
+
 def _assert_receipt_name_identity(
     path: Path, expected: tuple[int, ...], stage: str = "receipt"
 ) -> None:
@@ -1218,6 +1227,7 @@ def _replace_receipt_owned(
                 _assert_receipt_file_identity(source, source_identity, "uninstall")
                 _assert_receipt_name_identity(source, source_identity, "uninstall")
                 _assert_receipt_file_identity(source, source_identity, "uninstall")
+                _assert_receipt_file_identity_strict(source, source_identity, "uninstall")
                 if (
                     _directory_identity(destination.parent, "uninstall")
                     != destination_parent_identity
@@ -1232,6 +1242,7 @@ def _replace_receipt_owned(
                     with _windows_object_handle(
                         source, "uninstall", access=0x00010000 | 0x80
                     ) as source_handle:
+                        _assert_receipt_file_identity_strict(source, source_identity, "uninstall")
                         _windows_rename_by_handle(
                             source,
                             destination,
@@ -1257,21 +1268,23 @@ def _replace_receipt_owned(
             destination_descriptor = _open_relative_dir_nofollow(
                 root, expected_identity, relative_parent, create=True
             )
-        _assert_receipt_descriptor_identity(
-            source_descriptor, source.name, source_identity, "uninstall"
-        )
-        _assert_receipt_file_identity(source, source_identity, "uninstall")
-        _assert_receipt_name_identity(source, source_identity, "uninstall")
-        _assert_receipt_file_identity(source, source_identity, "uninstall")
-        os.replace(
-            source.name,
-            destination.name,
-            src_dir_fd=source_descriptor,
-            dst_dir_fd=destination_descriptor,
-        )
-        _assert_receipt_descriptor_identity(
-            destination_descriptor, destination.name, source_identity[:2], "uninstall"
-        )
+        with _posix_directory_locks(source_descriptor, destination_descriptor):
+            _assert_receipt_descriptor_identity(
+                source_descriptor, source.name, source_identity, "uninstall"
+            )
+            _assert_receipt_file_identity(source, source_identity, "uninstall")
+            _assert_receipt_name_identity(source, source_identity, "uninstall")
+            _assert_receipt_file_identity(source, source_identity, "uninstall")
+            _assert_receipt_file_identity_strict(source, source_identity, "uninstall")
+            os.replace(
+                source.name,
+                destination.name,
+                src_dir_fd=source_descriptor,
+                dst_dir_fd=destination_descriptor,
+            )
+            _assert_receipt_descriptor_identity(
+                destination_descriptor, destination.name, source_identity[:2], "uninstall"
+            )
         _assert_physical_root(root, expected_identity)
     except InstallFailure:
         raise
@@ -1301,17 +1314,20 @@ def _unlink_receipt_owned(path: Path) -> None:
             _assert_receipt_name_identity(path, expected_identity, "receipt")
             _assert_receipt_file_identity(path, expected_identity, "receipt")
             with _windows_object_handle(path, "receipt", access=0x00010000 | 0x80) as handle:
+                _assert_receipt_file_identity_strict(path, expected_identity, "receipt")
                 _windows_delete_handle(handle)
         return
     descriptor = None
     try:
         _assert_receipt_path_safe(path)
         descriptor = _open_absolute_dir_nofollow(path.parent)
-        _assert_receipt_descriptor_identity(descriptor, path.name, expected_identity, "receipt")
-        _assert_receipt_file_identity(path, expected_identity, "receipt")
-        _assert_receipt_name_identity(path, expected_identity, "receipt")
-        _assert_receipt_file_identity(path, expected_identity, "receipt")
-        os.unlink(path.name, dir_fd=descriptor)
+        with _posix_directory_lock(descriptor):
+            _assert_receipt_descriptor_identity(descriptor, path.name, expected_identity, "receipt")
+            _assert_receipt_file_identity(path, expected_identity, "receipt")
+            _assert_receipt_name_identity(path, expected_identity, "receipt")
+            _assert_receipt_file_identity(path, expected_identity, "receipt")
+            _assert_receipt_file_identity_strict(path, expected_identity, "receipt")
+            os.unlink(path.name, dir_fd=descriptor)
     except FileNotFoundError:
         return
     except InstallFailure:
@@ -1356,30 +1372,132 @@ def _cleanup_tree(path: Path) -> dict[str, Any]:
 _DEFAULT_CLEANUP_TREE = _cleanup_tree
 
 
-def _remove_entry_at(parent_descriptor: int, name: str) -> None:
+@contextlib.contextmanager
+def _posix_directory_lock(descriptor: int):
+    """Serialize identity checks and child mutations for one directory fd."""
+    try:
+        import fcntl
+    except ImportError:
+        yield
+        return
+    fcntl.flock(descriptor, fcntl.LOCK_EX)
+    try:
+        yield
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+
+
+@contextlib.contextmanager
+def _posix_directory_locks(*descriptors: int):
+    """Lock distinct directory inodes in a stable order."""
+    unique: dict[tuple[int, int], int] = {}
+    for descriptor in descriptors:
+        details = os.fstat(descriptor)
+        unique.setdefault((int(details.st_dev), int(details.st_ino)), descriptor)
+    with contextlib.ExitStack() as stack:
+        for descriptor in [unique[key] for key in sorted(unique)]:
+            stack.enter_context(_posix_directory_lock(descriptor))
+        yield
+
+
+@contextlib.contextmanager
+def _posix_stable_directory(path: Path, stage: str):
+    """Yield an fd-backed path when the platform exposes one."""
+    if os.name == "nt":
+        yield None
+        return
+    descriptor = None
+    try:
+        descriptor = _open_absolute_dir_nofollow(path)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise InstallFailure(EXIT_PREFLIGHT, stage, "Managed directory is unavailable") from exc
+    try:
+        stable = None
+        for prefix in ("/proc/self/fd", "/dev/fd"):
+            candidate = Path(prefix) / str(descriptor)
+            try:
+                if candidate.is_dir():
+                    stable = candidate
+                    break
+            except (OSError, RuntimeError, ValueError):
+                continue
+        yield stable
+    finally:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _remove_entry_at(
+    parent_descriptor: int,
+    name: str,
+    *,
+    expected: Optional[Mapping[str, tuple[int, ...]]] = None,
+    relative: str = "",
+) -> None:
     """Recursively remove one entry relative to a held no-follow directory."""
-    details = os.lstat(name, dir_fd=parent_descriptor)
-    identity = (int(details.st_dev), int(details.st_ino))
-    if stat.S_ISDIR(details.st_mode) and not stat.S_ISLNK(details.st_mode):
-        child = os.open(
-            name,
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
-            dir_fd=parent_descriptor,
-        )
-        try:
-            for child_name in os.listdir(child):
-                _remove_entry_at(child, child_name)
+    with _posix_directory_lock(parent_descriptor):
+        details = os.lstat(name, dir_fd=parent_descriptor)
+        identity = (int(details.st_dev), int(details.st_ino))
+        expected_identity = expected.get(relative) if expected is not None else None
+        if expected is not None:
+            if expected_identity is None:
+                raise InstallFailure(
+                    EXIT_INSTALL, "cleanup", "Private transaction entry is unowned"
+                )
+            if identity != tuple(expected_identity)[:2]:
+                raise InstallFailure(
+                    EXIT_INSTALL, "cleanup", "Private transaction entry changed identity"
+                )
+        if stat.S_ISDIR(details.st_mode) and not stat.S_ISLNK(details.st_mode):
+            child = os.open(
+                name,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=parent_descriptor,
+            )
+            try:
+                for child_name in os.listdir(child):
+                    child_relative = child_name if not relative else f"{relative}/{child_name}"
+                    _remove_entry_at(
+                        child,
+                        child_name,
+                        expected=expected,
+                        relative=child_relative,
+                    )
+                current = os.lstat(name, dir_fd=parent_descriptor)
+                if (int(current.st_dev), int(current.st_ino)) != identity:
+                    raise InstallFailure(EXIT_INSTALL, "cleanup", "Managed path changed identity")
+                child_current = os.fstat(child)
+                if (int(child_current.st_dev), int(child_current.st_ino)) != identity:
+                    raise InstallFailure(EXIT_INSTALL, "cleanup", "Managed path changed identity")
+                os.rmdir(name, dir_fd=parent_descriptor)
+            finally:
+                os.close(child)
+            return
+        # Open the child and bind its inode before the final name check.  The
+        # directory lock provides the protocol boundary for cooperating
+        # writers; the strict recheck fails closed if an injected or hostile
+        # pathname swap is observed before the destructive syscall.
+        if stat.S_ISLNK(details.st_mode):
             current = os.lstat(name, dir_fd=parent_descriptor)
             if (int(current.st_dev), int(current.st_ino)) != identity:
                 raise InstallFailure(EXIT_INSTALL, "cleanup", "Managed path changed identity")
-            os.rmdir(name, dir_fd=parent_descriptor)
+            os.unlink(name, dir_fd=parent_descriptor)
+            return
+        child_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        child_fd = os.open(name, child_flags, dir_fd=parent_descriptor)
+        try:
+            child_details = os.fstat(child_fd)
+            if (int(child_details.st_dev), int(child_details.st_ino)) != identity:
+                raise InstallFailure(EXIT_INSTALL, "cleanup", "Managed path changed identity")
+            current = os.lstat(name, dir_fd=parent_descriptor)
+            if (int(current.st_dev), int(current.st_ino)) != identity:
+                raise InstallFailure(EXIT_INSTALL, "cleanup", "Managed path changed identity")
+            os.unlink(name, dir_fd=parent_descriptor)
         finally:
-            os.close(child)
-        return
-    current = os.lstat(name, dir_fd=parent_descriptor)
-    if (int(current.st_dev), int(current.st_ino)) != identity:
-        raise InstallFailure(EXIT_INSTALL, "cleanup", "Managed path changed identity")
-    os.unlink(name, dir_fd=parent_descriptor)
+            os.close(child_fd)
 
 
 def _cleanup_tree_owned(
@@ -1489,13 +1607,21 @@ def _cleanup_private_tree(
                             EXIT_PREFLIGHT, stage, "Managed directory changed identity"
                         )
                     try:
-                        _remove_entry_at(parent_descriptor, path.name)
+                        if expected_identities is not None:
+                            _assert_private_tree_identities(path, expected_identities, stage)
+                        _remove_entry_at(
+                            parent_descriptor,
+                            path.name,
+                            expected=expected_identities,
+                        )
                     except FileNotFoundError:
                         return {"success": True, "requires_restart": False}
                 finally:
                     os.close(parent_descriptor)
                 return {"success": True, "requires_restart": False}
             result = _cleanup_tree(path)
+    except InstallFailure:
+        raise
     except BaseException as exc:
         raise InstallFailure(EXIT_INSTALL, stage, "Private transaction cleanup failed") from exc
     return result if isinstance(result, dict) else {"success": False}
@@ -1841,41 +1967,92 @@ def _copy_validated_recovery(
     expected = _recovery_manifest(source)
     destination_parent = recovery.parent
     destination_parent_identity = _directory_identity(destination_parent, "recovery")
-    # Keep the snapshot outside the destination tree.  A destination-parent
-    # pathname swap must not be able to redirect copytree writes into an
-    # attacker-controlled junction.  The final move remains identity-bound
-    # and fails closed if the destination is on another filesystem.
+    # Prefer the system temporary directory when it is on the destination
+    # volume, but fall back to a sibling of the destination parent for custom
+    # profiles on another drive. Publishing a staged tree is a rename, so a
+    # cross-device temporary would make every recovery transaction fail.
+    staging_parent: Optional[Path] = None
+    staging_parent_identity: Optional[tuple[int, int]] = None
+    candidates: list[Path] = []
     try:
-        staging_parent = Path(tempfile.gettempdir()).resolve(strict=True)
-    except (OSError, RuntimeError, ValueError) as exc:
-        raise InstallFailure(
-            EXIT_PREFLIGHT, "recovery", "Recovery staging parent is unavailable"
-        ) from exc
-    _assert_path_components_safe(staging_parent, "recovery")
-    staging_parent_identity = _directory_identity(staging_parent, "recovery")
-    try:
-        staging_root = Path(
-            tempfile.mkdtemp(prefix=".dcc-mcp-gimp-recovery-", dir=str(staging_parent))
-        )
-    except OSError as exc:
-        raise InstallFailure(
-            EXIT_INSTALL, "recovery", "Recovery staging directory could not be created"
-        ) from exc
-    if _directory_identity(staging_parent, "recovery") != staging_parent_identity:
+        candidates.append(Path(tempfile.gettempdir()).expanduser())
+    except (OSError, RuntimeError, TypeError, ValueError):
+        pass
+    candidates.append(destination_parent.parent)
+    seen_candidates: set[str] = set()
+    for candidate in candidates:
         try:
-            _cleanup_private_tree(staging_root, "recovery")
+            _assert_path_components_safe(candidate, "recovery")
+            resolved = candidate.resolve(strict=True)
+            _assert_path_components_safe(resolved, "recovery")
+            identity = _directory_identity(resolved, "recovery")
         except InstallFailure:
-            pass
-        raise InstallFailure(EXIT_PREFLIGHT, "recovery", "Recovery staging parent changed identity")
+            continue
+        except (OSError, RuntimeError, ValueError):
+            continue
+        key = os.path.normcase(str(resolved))
+        if key in seen_candidates:
+            continue
+        seen_candidates.add(key)
+        if identity[0] == destination_parent_identity[0]:
+            staging_parent = resolved
+            staging_parent_identity = identity
+            break
+    if staging_parent is None or staging_parent_identity is None:
+        raise InstallFailure(
+            EXIT_PREFLIGHT,
+            "recovery",
+            "No same-volume recovery staging directory is available",
+        )
+
+    staging_root: Optional[Path] = None
+    with _windows_directory_lease(staging_parent, "recovery"):
+        if _directory_identity(staging_parent, "recovery") != staging_parent_identity:
+            raise InstallFailure(
+                EXIT_PREFLIGHT, "recovery", "Recovery staging parent changed identity"
+            )
+        try:
+            staging_root = Path(
+                tempfile.mkdtemp(prefix=".dcc-mcp-gimp-recovery-", dir=str(staging_parent))
+            )
+        except OSError as exc:
+            raise InstallFailure(
+                EXIT_INSTALL,
+                "recovery",
+                "Recovery staging directory could not be created",
+            ) from exc
+        if _directory_identity(staging_parent, "recovery") != staging_parent_identity:
+            raise InstallFailure(
+                EXIT_PREFLIGHT, "recovery", "Recovery staging parent changed identity"
+            )
     staged_recovery = staging_root / recovery.name
     try:
-        # Build the snapshot outside the managed tree.  A pathname swap of the
-        # eventual destination therefore cannot redirect copytree writes into
-        # a junction or foreign directory.
-        shutil.copytree(source, staged_recovery, symlinks=True, copy_function=shutil.copy2)
+        # Build the snapshot under a leased, same-volume parent. A pathname
+        # swap is blocked before copytree can write externally.
+        with _windows_directory_lease(staging_parent, "recovery"):
+            if _directory_identity(staging_parent, "recovery") != staging_parent_identity:
+                raise InstallFailure(
+                    EXIT_PREFLIGHT, "recovery", "Recovery staging parent changed identity"
+                )
+            with _posix_stable_directory(staging_parent, "recovery") as stable_parent:
+                copy_parent = stable_parent or staging_parent
+                copy_destination = copy_parent / staging_root.name / recovery.name
+                shutil.copytree(source, copy_destination, symlinks=True, copy_function=shutil.copy2)
+            if _directory_identity(staging_parent, "recovery") != staging_parent_identity:
+                raise InstallFailure(
+                    EXIT_PREFLIGHT, "recovery", "Recovery staging parent changed identity"
+                )
+    except InstallFailure:
+        try:
+            with _windows_directory_lease(staging_parent, "recovery"):
+                _cleanup_private_tree(staging_root, "recovery")
+        except InstallFailure:
+            pass
+        raise
     except OSError as exc:
         try:
-            _cleanup_private_tree(staging_root, "recovery")
+            with _windows_directory_lease(staging_parent, "recovery"):
+                _cleanup_private_tree(staging_root, "recovery")
         except InstallFailure:
             pass
         raise InstallFailure(
@@ -1921,7 +2098,12 @@ def _copy_validated_recovery(
         ) from exc
     finally:
         try:
-            _cleanup_private_tree(staging_root, "recovery")
+            with _windows_directory_lease(staging_parent, "recovery"):
+                if _directory_identity(staging_parent, "recovery") != staging_parent_identity:
+                    raise InstallFailure(
+                        EXIT_PREFLIGHT, "recovery", "Recovery staging parent changed identity"
+                    )
+                _cleanup_private_tree(staging_root, "recovery")
         except InstallFailure:
             # Never follow an untrusted staging pathname during cleanup.  A
             # failed identity proof leaves the private temporary for manual
@@ -2557,9 +2739,9 @@ def _execute_uninstall(report: dict[str, Any]) -> tuple[dict[str, Any], int]:
         )
     _assert_physical_root(destination, root_identity)
     owned_snapshot = _capture_owned_bytes(target, receipt_path, receipt)
-    target_tree_identities = (
-        _private_tree_identities(target, "uninstall") if os.name == "nt" else None
-    )
+    # Bind every entry that will be moved into quarantine on every platform;
+    # POSIX cleanup must reject a late unowned child just as Windows does.
+    target_tree_identities = _private_tree_identities(target, "uninstall")
     _assert_target_identity(target, planned_target_identity, "uninstall")
     _assert_owned_file_identities(target, planned_file_identities, "uninstall")
     _assert_physical_root(destination, root_identity)
@@ -2580,7 +2762,7 @@ def _execute_uninstall(report: dict[str, Any]) -> tuple[dict[str, Any], int]:
         transaction_created = True
         snapshot.mkdir()
         quarantine.mkdir()
-        if os.name == "nt" and target_tree_identities is not None:
+        if target_tree_identities is not None:
             quarantine_expected_identities = {"": _object_identity(quarantine, "uninstall")}
             for relative, identity in target_tree_identities.items():
                 key = _PLUGIN_NAME if not relative else "%s/%s" % (_PLUGIN_NAME, relative)
@@ -2625,10 +2807,16 @@ def _execute_uninstall(report: dict[str, Any]) -> tuple[dict[str, Any], int]:
                 quarantine_receipt, "uninstall"
             )
         _assert_physical_root(destination, root_identity)
-        removed = _cleanup_private_tree(
-            quarantine,
-            expected_identities=quarantine_expected_identities,
-        )
+        try:
+            removed = _cleanup_private_tree(
+                quarantine,
+                expected_identities=quarantine_expected_identities,
+            )
+        except BaseException:
+            # An unexpected quarantine entry must remain available for manual
+            # recovery; never fall through to recursive transaction cleanup.
+            preserve_transaction = True
+            raise
         if not removed.get("success"):
             raise InstallFailure(
                 EXIT_REQUIRES_RESTART if removed.get("requires_restart") else EXIT_INSTALL,
