@@ -1,5 +1,6 @@
 import builtins
 import json
+import os
 import runpy
 import socket
 import sys
@@ -168,6 +169,27 @@ def test_runtime_bootstrap_concurrent_writers_remain_bounded(runtime, tmp_path, 
         )
 
     assert errors.stat().st_size <= 256 * 1024
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Exercises Windows bootstrap temp identity lease")
+def test_runtime_windows_bootstrap_rotation_rejects_temp_swap(runtime, tmp_path, monkeypatch):
+    errors = tmp_path / "bootstrap-errors.jsonl"
+    errors.write_bytes(b"x" * (260 * 1024))
+    monkeypatch.setenv("DCC_MCP_GIMP_BOOTSTRAP_ERRORS", str(errors))
+    capture = runtime["_capture_bootstrap_error"]
+
+    def swap(source, _destination):
+        foreign = source.with_name("foreign-bootstrap.bin")
+        foreign.write_bytes(b"FOREIGN-BOOTSTRAP")
+        # The capture transaction holds a no-delete-share handle on the
+        # temporary, so an injected pathname swap must fail before publish.
+        source.unlink()
+
+    monkeypatch.setitem(capture.__globals__, "_windows_rename_by_handle", swap)
+    capture("bridge-startup", RuntimeError("new failure"))
+
+    assert b"FOREIGN-BOOTSTRAP" not in errors.read_bytes()
+    assert b"new failure" not in errors.read_bytes()
 
 
 def test_plugin_captures_gi_import_failure(tmp_path, monkeypatch):

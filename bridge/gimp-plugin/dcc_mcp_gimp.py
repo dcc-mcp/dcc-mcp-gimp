@@ -24,6 +24,8 @@ _MAX_BOOTSTRAP_RECORD_BYTES = 64 * 1024
 _MAX_BOOTSTRAP_RECORDS = 1024
 _MAX_BOOTSTRAP_LOG_BYTES = 256 * 1024
 _BOOTSTRAP_WRITE_LOCK = threading.Lock()
+_BOOTSTRAP_RENAME_EXPECTED: Optional[tuple[int, int]] = None
+_BOOTSTRAP_RENAME_HANDLE: Any = None
 
 
 def _path_is_link_or_reparse(path: Path) -> bool:
@@ -105,7 +107,7 @@ def _windows_directory_lease(path: Path):
 
 
 @contextmanager
-def _windows_object_handle(path: Path):
+def _windows_object_handle(path: Path, *, access: int = 0x80):
     """Hold one bootstrap file with delete sharing disabled."""
     if os.name != "nt":
         yield
@@ -127,7 +129,7 @@ def _windows_object_handle(path: Path):
     kernel32.CloseHandle.restype = ctypes.c_int
     handle = kernel32.CreateFileW(
         str(path),
-        0x80,
+        access,
         0x1 | 0x2,
         None,
         3,
@@ -145,7 +147,16 @@ def _windows_object_handle(path: Path):
         kernel32.CloseHandle(handle)
 
 
-def _windows_rename_by_handle(source: Path, destination: Path) -> None:
+def _bootstrap_object_identity(path: Path) -> tuple[int, int]:
+    details = os.lstat(str(path))
+    if not stat.S_ISREG(details.st_mode) or _path_is_link_or_reparse(path):
+        raise OSError("bootstrap file is linked or not regular")
+    return int(details.st_dev), int(details.st_ino)
+
+
+def _windows_rename_by_handle(
+    source: Path, destination: Path, *, expected_identity: Optional[tuple[int, int]] = None
+) -> None:
     """Atomically replace a bootstrap file through its held source handle."""
     import ctypes
 
@@ -163,7 +174,14 @@ def _windows_rename_by_handle(source: Path, destination: Path) -> None:
     payload = (ctypes.c_ubyte * (offset + len(encoded)))()
     ctypes.memmove(payload, ctypes.byref(header), ctypes.sizeof(header))
     ctypes.memmove(ctypes.addressof(payload) + offset, encoded, len(encoded))
-    with _windows_object_handle(source) as handle:
+    source_identity = _bootstrap_object_identity(source)
+    bound_identity = expected_identity or _BOOTSTRAP_RENAME_EXPECTED
+    if bound_identity is not None and source_identity != tuple(bound_identity):
+        raise OSError("bootstrap temporary changed identity")
+
+    def rename_with_handle(handle: Any) -> None:
+        if _bootstrap_object_identity(source) != source_identity:
+            raise OSError("bootstrap temporary changed identity")
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         kernel32.SetFileInformationByHandle.argtypes = [
             ctypes.c_void_p,
@@ -175,6 +193,13 @@ def _windows_rename_by_handle(source: Path, destination: Path) -> None:
         if not kernel32.SetFileInformationByHandle(handle, 3, payload, len(payload)):
             raise OSError(ctypes.get_last_error(), "bootstrap rename failed")
 
+    bound_handle = _BOOTSTRAP_RENAME_HANDLE
+    if bound_handle is not None:
+        rename_with_handle(bound_handle)
+    else:
+        with _windows_object_handle(source, access=0x00010000 | 0x80) as handle:
+            rename_with_handle(handle)
+
 
 def _bootstrap_error_path() -> Path:
     configured = os.environ.get("DCC_MCP_GIMP_BOOTSTRAP_ERRORS")
@@ -184,6 +209,7 @@ def _bootstrap_error_path() -> Path:
 
 
 def _capture_bootstrap_error(stage: str, error: BaseException) -> None:
+    global _BOOTSTRAP_RENAME_EXPECTED, _BOOTSTRAP_RENAME_HANDLE
     path = _bootstrap_error_path()
     record = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -262,13 +288,26 @@ def _capture_bootstrap_error(stage: str, error: BaseException) -> None:
                         return
                     with temporary.open("xb") as stream:
                         stream.write(payload)
+                    temporary_identity = _bootstrap_object_identity(temporary)
                     try:
                         if _bootstrap_path_safe(path):
-                            _windows_rename_by_handle(temporary, path)
+                            _BOOTSTRAP_RENAME_EXPECTED = temporary_identity
+                            with _windows_object_handle(
+                                temporary, access=0x00010000 | 0x80
+                            ) as temporary_handle:
+                                _BOOTSTRAP_RENAME_HANDLE = temporary_handle
+                                _windows_rename_by_handle(temporary, path)
+                            _BOOTSTRAP_RENAME_HANDLE = None
+                            _BOOTSTRAP_RENAME_EXPECTED = None
+                            if _bootstrap_object_identity(path) != temporary_identity:
+                                return
                     finally:
+                        _BOOTSTRAP_RENAME_HANDLE = None
+                        _BOOTSTRAP_RENAME_EXPECTED = None
                         try:
-                            temporary.unlink()
-                        except FileNotFoundError:
+                            if _bootstrap_object_identity(temporary) == temporary_identity:
+                                temporary.unlink()
+                        except (FileNotFoundError, OSError):
                             pass
                 return
 
@@ -339,7 +378,7 @@ def _capture_bootstrap_error(stage: str, error: BaseException) -> None:
                     except (FileNotFoundError, OSError):
                         pass
                 os.close(parent_descriptor)
-    except OSError:
+    except (OSError, RuntimeError, ValueError, AttributeError):
         pass
 
 
