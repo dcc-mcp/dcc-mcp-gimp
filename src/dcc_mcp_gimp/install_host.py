@@ -21,6 +21,27 @@ _GIMP_VERSION_PATTERN = re.compile(
 _GIMP_EXECUTABLES = frozenset(("gimp", "gimp.exe", "gimp-3.0", "gimp-3.0.exe"))
 _MAX_PROBE_OUTPUT = 16 * 1024
 _MAX_METADATA_OUTPUT = 256 * 1024
+_MAX_BOOTSTRAP_RECORD_BYTES = 64 * 1024
+_MAX_BOOTSTRAP_RECORDS = 1024
+
+
+def _path_is_link_or_reparse(path: Path) -> bool:
+    try:
+        is_junction = getattr(path, "is_junction", None)
+        if path.is_symlink() or bool(is_junction and is_junction()):
+            return True
+        if os.name != "nt":
+            return False
+        import ctypes
+
+        attributes = ctypes.windll.kernel32.GetFileAttributesW(str(path))
+        if int(attributes) in (-1, 0xFFFFFFFF):
+            return False
+        return bool(int(attributes) & 0x400)
+    except AttributeError:
+        return False
+    except (OSError, RuntimeError, ValueError):
+        return True
 
 
 def default_plugin_dir() -> Path:
@@ -36,23 +57,61 @@ def default_plugin_dir() -> Path:
 def _bootstrap_error_path() -> Path:
     configured = os.environ.get("DCC_MCP_GIMP_BOOTSTRAP_ERRORS")
     if configured:
-        return Path(configured).expanduser().resolve()
-    return Path.home().joinpath(".dcc-mcp", "gimp-bootstrap-errors.jsonl").resolve()
+        return Path(configured).expanduser().absolute()
+    return Path.home().joinpath(".dcc-mcp", "gimp-bootstrap-errors.jsonl").absolute()
 
 
 def _bootstrap_error_summary() -> dict[str, Any]:
     path = _bootstrap_error_path()
     records = []
-    if path.is_file():
+    try:
+        linked = _path_is_link_or_reparse(path)
+        is_file = path.is_file()
+    except (OSError, RuntimeError, ValueError) as exc:
+        return {
+            "path": str(path),
+            "count": 0,
+            "latest": None,
+            "read_error": str(exc),
+        }
+    if linked:
+        return {
+            "path": str(path),
+            "count": 0,
+            "latest": None,
+            "read_error": "Bootstrap error path is linked",
+        }
+    if is_file:
         try:
-            for line in path.read_text(encoding="utf-8").splitlines():
-                try:
-                    record = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(record, dict):
-                    records.append(record)
-        except OSError as exc:
+            with path.open("rb") as stream:
+                for _ in range(_MAX_BOOTSTRAP_RECORDS):
+                    raw_line = stream.readline(_MAX_BOOTSTRAP_RECORD_BYTES + 1)
+                    if not raw_line:
+                        break
+                    oversized = len(raw_line) > _MAX_BOOTSTRAP_RECORD_BYTES
+                    if oversized and not raw_line.endswith(b"\n"):
+                        # Do not scan an attacker-controlled unterminated line;
+                        # one bounded prefix is enough for the diagnostic.
+                        stream.seek(0, os.SEEK_END)
+                    line = raw_line[:_MAX_BOOTSTRAP_RECORD_BYTES].decode("utf-8", errors="replace")
+                    if oversized:
+                        records.append(
+                            {
+                                "stage": "unknown",
+                                "message": line[:_MAX_BOOTSTRAP_RECORD_BYTES],
+                                "truncated": True,
+                            }
+                        )
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(record, dict):
+                        if isinstance(record.get("message"), str):
+                            record["message"] = record["message"][:_MAX_BOOTSTRAP_RECORD_BYTES]
+                        records.append(record)
+        except (OSError, RuntimeError, ValueError) as exc:
             return {
                 "path": str(path),
                 "count": 0,
@@ -86,8 +145,15 @@ def _resolve_python(value: Optional[Path], executable: Path) -> Path:
             Path(sys.executable),
         )
     try:
-        resolved = configured.expanduser().resolve()
-        valid = resolved.is_file() and not resolved.is_symlink() and resolved.stat().st_size > 0
+        candidate = configured.expanduser().absolute()
+        if _path_is_link_or_reparse(candidate):
+            raise InstallFailure(EXIT_PREFLIGHT, "python", "Python interpreter path is linked")
+        resolved = candidate.resolve()
+        if os.path.normcase(str(resolved)) != os.path.normcase(str(candidate)):
+            raise InstallFailure(EXIT_PREFLIGHT, "python", "Python interpreter path is linked")
+        valid = resolved.is_file() and resolved.stat().st_size > 0
+    except InstallFailure:
+        raise
     except (OSError, RuntimeError, ValueError) as exc:
         raise InstallFailure(
             EXIT_PREFLIGHT, "python", "Python interpreter path is unavailable"
@@ -121,7 +187,12 @@ def _resolve_gimp(value: Optional[Path]) -> Path:
     if value is None:
         raise InstallFailure(EXIT_PREFLIGHT, "gimp", "GIMP 3 installation was not found")
     try:
-        resolved = value.expanduser().resolve()
+        candidate = value.expanduser().absolute()
+        if _path_is_link_or_reparse(candidate):
+            raise InstallFailure(EXIT_PREFLIGHT, "gimp", "GIMP executable path is linked")
+        resolved = candidate.resolve()
+        if os.path.normcase(str(resolved)) != os.path.normcase(str(candidate)):
+            raise InstallFailure(EXIT_PREFLIGHT, "gimp", "GIMP executable path is linked")
         if resolved.is_dir():
             candidates = (
                 resolved / "gimp-3.0.exe",
@@ -134,6 +205,8 @@ def _resolve_gimp(value: Optional[Path]) -> Path:
                 (candidate for candidate in candidates if candidate.is_file()), resolved
             )
         valid = resolved.is_file() and not resolved.is_symlink() and resolved.stat().st_size > 0
+    except InstallFailure:
+        raise
     except (OSError, RuntimeError, ValueError) as exc:
         raise InstallFailure(EXIT_PREFLIGHT, "gimp", "GIMP executable path is unavailable") from exc
     if not valid:

@@ -145,6 +145,19 @@ classifies the selected profile as `fresh`, `current`, `upgrade`, `repair`, or
 point executable bit (POSIX); a chmod-only drift is reported as `repair` or a
 failed artifact verification.
 
+Receipts created by an earlier v1 build that do not contain
+`entry_point_executable` are treated as legacy and are never silently migrated:
+`status` reports `repair` (exit `40`), `upgrade --yes` refuses replacement
+(exit `30`), and `uninstall --yes` refuses deletion (exit `10`). Run a fresh
+`install --yes` after reviewing the profile if the old installation is yours.
+All lifecycle mutations re-check the selected profile and every receipted file
+by physical identity immediately before changing or removing it; a pathname
+or junction/symlink swap fails closed and leaves the foreign object untouched.
+
+When an explicit `--instance-id` or `--host-pid` is supplied, the same values
+are retained in the plan and emitted in the `verify-selected-gimp` command in
+`next_steps[]`; execute that command verbatim.
+
 ## Upgrade
 
 Upgrade the Python package first, inspect the plan, and then replace the

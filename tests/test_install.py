@@ -549,6 +549,36 @@ def test_atomic_receipt_write_removes_temp_when_commit_fails(tmp_path, monkeypat
     assert not list(receipt.parent.glob(".gimp.json.*.tmp"))
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Symlink creation requires elevated Windows rights")
+def test_receipt_parent_swap_between_checks_fails_closed(tmp_path, monkeypatch):
+    from dcc_mcp_gimp import install_files
+    from dcc_mcp_gimp.install_contract import InstallFailure
+
+    receipt = tmp_path / "receipts" / "gimp.json"
+    receipt.parent.mkdir(parents=True)
+    external = tmp_path / "external"
+    external.mkdir()
+    sentinel = external / "gimp.json"
+    sentinel.write_text("do not overwrite", encoding="utf-8")
+    original_safe = install_files._assert_receipt_path_safe
+    swapped = False
+
+    def safe_then_swap(path):
+        nonlocal swapped
+        original_safe(path)
+        if not swapped:
+            swapped = True
+            old = receipt.parent.with_name("receipts-owned")
+            receipt.parent.rename(old)
+            receipt.parent.symlink_to(external, target_is_directory=True)
+
+    monkeypatch.setattr(install_files, "_assert_receipt_path_safe", safe_then_swap)
+    with pytest.raises(InstallFailure):
+        install_files._write_json_atomic(receipt, {"schema_version": 1})
+
+    assert sentinel.read_text(encoding="utf-8") == "do not overwrite"
+
+
 def test_install_reports_and_cleans_a_staging_failure(lifecycle_env, monkeypatch):
     from dcc_mcp_gimp.install import EXIT_INSTALL, run
 
@@ -597,6 +627,50 @@ def test_install_returns_executable_next_steps_until_live_readiness(lifecycle_en
         str(lifecycle_env.plugins.resolve()),
     ):
         assert value in verify_command
+
+
+def test_next_steps_retain_explicit_instance_and_host_identity(lifecycle_env, monkeypatch):
+    from dcc_mcp_gimp.install import run
+
+    monkeypatch.setattr(
+        "dcc_mcp_gimp.install_lifecycle.wait_for_sidecar_ready",
+        lambda *_args, **_kwargs: {"success": False, "message": "host is not ready"},
+    )
+    report, code, _ = run(
+        [
+            "verify",
+            "--instance-id",
+            "selected-instance",
+            "--host-pid",
+            "4242",
+            *lifecycle_env.common,
+        ]
+    )
+
+    assert code == 40
+    verify_step = next(
+        step for step in report["next_steps"] if step["id"] == "verify-selected-gimp"
+    )
+    assert verify_step["command"][-4:] == [
+        "--instance-id",
+        "selected-instance",
+        "--host-pid",
+        "4242",
+    ]
+
+
+def test_bootstrap_summary_bounds_oversized_records(tmp_path, monkeypatch):
+    from dcc_mcp_gimp.install_host import _bootstrap_error_summary
+
+    path = tmp_path / "bootstrap.jsonl"
+    path.write_text(json.dumps({"stage": "bridge-startup", "message": "x" * (1024 * 1024)}) + "\n")
+    monkeypatch.setenv("DCC_MCP_GIMP_BOOTSTRAP_ERRORS", str(path))
+
+    summary = _bootstrap_error_summary()
+
+    assert summary["count"] == 1
+    assert summary["latest"]["truncated"] is True
+    assert len(summary["latest"]["message"]) <= 64 * 1024
 
 
 def _install_schema_validator() -> Draft202012Validator:
@@ -933,9 +1007,7 @@ def test_target_interpreter_rejects_unbounded_metadata(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("field", ["core", "adapter"])
 @pytest.mark.parametrize("nested", [None, [], "not-an-object", 7])
-def test_target_interpreter_rejects_malformed_nested_metadata(
-    tmp_path, monkeypatch, field, nested
-):
+def test_target_interpreter_rejects_malformed_nested_metadata(tmp_path, monkeypatch, field, nested):
     from dcc_mcp_gimp.install_contract import InstallFailure
     from dcc_mcp_gimp.install_host import _target_versions
 
@@ -1021,6 +1093,28 @@ def test_multiple_destinations_fail_closed_without_overwriting_receipt(lifecycle
     assert receipt_path.read_bytes() == prior_receipt
     assert not second.exists()
     assert first.exists()
+
+
+def test_legacy_receipt_mode_field_fails_closed_consistently(lifecycle_env):
+    from dcc_mcp_gimp.install import run
+
+    installed, code, _ = run(["install", "--yes", *lifecycle_env.common])
+    assert code == 0, installed
+    receipt_path = lifecycle_env.root / ".dcc-mcp" / "receipts" / "gimp.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt.pop("entry_point_executable")
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+
+    status, status_code, _ = run(["status", *lifecycle_env.common])
+    upgrade, upgrade_code, _ = run(["upgrade", "--yes", *lifecycle_env.common])
+    uninstall, uninstall_code, _ = run(["uninstall", "--yes", *lifecycle_env.common])
+
+    assert status_code == 40
+    assert status["installation_state"] == "repair"
+    assert upgrade_code == 30
+    assert uninstall_code == 10
+    assert upgrade["verify"]["failure_stage"] == "receipt"
+    assert uninstall["verify"]["failure_stage"] == "receipt"
 
 
 def test_plan_maps_symlink_loop_to_structured_preflight(tmp_path, monkeypatch):
@@ -1123,6 +1217,115 @@ def test_root_identity_swap_during_staging_fails_closed(lifecycle_env, monkeypat
     assert not (lifecycle_env.plugins / "dcc_mcp_gimp").exists()
 
 
+def test_verify_target_swap_after_validation_fails_closed(lifecycle_env, monkeypatch):
+    from dcc_mcp_gimp import install_lifecycle
+    from dcc_mcp_gimp.install import run
+
+    installed, code, _ = run(["install", "--yes", *lifecycle_env.common])
+    assert code == 0, installed
+    target = lifecycle_env.plugins / "dcc_mcp_gimp"
+    foreign = lifecycle_env.root / "foreign-plugin"
+    foreign.mkdir()
+    (foreign / "operator.txt").write_text("do not touch", encoding="utf-8")
+    original_validate = install_lifecycle._validate_owned_install
+
+    def validate_then_swap(*args, **kwargs):
+        original_validate(*args, **kwargs)
+        owned = target.with_name("dcc_mcp_gimp-owned")
+        target.rename(owned)
+        target.mkdir()
+        (target / "operator.txt").write_text("foreign", encoding="utf-8")
+
+    monkeypatch.setattr(install_lifecycle, "_validate_owned_install", validate_then_swap)
+    report, code, _ = run(["verify", *lifecycle_env.common])
+
+    assert code == 40
+    assert report["status"] == "failed"
+    assert report["verify"]["directly_usable"] is False
+    assert "identity" in report["verify"]["failure_reason"]
+    assert (foreign / "operator.txt").read_text(encoding="utf-8") == "do not touch"
+
+
+def test_upgrade_target_swap_before_replace_preserves_foreign_tree(lifecycle_env, monkeypatch):
+    from dcc_mcp_gimp import install_files
+    from dcc_mcp_gimp.install import run
+
+    installed, code, _ = run(["install", "--yes", *lifecycle_env.common])
+    assert code == 0, installed
+    target = lifecycle_env.plugins / "dcc_mcp_gimp"
+    original_stage = install_files._stage_plugin
+
+    def stage_then_swap(root):
+        stage = original_stage(root)
+        owned = target.with_name("dcc_mcp_gimp-owned")
+        target.rename(owned)
+        target.mkdir()
+        (target / "operator.txt").write_text("foreign", encoding="utf-8")
+        return stage
+
+    monkeypatch.setattr(install_files, "_stage_plugin", stage_then_swap)
+    report, code, _ = run(["upgrade", "--yes", *lifecycle_env.common])
+
+    assert code == 10
+    assert report["status"] == "failed"
+    assert (target / "operator.txt").read_text(encoding="utf-8") == "foreign"
+
+
+def test_uninstall_child_swap_after_validation_preserves_foreign_file(lifecycle_env, monkeypatch):
+    from dcc_mcp_gimp import install_files
+    from dcc_mcp_gimp.install import run
+
+    installed, code, _ = run(["install", "--yes", *lifecycle_env.common])
+    assert code == 0, installed
+    target = lifecycle_env.plugins / "dcc_mcp_gimp"
+    script = target / "dcc_mcp_gimp.py"
+    original_validate = install_files._validate_owned_install
+    calls = 0
+
+    def validate_then_swap(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        original_validate(*args, **kwargs)
+        if calls >= 2:
+            script.unlink()
+            script.write_text("foreign operator", encoding="utf-8")
+
+    monkeypatch.setattr(install_files, "_validate_owned_install", validate_then_swap)
+    report, code, _ = run(["uninstall", "--yes", *lifecycle_env.common])
+
+    assert code == 10
+    assert report["status"] == "failed"
+    assert script.read_text(encoding="utf-8") == "foreign operator"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Symlink creation requires elevated Windows rights")
+def test_destination_symlink_is_rejected_before_canonicalization(lifecycle_env):
+    from dcc_mcp_gimp.install import run
+
+    actual = lifecycle_env.root / "actual-profile" / "plug-ins"
+    actual.mkdir(parents=True)
+    linked = lifecycle_env.root / "linked-profile" / "plug-ins"
+    linked.parent.mkdir()
+    linked.symlink_to(actual, target_is_directory=True)
+
+    report, code, _ = run(
+        [
+            "status",
+            "--json",
+            "--dcc-path",
+            str(lifecycle_env.host),
+            "--python",
+            sys.executable,
+            "--destination",
+            str(linked),
+        ]
+    )
+
+    assert code == 10
+    assert report["status"] == "failed"
+    assert report["verify"]["failure_stage"] == "profile"
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows reparse-point contract")
 def test_windows_junction_is_rejected_as_reparse_point(tmp_path):
     from dcc_mcp_gimp.install_files import _is_link
@@ -1140,6 +1343,46 @@ def test_windows_junction_is_rejected_as_reparse_point(tmp_path):
         pytest.skip("junction creation unavailable")
 
     assert _is_link(junction) is True
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction contract")
+def test_destination_junction_is_rejected_before_canonicalization(lifecycle_env):
+    from dcc_mcp_gimp.install import run
+
+    actual = lifecycle_env.root / "actual-profile"
+    actual.mkdir()
+    linked = lifecycle_env.root / "linked-profile"
+    process = subprocess.Popen(
+        ["cmd", "/c", "mklink", "/J", str(linked), str(actual)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    stdout, stderr = process.communicate()
+    if process.returncode != 0:
+        pytest.skip("junction creation unavailable")
+    from dcc_mcp_gimp.install_files import _is_link
+
+    assert linked.exists(), (stdout, stderr)
+    assert _is_link(linked) is True
+    destination = linked / "plug-ins"
+
+    report, code, _ = run(
+        [
+            "status",
+            "--json",
+            "--dcc-path",
+            str(lifecycle_env.host),
+            "--python",
+            sys.executable,
+            "--destination",
+            str(destination),
+        ]
+    )
+
+    assert code == 10
+    assert report["status"] == "failed"
+    assert report["verify"]["failure_stage"] == "profile"
 
 
 def test_verify_rejects_pid_reuse_during_identity_check(lifecycle_env, monkeypatch):

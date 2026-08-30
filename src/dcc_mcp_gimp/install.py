@@ -78,7 +78,14 @@ def _failure_verification(failure: InstallFailure) -> dict[str, Any]:
 def run(argv: Sequence[str]) -> tuple[dict[str, Any], int, bool]:
     args = _parser().parse_args(list(argv))
     try:
-        report = plan(args.verb, args.destination, args.python, args.dcc_path)
+        report = plan(
+            args.verb,
+            args.destination,
+            args.python,
+            args.dcc_path,
+            instance_id=args.instance_id,
+            host_pid=args.host_pid,
+        )
     except InstallFailure as failure:
         return (
             {
