@@ -235,8 +235,11 @@ def test_runtime_windows_bootstrap_rotation_rejects_temp_swap(runtime, tmp_path,
     errors.write_bytes(b"x" * (260 * 1024))
     monkeypatch.setenv("DCC_MCP_GIMP_BOOTSTRAP_ERRORS", str(errors))
     capture = runtime["_capture_bootstrap_error"]
+    original_rename = capture.__globals__["_windows_rename_by_handle"]
 
-    def swap(source, _destination):
+    def swap(source, destination, *args, **kwargs):
+        if not source.name.endswith(".tmp"):
+            return original_rename(source, destination, *args, **kwargs)
         foreign = source.with_name("foreign-bootstrap.bin")
         foreign.write_bytes(b"FOREIGN-BOOTSTRAP")
         # The capture transaction holds a no-delete-share handle on the
@@ -261,6 +264,83 @@ def test_runtime_windows_bootstrap_rotation_publishes_new_record(runtime, tmp_pa
     payload = errors.read_bytes()
     assert len(payload) <= 256 * 1024
     assert b"fresh failure" in payload
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Exercises Windows no-replace rotation")
+def test_runtime_windows_bootstrap_rotation_preserves_final_name_occupant(
+    runtime, tmp_path, monkeypatch
+):
+    errors = tmp_path / "bootstrap-errors.jsonl"
+    previous = b"x" * (260 * 1024)
+    errors.write_bytes(previous)
+    monkeypatch.setenv("DCC_MCP_GIMP_BOOTSTRAP_ERRORS", str(errors))
+    capture = runtime["_capture_bootstrap_error"]
+    globals_ = capture.__globals__
+    original_rename = globals_["_windows_rename_by_handle"]
+    state = {"occupied": False}
+
+    def occupy_final_name(source, destination, *args, **kwargs):
+        if not state["occupied"] and source.name.endswith(".tmp"):
+            if errors.exists():
+                errors.rename(tmp_path / "previous-bootstrap.log")
+            errors.write_bytes(b"OPERATOR-BOOTSTRAP")
+            state["occupied"] = True
+        return original_rename(source, destination, *args, **kwargs)
+
+    monkeypatch.setitem(globals_, "_windows_rename_by_handle", occupy_final_name)
+    capture("bridge-startup", RuntimeError("fresh failure"))
+
+    assert state["occupied"] is True
+    assert errors.read_bytes() == b"OPERATOR-BOOTSTRAP"
+    assert any(
+        candidate.is_file() and candidate.read_bytes() == previous
+        for candidate in tmp_path.iterdir()
+        if candidate != errors
+    )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Exercises Windows bootstrap creation")
+def test_runtime_windows_bootstrap_new_file_completes_short_writes(runtime, tmp_path, monkeypatch):
+    errors = tmp_path / "bootstrap-errors.jsonl"
+    monkeypatch.setenv("DCC_MCP_GIMP_BOOTSTRAP_ERRORS", str(errors))
+    capture = runtime["_capture_bootstrap_error"]
+    original_write = os.write
+    state = {"short": False}
+
+    def write_part(descriptor, data):
+        if not state["short"] and len(data) > 1:
+            state["short"] = True
+            return original_write(descriptor, data[:1])
+        return original_write(descriptor, data)
+
+    monkeypatch.setattr(os, "write", write_part)
+    capture("bridge-startup", RuntimeError("complete record"))
+
+    assert state["short"] is True
+    record = json.loads(errors.read_text(encoding="utf-8").splitlines()[-1])
+    assert record["message"] == "complete record"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Exercises Windows bootstrap creation")
+def test_runtime_windows_bootstrap_new_file_discards_failed_write(runtime, tmp_path, monkeypatch):
+    errors = tmp_path / "bootstrap-errors.jsonl"
+    monkeypatch.setenv("DCC_MCP_GIMP_BOOTSTRAP_ERRORS", str(errors))
+    capture = runtime["_capture_bootstrap_error"]
+    original_write = os.write
+    calls = 0
+
+    def fail_after_part(descriptor, data):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return original_write(descriptor, data[:1])
+        raise OSError("injected write failure")
+
+    monkeypatch.setattr(os, "write", fail_after_part)
+    capture("bridge-startup", RuntimeError("incomplete record"))
+
+    assert calls == 2
+    assert not errors.exists()
 
 
 def test_plugin_captures_gi_import_failure(tmp_path, monkeypatch):
