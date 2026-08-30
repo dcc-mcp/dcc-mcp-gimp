@@ -51,11 +51,21 @@ _POSIX_RENAME = os.rename
 _POSIX_UNLINK = os.unlink
 _POSIX_UNLINK_SAFE = os.unlink
 _POSIX_LINK = os.link
-# Path-returning test seams cannot carry an inode identity by themselves.  Keep
-# the identity captured at the side-effect boundary so a caller that swaps the
-# returned pathname before publication fails closed instead of consuming the
-# replacement object.
-_BOUND_STAGE_IDENTITIES: dict[str, tuple[int, int, int, int, int, int]] = {}
+
+
+# Path-returning test seams cannot carry physical child ownership by themselves.
+# Keep the complete staged manifest captured at the side-effect boundary so a
+# caller that rewrites either the directory name or its contents fails closed.
+@dataclass(frozen=True)
+class _StageManifest:
+    root_identity: tuple[int, int, int, int, int, int]
+    directories: tuple[str, ...]
+    files: tuple[tuple[str, str, int], ...]
+    links: tuple[str, ...]
+    file_identities: Mapping[str, tuple[int, int, int, int, int, int]]
+
+
+_BOUND_STAGE_MANIFESTS: dict[str, _StageManifest] = {}
 _BOUND_TRANSACTION_IDENTITIES: dict[str, tuple[int, int, int, int, int, int]] = {}
 
 
@@ -115,12 +125,12 @@ def _is_link(path: Path) -> bool:
     return bool(int(attributes) & 0x400)
 
 
-def _file_record(
+def _file_evidence(
     path: Path,
     root: Path,
     *,
     parent_descriptor: Optional[int] = None,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], tuple[int, int, int, int, int, int]]:
     descriptor = None
     owns_parent_descriptor = parent_descriptor is None
     object_lease = None
@@ -129,7 +139,7 @@ def _file_record(
         if parent_descriptor is None:
             before = os.lstat(str(path))
         else:
-            before = os.lstat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
+            before = os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
         if not stat.S_ISREG(before.st_mode) or (parent_descriptor is None and _is_link(path)):
             raise InstallFailure(
                 EXIT_PREFLIGHT, "receipt", "Managed GIMP file is missing or linked"
@@ -184,11 +194,76 @@ def _file_record(
             directory_lease.__exit__(None, None, None)
     if not contents:
         raise InstallFailure(EXIT_PREFLIGHT, "receipt", "Managed GIMP file is empty")
-    return {
-        "path": path.relative_to(root).as_posix(),
-        "sha256": hashlib.sha256(contents).hexdigest(),
-        "size": len(contents),
-    }
+    return (
+        {
+            "path": path.relative_to(root).as_posix(),
+            "sha256": hashlib.sha256(contents).hexdigest(),
+            "size": len(contents),
+        },
+        (
+            int(after.st_dev),
+            int(after.st_ino),
+            int(after.st_size),
+            int(after.st_mtime_ns),
+            int(after.st_ctime_ns),
+            stat.S_IMODE(after.st_mode),
+        ),
+    )
+
+
+def _file_record(
+    path: Path,
+    root: Path,
+    *,
+    parent_descriptor: Optional[int] = None,
+) -> dict[str, Any]:
+    return _file_evidence(path, root, parent_descriptor=parent_descriptor)[0]
+
+
+def _manifest_file_signature(files: list[dict[str, Any]]) -> tuple[tuple[str, str, int], ...]:
+    return tuple(
+        (str(record["path"]), str(record["sha256"]), int(record["size"])) for record in files
+    )
+
+
+def _assert_stage_manifest(path: Path, expected: _StageManifest) -> None:
+    if _object_identity(path, "install")[:2] != expected.root_identity[:2]:
+        raise InstallFailure(EXIT_PREFLIGHT, "install", "Managed stage changed identity")
+    _assert_owned_file_identities(
+        path,
+        {relative: identity[:2] for relative, identity in expected.file_identities.items()},
+        "install",
+    )
+    directories, files, links = _owned_root_manifest(path)
+    if (
+        tuple(directories) != expected.directories
+        or _manifest_file_signature(files) != expected.files
+        or tuple(links) != expected.links
+    ):
+        raise InstallFailure(EXIT_PREFLIGHT, "install", "Managed stage contents changed")
+    source = _source_file()
+    bundled = _file_record(source, source.parent)
+    if _manifest_file_signature([bundled]) != expected.files:
+        raise InstallFailure(EXIT_PREFLIGHT, "install", "Bundled GIMP plug-in source changed")
+
+
+def _cleanup_bound_stage(
+    root: Path,
+    expected_root_identity: Optional[tuple[int, int]],
+    stage: Path,
+    expected: _StageManifest,
+) -> bool:
+    if not stage.exists() and not stage.is_symlink():
+        return True
+    try:
+        _assert_stage_manifest(stage, expected)
+    except InstallFailure:
+        # A changed stage may now contain an object the transaction never
+        # created. Preserve it instead of turning failed validation into
+        # deletion authority.
+        return False
+    result = _cleanup_tree_owned(root, expected_root_identity, stage)
+    return bool(result.get("success")) and not stage.exists() and not stage.is_symlink()
 
 
 def _owned_root_manifest(
@@ -1111,6 +1186,7 @@ def _replace_path_owned(
     destination: Path,
     expected_file_identities: Optional[Mapping[str, tuple[int, ...]]] = None,
     expected_source_identity: Optional[tuple[int, ...]] = None,
+    expected_stage_manifest: Optional[_StageManifest] = None,
 ) -> None:
     """Rename only while the selected profile still owns the pathname."""
     # Tests and callers may intentionally replace the primitive to inject a
@@ -1136,7 +1212,11 @@ def _replace_path_owned(
                         raise InstallFailure(
                             EXIT_PREFLIGHT, "install", "Managed stage changed identity"
                         )
+                if expected_stage_manifest is not None:
+                    _assert_stage_manifest(source, expected_stage_manifest)
                 _replace_path(source, destination)
+                if expected_stage_manifest is not None:
+                    _assert_stage_manifest(destination, expected_stage_manifest)
                 _assert_physical_root(root, expected_identity)
         return
     if os.name == "nt":
@@ -1155,7 +1235,27 @@ def _replace_path_owned(
                         )
                 if expected_file_identities:
                     _assert_owned_file_identities(source, expected_file_identities, "install")
-                _windows_rename_by_handle(source, destination, replace=False)
+                if expected_stage_manifest is not None:
+                    _assert_stage_manifest(source, expected_stage_manifest)
+                published_stage = False
+                try:
+                    _windows_rename_by_handle(source, destination, replace=False)
+                    published_stage = True
+                    if expected_stage_manifest is not None:
+                        _assert_stage_manifest(destination, expected_stage_manifest)
+                except BaseException:
+                    if published_stage and expected_stage_manifest is not None:
+                        try:
+                            if (
+                                _object_identity(destination, "install")[:2]
+                                == expected_stage_manifest.root_identity[:2]
+                                and not source.exists()
+                                and not source.is_symlink()
+                            ):
+                                _windows_rename_by_handle(destination, source, replace=False)
+                        except (InstallFailure, OSError, RuntimeError, ValueError):
+                            pass
+                    raise
                 _assert_physical_root(root, expected_identity)
         return
     source_descriptor = None
@@ -1191,6 +1291,8 @@ def _replace_path_owned(
         with _posix_directory_locks(source_descriptor, destination_descriptor):
             if expected_file_identities:
                 _assert_owned_file_identities(source, expected_file_identities, "install")
+            if expected_stage_manifest is not None:
+                _assert_stage_manifest(source, expected_stage_manifest)
             selected_identity = (
                 tuple(expected_source_identity)[:2]
                 if expected_source_identity is not None
@@ -1204,6 +1306,7 @@ def _replace_path_owned(
                 dst_dir_fd=source_descriptor,
             )
             moved_owned = False
+            published_stage = False
             try:
                 moved = os.stat(
                     tombstone_name,
@@ -1224,6 +1327,8 @@ def _replace_path_owned(
                     source_descriptor,
                     destination_descriptor,
                 )
+                moved_owned = False
+                published_stage = True
                 published = os.stat(
                     destination_name,
                     dir_fd=destination_descriptor,
@@ -1235,10 +1340,31 @@ def _replace_path_owned(
                         "install",
                         "Managed stage changed identity during publication",
                     )
+                if expected_stage_manifest is not None:
+                    _assert_stage_manifest(destination, expected_stage_manifest)
                 os.fsync(destination_descriptor)
                 if source_descriptor != destination_descriptor:
                     os.fsync(source_descriptor)
             except BaseException:
+                if published_stage:
+                    try:
+                        _posix_rename_noreplace(
+                            destination_name,
+                            tombstone_name,
+                            destination_descriptor,
+                            source_descriptor,
+                        )
+                        returned = os.stat(
+                            tombstone_name,
+                            dir_fd=source_descriptor,
+                            follow_symlinks=False,
+                        )
+                        moved_owned = (
+                            int(returned.st_dev),
+                            int(returned.st_ino),
+                        ) == selected_identity
+                    except OSError:
+                        moved_owned = False
                 # Restore only when the original name is still free.  A raced
                 # occupant keeps that name, while the selected inode remains
                 # preserved in the private tombstone for manual recovery.
@@ -1931,9 +2057,13 @@ def _replace_receipt_owned(
     destination: Path,
     root: Path,
     expected_identity: Optional[tuple[int, int]],
+    *,
+    expected_source_identity: Optional[tuple[int, ...]] = None,
 ) -> None:
     """Move the receipt using a held no-follow source parent and root check."""
     source_identity = _receipt_file_identity(source, "uninstall")
+    if expected_source_identity is not None and source_identity != tuple(expected_source_identity):
+        raise InstallFailure(EXIT_PREFLIGHT, "uninstall", "Managed receipt file changed identity")
     if _replace_path is not _DEFAULT_REPLACE_PATH or os.name == "nt":
         source_parent_identity = _receipt_parent_identity(source)
         destination_parent_identity = _directory_identity(destination.parent, "uninstall")
@@ -2192,6 +2322,7 @@ def _unlink_receipt_owned(
 def _stage_plugin(root: Path) -> Path:
     try:
         source = _source_file()
+        bundled_record = _file_record(source, source.parent)
     except OSError as exc:
         raise InstallFailure(EXIT_ACQUIRE, "acquire", str(exc)) from exc
     # Re-acquire the physical profile immediately before creating the stage.
@@ -2237,11 +2368,35 @@ def _stage_plugin(root: Path) -> Path:
                 view = memoryview(source_bytes)
                 while view:
                     written = os.write(script_fd, view)
+                    if written <= 0:
+                        raise OSError("short write while staging GIMP plug-in")
                     view = view[written:]
                 os.fchmod(script_fd, 0o755)
+                os.fsync(script_fd)
             finally:
                 os.close(script_fd)
-            _BOUND_STAGE_IDENTITIES[str(stage.absolute())] = _object_identity(stage, "install")
+            staged_record, staged_identity = _file_evidence(
+                stage / script_name,
+                stage,
+                parent_descriptor=stage_descriptor,
+            )
+            if (
+                staged_record != bundled_record
+                or hashlib.sha256(source_bytes).hexdigest() != bundled_record["sha256"]
+                or _file_record(source, source.parent) != bundled_record
+            ):
+                raise InstallFailure(
+                    EXIT_PREFLIGHT,
+                    "install",
+                    "Staged GIMP plug-in differs from the bundled source",
+                )
+            _BOUND_STAGE_MANIFESTS[str(stage.absolute())] = _StageManifest(
+                root_identity=_object_identity(stage, "install"),
+                directories=(),
+                files=_manifest_file_signature([staged_record]),
+                links=(),
+                file_identities={script_name: staged_identity},
+            )
             return stage
         with _windows_directory_lease(root, "install"):
             _assert_physical_root(root, root_identity)
@@ -2249,7 +2404,20 @@ def _stage_plugin(root: Path) -> Path:
             script = stage / ("%s.py" % _PLUGIN_NAME)
             shutil.copy2(source, script)
             _assert_physical_root(root, root_identity)
-        _BOUND_STAGE_IDENTITIES[str(stage.absolute())] = _object_identity(stage, "install")
+        staged_record, staged_identity = _file_evidence(script, stage)
+        if staged_record != bundled_record or _file_record(source, source.parent) != bundled_record:
+            raise InstallFailure(
+                EXIT_PREFLIGHT,
+                "install",
+                "Staged GIMP plug-in differs from the bundled source",
+            )
+        _BOUND_STAGE_MANIFESTS[str(stage.absolute())] = _StageManifest(
+            root_identity=_object_identity(stage, "install"),
+            directories=(),
+            files=_manifest_file_signature([staged_record]),
+            links=(),
+            file_identities={script.name: staged_identity},
+        )
         return stage
     except InstallFailure:
         raise
@@ -3300,7 +3468,9 @@ def _replace_plugin(root: Path) -> Path:
     root_identity = _assert_physical_root(root)
     target = root / _PLUGIN_NAME
     stage = _stage_plugin(root)
-    _BOUND_STAGE_IDENTITIES.pop(str(stage.absolute()), None)
+    stage_manifest = _BOUND_STAGE_MANIFESTS.pop(str(stage.absolute()), None)
+    if stage_manifest is None:
+        raise InstallFailure(EXIT_PREFLIGHT, "install", "Managed stage manifest is unavailable")
     backup = root / (".%s.%s.backup" % (_PLUGIN_NAME, uuid.uuid4().hex))
     try:
         if target.exists():
@@ -3310,16 +3480,32 @@ def _replace_plugin(root: Path) -> Path:
                 target,
                 backup,
             )
-        _replace_path_owned(root, root_identity, stage, target)
+        _replace_path_owned(
+            root,
+            root_identity,
+            stage,
+            target,
+            expected_file_identities={
+                relative: identity[:2]
+                for relative, identity in stage_manifest.file_identities.items()
+            },
+            expected_source_identity=stage_manifest.root_identity,
+            expected_stage_manifest=stage_manifest,
+        )
         cleanup = _cleanup_tree_owned(root, root_identity, backup)
         if not cleanup.get("success"):
             raise InstallFailure(EXIT_INSTALL, "cleanup", "Legacy backup cleanup failed")
     except BaseException:
         if target.exists() and backup.exists():
-            _cleanup_tree_owned(root, root_identity, target)
-        if backup.exists():
+            if not _cleanup_bound_stage(root, root_identity, target, stage_manifest):
+                raise InstallFailure(
+                    EXIT_INSTALL,
+                    "install",
+                    "Changed GIMP stage and prior install were preserved",
+                ) from None
+        if backup.exists() and not target.exists() and not target.is_symlink():
             _replace_path_owned(root, root_identity, backup, target)
-        _cleanup_tree_owned(root, root_identity, stage)
+        _cleanup_bound_stage(root, root_identity, stage, stage_manifest)
         raise
     return target
 
@@ -3518,7 +3704,15 @@ def _validate_owned_install(
         )
 
 
-def _receipt_payload(root: Path, target: Path, report: Mapping[str, Any]) -> dict[str, Any]:
+def _receipt_payload(
+    root: Path,
+    target: Path,
+    report: Mapping[str, Any],
+    *,
+    expected_stage_manifest: Optional[_StageManifest] = None,
+) -> dict[str, Any]:
+    if expected_stage_manifest is not None:
+        _assert_stage_manifest(target, expected_stage_manifest)
     directories, files, links = _owned_root_manifest(target)
     entry_point = target / ("%s.py" % _PLUGIN_NAME)
     return {
@@ -3723,13 +3917,13 @@ def _begin_replace_plugin(root: Path, report: Mapping[str, Any]) -> InstallTrans
             EXIT_INSTALL, "receipt", "Unowned or changed GIMP plug-in state cannot be overwritten"
         )
     stage = _stage_plugin(root)
-    stage_identity = _BOUND_STAGE_IDENTITIES.pop(str(stage.absolute()), None)
-    if stage_identity is None:
-        stage_identity = _object_identity(stage, "install")
+    stage_manifest = _BOUND_STAGE_MANIFESTS.pop(str(stage.absolute()), None)
+    if stage_manifest is None:
+        raise InstallFailure(EXIT_PREFLIGHT, "install", "Managed stage manifest is unavailable")
     try:
         _assert_physical_root(root, root_identity)
     except BaseException:
-        _cleanup_tree_owned(root, root_identity, stage)
+        _cleanup_bound_stage(root, root_identity, stage, stage_manifest)
         raise
     backup = root / (".%s.%s.backup" % (_PLUGIN_NAME, uuid.uuid4().hex))
     receipt_path = _receipt_path()
@@ -3787,13 +3981,23 @@ def _begin_replace_plugin(root: Path, report: Mapping[str, Any]) -> InstallTrans
             root_identity,
             stage,
             target,
-            expected_source_identity=stage_identity,
+            expected_file_identities={
+                relative: identity[:2]
+                for relative, identity in stage_manifest.file_identities.items()
+            },
+            expected_source_identity=stage_manifest.root_identity,
+            expected_stage_manifest=stage_manifest,
         )
         transaction.replacement_moved = True
         _assert_physical_root(root, root_identity)
         transaction.receipt_committed_identity = _write_json_atomic(
             receipt_path,
-            _receipt_payload(root, target, report),
+            _receipt_payload(
+                root,
+                target,
+                report,
+                expected_stage_manifest=stage_manifest,
+            ),
             expected_identity=transaction.old_receipt_identity,
             expected_absent=transaction.receipt_expected_absent,
         )[:2]
@@ -3806,13 +4010,13 @@ def _begin_replace_plugin(root: Path, report: Mapping[str, Any]) -> InstallTrans
         return transaction
     except BaseException as exc:
         transaction.rollback()
-        _cleanup_tree_owned(root, root_identity, stage)
+        _cleanup_bound_stage(root, root_identity, stage, stage_manifest)
         if isinstance(exc, InstallFailure):
             raise
         code = EXIT_REQUIRES_RESTART if isinstance(exc, PermissionError) else EXIT_INSTALL
         raise InstallFailure(code, "install", "Install rolled back: %s" % exc) from exc
     finally:
-        _cleanup_tree_owned(root, root_identity, stage)
+        _cleanup_bound_stage(root, root_identity, stage, stage_manifest)
 
 
 def _installation_state(destination: Path) -> str:
@@ -3893,9 +4097,23 @@ def _restore_owned_bytes(
     receipt: Mapping[str, Any],
     snapshot: OwnedSnapshot,
     expected_identity: Optional[tuple[int, int]] = None,
+    *,
+    expected_receipt_identity: Optional[tuple[int, ...]] = None,
+    receipt_expected_absent: bool = False,
 ) -> None:
     _assert_physical_root(destination, expected_identity)
     _assert_receipt_path_safe(receipt_path)
+    try:
+        current_receipt_identity = _receipt_file_identity(receipt_path, "uninstall")
+    except InstallFailure:
+        if _path_present_no_follow(receipt_path):
+            raise
+        current_receipt_identity = None
+    _assert_receipt_commit_precondition(
+        current_receipt_identity,
+        expected_receipt_identity,
+        receipt_expected_absent,
+    )
     if target.exists() or target.is_symlink():
         removed = _cleanup_tree_owned(destination, expected_identity, target)
         if not removed.get("success"):
@@ -3927,7 +4145,13 @@ def _restore_owned_bytes(
         )
     _assert_physical_root(destination, expected_identity)
     _chmod_relative_nofollow(destination, expected_identity, target.name, snapshot.root_mode)
-    _write_bytes_atomic(receipt_path, snapshot.receipt_bytes, snapshot.receipt_mode)
+    _write_bytes_atomic(
+        receipt_path,
+        snapshot.receipt_bytes,
+        snapshot.receipt_mode,
+        expected_identity=expected_receipt_identity,
+        expected_absent=receipt_expected_absent,
+    )
     _validate_owned_install(destination, target, receipt_path, receipt)
 
 
@@ -3943,11 +4167,17 @@ def _execute_uninstall(report: dict[str, Any]) -> tuple[dict[str, Any], int]:
         report["status"] = "ok"
         report["steps"][-1] = {"id": "uninstall", "status": "already_absent"}
         return report, 0
+    original_receipt_identity = _receipt_file_identity(receipt_path, "uninstall")
     receipt = _read_receipt()
     if receipt is None:
         raise InstallFailure(
             EXIT_PREFLIGHT, "receipt", "Refusing to remove an unreceipted GIMP plug-in"
         )
+    _assert_receipt_file_identity_strict(
+        receipt_path,
+        original_receipt_identity,
+        "uninstall",
+    )
     if planned_target_identity is not None:
         _assert_target_identity(target, planned_target_identity, "uninstall")
     _validate_owned_install(destination, target, receipt_path, receipt)
@@ -3962,6 +4192,11 @@ def _execute_uninstall(report: dict[str, Any]) -> tuple[dict[str, Any], int]:
         )
     _assert_physical_root(destination, root_identity)
     owned_snapshot = _capture_owned_bytes(target, receipt_path, receipt)
+    _assert_receipt_file_identity_strict(
+        receipt_path,
+        original_receipt_identity,
+        "uninstall",
+    )
     # Cleanup authority comes only from the receipt.  A new child is rejected
     # here, and one added after this capture remains absent from the quarantine
     # cleanup set so it can never be treated as installer-owned.
@@ -3982,6 +4217,7 @@ def _execute_uninstall(report: dict[str, Any]) -> tuple[dict[str, Any], int]:
     preserve_transaction = False
     quarantine_expected_identities = None
     transaction_cleanup_identities = None
+    receipt_quarantined = False
     try:
         transaction = _create_private_transaction(
             transaction_parent,
@@ -4041,7 +4277,14 @@ def _execute_uninstall(report: dict[str, Any]) -> tuple[dict[str, Any], int]:
                 preserve_transaction = True
                 raise
         _assert_receipt_path_safe(receipt_path)
-        _replace_receipt_owned(receipt_path, quarantine_receipt, destination, root_identity)
+        _replace_receipt_owned(
+            receipt_path,
+            quarantine_receipt,
+            destination,
+            root_identity,
+            expected_source_identity=original_receipt_identity,
+        )
+        receipt_quarantined = True
         if quarantine_expected_identities is not None:
             quarantine_expected_identities["gimp.json"] = _receipt_file_identity(
                 quarantine_receipt, "uninstall"
@@ -4090,6 +4333,10 @@ def _execute_uninstall(report: dict[str, Any]) -> tuple[dict[str, Any], int]:
                 receipt,
                 owned_snapshot,
                 root_identity,
+                expected_receipt_identity=(
+                    None if receipt_quarantined else original_receipt_identity
+                ),
+                receipt_expected_absent=receipt_quarantined,
             )
         except BaseException as restore_error:
             raise InstallFailure(

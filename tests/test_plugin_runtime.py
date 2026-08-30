@@ -299,6 +299,106 @@ def test_runtime_windows_bootstrap_rotation_preserves_final_name_occupant(
     )
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Exercises Windows bootstrap append")
+def test_runtime_windows_bootstrap_append_completes_short_writes(runtime, tmp_path, monkeypatch):
+    errors = tmp_path / "bootstrap-errors.jsonl"
+    errors.write_bytes(b'{"stage":"old"}\n')
+    monkeypatch.setenv("DCC_MCP_GIMP_BOOTSTRAP_ERRORS", str(errors))
+    capture = runtime["_capture_bootstrap_error"]
+    original_write = os.write
+    state = {"short": False}
+
+    def write_part(descriptor, data):
+        if not state["short"] and len(data) > 1:
+            state["short"] = True
+            return original_write(descriptor, data[:1])
+        return original_write(descriptor, data)
+
+    monkeypatch.setattr(os, "write", write_part)
+    capture("append", RuntimeError("complete append record"))
+
+    assert state["short"] is True
+    records = [json.loads(line) for line in errors.read_text(encoding="utf-8").splitlines()]
+    assert records[-1]["message"] == "complete append record"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Exercises Windows bootstrap append rollback")
+def test_runtime_windows_bootstrap_append_rolls_back_partial_failure(
+    runtime, tmp_path, monkeypatch
+):
+    errors = tmp_path / "bootstrap-errors.jsonl"
+    original_bytes = b'{"stage":"old"}\n'
+    errors.write_bytes(original_bytes)
+    monkeypatch.setenv("DCC_MCP_GIMP_BOOTSTRAP_ERRORS", str(errors))
+    capture = runtime["_capture_bootstrap_error"]
+    original_write = os.write
+    calls = 0
+
+    def fail_after_part(descriptor, data):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return original_write(descriptor, data[:1])
+        raise OSError("injected append failure")
+
+    monkeypatch.setattr(os, "write", fail_after_part)
+    capture("append", RuntimeError("incomplete append record"))
+
+    assert calls == 2
+    assert errors.read_bytes() == original_bytes
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Exercises Windows bootstrap rotation staging")
+def test_runtime_windows_bootstrap_rotation_staging_completes_short_writes(
+    runtime, tmp_path, monkeypatch
+):
+    errors = tmp_path / "bootstrap-errors.jsonl"
+    errors.write_bytes(b"x" * (260 * 1024))
+    monkeypatch.setenv("DCC_MCP_GIMP_BOOTSTRAP_ERRORS", str(errors))
+    capture = runtime["_capture_bootstrap_error"]
+    original_write = os.write
+    state = {"short": False}
+
+    def write_part(descriptor, data):
+        if not state["short"] and len(data) > 1:
+            state["short"] = True
+            return original_write(descriptor, data[:1])
+        return original_write(descriptor, data)
+
+    monkeypatch.setattr(os, "write", write_part)
+    capture("rotation", RuntimeError("complete rotation record"))
+
+    assert state["short"] is True
+    assert b"complete rotation record" in errors.read_bytes()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Exercises Windows bootstrap rotation rollback")
+def test_runtime_windows_bootstrap_rotation_staging_discards_partial_failure(
+    runtime, tmp_path, monkeypatch
+):
+    errors = tmp_path / "bootstrap-errors.jsonl"
+    original_bytes = b"x" * (260 * 1024)
+    errors.write_bytes(original_bytes)
+    monkeypatch.setenv("DCC_MCP_GIMP_BOOTSTRAP_ERRORS", str(errors))
+    capture = runtime["_capture_bootstrap_error"]
+    original_write = os.write
+    calls = 0
+
+    def fail_after_part(descriptor, data):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return original_write(descriptor, data[:1])
+        raise OSError("injected rotation staging failure")
+
+    monkeypatch.setattr(os, "write", fail_after_part)
+    capture("rotation", RuntimeError("incomplete rotation record"))
+
+    assert calls == 2
+    assert errors.read_bytes() == original_bytes
+    assert not list(tmp_path.glob(".bootstrap-errors.jsonl.*.tmp"))
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Exercises Windows bootstrap creation")
 def test_runtime_windows_bootstrap_new_file_completes_short_writes(runtime, tmp_path, monkeypatch):
     errors = tmp_path / "bootstrap-errors.jsonl"

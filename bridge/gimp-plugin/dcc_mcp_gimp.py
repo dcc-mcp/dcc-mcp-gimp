@@ -399,8 +399,26 @@ def _capture_bootstrap_error(stage: str, error: BaseException) -> None:
                                 opened = os.lstat(str(path))
                                 if (int(opened.st_dev), int(opened.st_ino)) != before:
                                     return
-                                with path.open("ab") as stream:
-                                    stream.write(line)
+                                descriptor = os.open(
+                                    str(path),
+                                    os.O_WRONLY | os.O_APPEND | getattr(os, "O_BINARY", 0),
+                                )
+                                try:
+                                    descriptor_details = os.fstat(descriptor)
+                                    if (
+                                        int(descriptor_details.st_dev),
+                                        int(descriptor_details.st_ino),
+                                    ) != before:
+                                        return
+                                    try:
+                                        write_all(descriptor, line)
+                                        os.fsync(descriptor)
+                                    except BaseException:
+                                        os.ftruncate(descriptor, current_size)
+                                        os.fsync(descriptor)
+                                        raise
+                                finally:
+                                    os.close(descriptor)
                                 after = os.lstat(str(path))
                                 if (int(after.st_dev), int(after.st_ino)) != before:
                                     return
@@ -413,11 +431,26 @@ def _capture_bootstrap_error(stage: str, error: BaseException) -> None:
                     temporary = path.with_name(".%s.%s.tmp" % (path.name, uuid.uuid4().hex))
                     if not _bootstrap_path_safe(temporary):
                         return
-                    with temporary.open("xb") as stream:
-                        stream.write(payload)
-                        stream.flush()
-                        os.fsync(stream.fileno())
-                    temporary_identity = _bootstrap_object_identity(temporary)
+                    temporary_descriptor = _windows_create_new_file(temporary)
+                    temporary_details = os.fstat(temporary_descriptor)
+                    temporary_identity = (
+                        int(temporary_details.st_dev),
+                        int(temporary_details.st_ino),
+                    )
+                    try:
+                        try:
+                            write_all(temporary_descriptor, payload)
+                            os.fsync(temporary_descriptor)
+                        finally:
+                            os.close(temporary_descriptor)
+                    except BaseException:
+                        try:
+                            _delete_bootstrap_owned(temporary, temporary_identity)
+                        except (FileNotFoundError, OSError):
+                            pass
+                        raise
+                    if _bootstrap_object_identity(temporary) != temporary_identity:
+                        raise OSError("bootstrap temporary changed identity")
                     backup = path.with_name(
                         ".%s.bootstrap-backup-%s" % (path.name, uuid.uuid4().hex)
                     )
