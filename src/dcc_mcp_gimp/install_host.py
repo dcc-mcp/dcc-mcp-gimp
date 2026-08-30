@@ -120,11 +120,34 @@ def _posix_executable_binding(
         launch_path = None
         for descriptor_root in (Path("/proc/self/fd"), Path("/dev/fd")):
             candidate = descriptor_root / str(descriptor)
+            candidate_descriptor = None
             try:
-                candidate_details = os.stat(str(candidate))
+                candidate_descriptor = os.open(
+                    str(candidate),
+                    os.O_RDONLY | getattr(os, "O_CLOEXEC", 0),
+                )
+                candidate_details = os.fstat(candidate_descriptor)
             except OSError:
                 continue
-            if (int(candidate_details.st_dev), int(candidate_details.st_ino)) == actual[:2]:
+            finally:
+                if candidate_descriptor is not None:
+                    try:
+                        os.close(candidate_descriptor)
+                    except OSError:
+                        pass
+            candidate_identity = (
+                int(candidate_details.st_dev),
+                int(candidate_details.st_ino),
+                int(candidate_details.st_size),
+                int(
+                    getattr(
+                        candidate_details,
+                        "st_mtime_ns",
+                        int(candidate_details.st_mtime * 1_000_000_000),
+                    )
+                ),
+            )
+            if stat.S_ISREG(candidate_details.st_mode) and candidate_identity == actual:
                 launch_path = candidate
                 break
         if launch_path is None:
