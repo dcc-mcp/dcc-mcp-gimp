@@ -288,6 +288,52 @@ def _capture_bootstrap_error(stage: str, error: BaseException) -> None:
                     lines.pop(0)
                 return b"".join(lines) + line
 
+            def posix_rename_at(source_name: str, destination_name: str) -> None:
+                """Publish through the held parent inode, bypassing os.rename hooks."""
+                import ctypes
+
+                libc = ctypes.CDLL(None, use_errno=True)
+                try:
+                    renameat = libc.renameat
+                except AttributeError as exc:
+                    raise OSError("POSIX bootstrap rename is unavailable") from exc
+                renameat.argtypes = [
+                    ctypes.c_int,
+                    ctypes.c_char_p,
+                    ctypes.c_int,
+                    ctypes.c_char_p,
+                ]
+                renameat.restype = ctypes.c_int
+                result = renameat(
+                    int(parent_descriptor),
+                    os.fsencode(source_name),
+                    int(parent_descriptor),
+                    os.fsencode(destination_name),
+                )
+                if result != 0:
+                    error_number = ctypes.get_errno()
+                    raise OSError(
+                        error_number,
+                        os.strerror(error_number),
+                        destination_name,
+                    )
+
+            def posix_unlink_at(name: str) -> None:
+                """Remove a temporary through the held parent inode."""
+                import ctypes
+
+                libc = ctypes.CDLL(None, use_errno=True)
+                try:
+                    unlinkat = libc.unlinkat
+                except AttributeError as exc:
+                    raise OSError("POSIX bootstrap unlink is unavailable") from exc
+                unlinkat.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+                unlinkat.restype = ctypes.c_int
+                result = unlinkat(int(parent_descriptor), os.fsencode(name), 0)
+                if result != 0:
+                    error_number = ctypes.get_errno()
+                    raise OSError(error_number, os.strerror(error_number), name)
+
             if os.name == "nt":
                 with _windows_directory_lease(path.parent):
                     if not _bootstrap_path_safe(path):
@@ -434,19 +480,12 @@ def _capture_bootstrap_error(stage: str, error: BaseException) -> None:
                     int(temporary_identity.st_ino),
                 ):
                     return
-                (os.replace if sys.platform == "darwin" else os.rename)(
-                    temporary_name,
-                    path.name,
-                    src_dir_fd=parent_descriptor,
-                    dst_dir_fd=parent_descriptor,
-                )
+                posix_rename_at(temporary_name, path.name)
                 temporary_name = None
             finally:
                 if temporary_name is not None:
                     try:
-                        (os.unlink if sys.platform == "darwin" else os.remove)(
-                            temporary_name, dir_fd=parent_descriptor
-                        )
+                        posix_unlink_at(temporary_name)
                     except (FileNotFoundError, OSError):
                         pass
                 os.close(parent_descriptor)
