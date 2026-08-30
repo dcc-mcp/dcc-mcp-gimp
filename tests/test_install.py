@@ -1088,6 +1088,62 @@ def test_receipt_move_identity_swap_fails_closed(monkeypatch, tmp_path):
     assert not destination.exists()
 
 
+def test_receipt_name_identity_swap_fails_closed(monkeypatch, tmp_path):
+    from dcc_mcp_gimp import install_files
+
+    source = tmp_path / "receipt.json"
+    parked = tmp_path / "receipt.owned"
+    foreign = tmp_path / "foreign.json"
+    source.write_bytes(b"owned")
+    foreign.write_bytes(b"FOREIGN")
+    original = install_files._assert_receipt_name_identity
+    swapped = False
+
+    def late(path, expected, stage="receipt"):
+        nonlocal swapped
+        result = original(path, expected, stage)
+        if path == source and not swapped:
+            source.rename(parked)
+            foreign.rename(source)
+            swapped = True
+        return result
+
+    monkeypatch.setattr(install_files, "_assert_receipt_name_identity", late)
+    with pytest.raises(InstallFailure, match="identity"):
+        install_files._unlink_receipt_owned(source)
+    assert source.read_bytes() == b"FOREIGN"
+    assert parked.read_bytes() == b"owned"
+
+
+def test_receipt_move_name_identity_swap_fails_closed(monkeypatch, tmp_path):
+    from dcc_mcp_gimp import install_files
+
+    source = tmp_path / "source.json"
+    parked = tmp_path / "source.owned"
+    foreign = tmp_path / "foreign.json"
+    destination = tmp_path / "quarantine.json"
+    source.write_bytes(b"owned")
+    foreign.write_bytes(b"FOREIGN")
+    original = install_files._assert_receipt_name_identity
+    swapped = False
+
+    def late(path, expected, stage="receipt"):
+        nonlocal swapped
+        result = original(path, expected, stage)
+        if path == source and not swapped:
+            source.rename(parked)
+            foreign.rename(source)
+            swapped = True
+        return result
+
+    monkeypatch.setattr(install_files, "_assert_receipt_name_identity", late)
+    with pytest.raises(InstallFailure, match="identity"):
+        install_files._replace_receipt_owned(source, destination, tmp_path, None)
+    assert source.read_bytes() == b"FOREIGN"
+    assert parked.read_bytes() == b"owned"
+    assert not destination.exists()
+
+
 def test_recovery_copy_destination_swap_does_not_write_external(tmp_path, monkeypatch):
     from dcc_mcp_gimp import install_files
 
@@ -1132,6 +1188,41 @@ def test_verify_runtime_shape_failure_is_structured(lifecycle_env, monkeypatch):
     assert report["verify"]["directly_usable"] is False
     assert report["verify"]["failure_stage"] == "readiness"
     assert "runtime" in report["verify"]["failure_reason"].lower()
+
+
+@pytest.mark.parametrize("payload", [None, [], "invalid"])
+def test_verify_readiness_shape_failure_is_structured(lifecycle_env, monkeypatch, payload):
+    from dcc_mcp_gimp.install import run
+
+    installed, code, _ = run(["install", "--yes", *lifecycle_env.common])
+    assert code == 0, installed
+    monkeypatch.setattr(
+        "dcc_mcp_gimp.install_lifecycle.wait_for_sidecar_ready",
+        lambda *_args, **_kwargs: payload,
+    )
+    report, code, _ = run(["verify", *lifecycle_env.common])
+    assert code != 0
+    assert report["status"] == "failed"
+    assert report["verify"]["directly_usable"] is False
+    assert report["verify"]["failure_stage"] == "readiness"
+    assert "readiness" in report["verify"]["failure_reason"].lower()
+
+
+def test_verify_readiness_exception_is_structured(lifecycle_env, monkeypatch):
+    from dcc_mcp_gimp.install import run
+
+    installed, code, _ = run(["install", "--yes", *lifecycle_env.common])
+    assert code == 0, installed
+
+    def explode(*_args, **_kwargs):
+        raise RuntimeError("probe exploded")
+
+    monkeypatch.setattr("dcc_mcp_gimp.install_lifecycle.wait_for_sidecar_ready", explode)
+    report, code, _ = run(["verify", *lifecycle_env.common])
+    assert code != 0
+    assert report["status"] == "failed"
+    assert report["verify"]["failure_stage"] == "readiness"
+    assert report["verify"]["failure_reason"] == "GIMP sidecar readiness probe failed"
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Exercises Windows directory lease")
