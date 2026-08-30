@@ -1065,6 +1065,58 @@ def test_receipt_final_child_swap_cannot_delete_or_publish_foreign(tmp_path, mon
     assert not swapped
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Exercises POSIX identity-bound receipt move")
+def test_receipt_final_identity_swap_is_restored_without_foreign_loss(tmp_path, monkeypatch):
+    from dcc_mcp_gimp import install_files
+
+    root = tmp_path / "receipt"
+    root.mkdir()
+    source = root / "source.json"
+    parked = root / "owned.json"
+    foreign = root / "foreign.json"
+    destination = root / "quarantine.json"
+    source.write_bytes(b"OWNED")
+    foreign.write_bytes(b"FOREIGN")
+    original = install_files._POSIX_RENAME
+    swapped = False
+
+    def race(source_name, destination_name, *args, **kwargs):
+        nonlocal swapped
+        if source_name == source.name and not swapped:
+            source.rename(parked)
+            foreign.rename(source)
+            swapped = True
+        return original(source_name, destination_name, *args, **kwargs)
+
+    monkeypatch.setattr(install_files, "_POSIX_RENAME", race)
+    with pytest.raises(install_files.InstallFailure, match="identity"):
+        install_files._replace_receipt_owned(source, destination, root, None)
+    assert source.read_bytes() == b"FOREIGN"
+    assert parked.read_bytes() == b"OWNED"
+    assert not destination.exists()
+
+    source = root / "unlink.json"
+    parked = root / "unlink-owned.json"
+    foreign = root / "unlink-foreign.json"
+    source.write_bytes(b"OWNED")
+    foreign.write_bytes(b"FOREIGN")
+    swapped = False
+
+    def unlink_race(source_name, destination_name, *args, **kwargs):
+        nonlocal swapped
+        if source_name == source.name and not swapped:
+            source.rename(parked)
+            foreign.rename(source)
+            swapped = True
+        return original(source_name, destination_name, *args, **kwargs)
+
+    monkeypatch.setattr(install_files, "_POSIX_RENAME", unlink_race)
+    with pytest.raises(install_files.InstallFailure, match="identity"):
+        install_files._unlink_receipt_owned(source)
+    assert source.read_bytes() == b"FOREIGN"
+    assert parked.read_bytes() == b"OWNED"
+
+
 @pytest.mark.skipif(os.name == "nt", reason="Exercises POSIX receipt temp publication")
 def test_receipt_atomic_temp_swap_cannot_publish_foreign(tmp_path, monkeypatch):
     from dcc_mcp_gimp import install_files
@@ -1457,6 +1509,38 @@ def test_manifest_nested_directory_swap_fails_closed(tmp_path, monkeypatch):
         yield str(nested), [], ["foreign.txt"]
 
     monkeypatch.setattr(install_files.os, "walk", race_walk)
+    with pytest.raises(install_files.InstallFailure, match="directory changed identity"):
+        install_files._owned_root_manifest(root)
+    assert swapped
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Exercises POSIX late nested manifest identity")
+def test_manifest_nested_late_swap_is_not_recorded(tmp_path, monkeypatch):
+    from dcc_mcp_gimp import install_files
+
+    root = tmp_path / "plugins"
+    nested = root / "nested"
+    foreign = tmp_path / "foreign"
+    nested.mkdir(parents=True)
+    (nested / "owned.txt").write_text("owned", encoding="utf-8")
+    foreign.mkdir()
+    (foreign / "owned.txt").write_text("FOREIGN", encoding="utf-8")
+    original_identity = install_files._directory_identity
+    calls = 0
+    swapped = False
+
+    def race_identity(path, stage):
+        nonlocal calls, swapped
+        result = original_identity(path, stage)
+        if Path(path) == nested:
+            calls += 1
+            if calls == 2 and not swapped:
+                nested.rename(tmp_path / "nested-owned")
+                foreign.rename(nested)
+                swapped = True
+        return result
+
+    monkeypatch.setattr(install_files, "_directory_identity", race_identity)
     with pytest.raises(install_files.InstallFailure, match="directory changed identity"):
         install_files._owned_root_manifest(root)
     assert swapped

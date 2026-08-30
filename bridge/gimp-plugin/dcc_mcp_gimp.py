@@ -288,52 +288,6 @@ def _capture_bootstrap_error(stage: str, error: BaseException) -> None:
                     lines.pop(0)
                 return b"".join(lines) + line
 
-            def posix_rename_at(source_name: str, destination_name: str) -> None:
-                """Publish through the held parent inode, bypassing os.rename hooks."""
-                import ctypes
-
-                libc = ctypes.CDLL(None, use_errno=True)
-                try:
-                    renameat = libc.renameat
-                except AttributeError as exc:
-                    raise OSError("POSIX bootstrap rename is unavailable") from exc
-                renameat.argtypes = [
-                    ctypes.c_int,
-                    ctypes.c_char_p,
-                    ctypes.c_int,
-                    ctypes.c_char_p,
-                ]
-                renameat.restype = ctypes.c_int
-                result = renameat(
-                    int(parent_descriptor),
-                    os.fsencode(source_name),
-                    int(parent_descriptor),
-                    os.fsencode(destination_name),
-                )
-                if result != 0:
-                    error_number = ctypes.get_errno()
-                    raise OSError(
-                        error_number,
-                        os.strerror(error_number),
-                        destination_name,
-                    )
-
-            def posix_unlink_at(name: str) -> None:
-                """Remove a temporary through the held parent inode."""
-                import ctypes
-
-                libc = ctypes.CDLL(None, use_errno=True)
-                try:
-                    unlinkat = libc.unlinkat
-                except AttributeError as exc:
-                    raise OSError("POSIX bootstrap unlink is unavailable") from exc
-                unlinkat.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
-                unlinkat.restype = ctypes.c_int
-                result = unlinkat(int(parent_descriptor), os.fsencode(name), 0)
-                if result != 0:
-                    error_number = ctypes.get_errno()
-                    raise OSError(error_number, os.strerror(error_number), name)
-
             if os.name == "nt":
                 with _windows_directory_lease(path.parent):
                     if not _bootstrap_path_safe(path):
@@ -412,7 +366,6 @@ def _capture_bootstrap_error(stage: str, error: BaseException) -> None:
                 int(parent_before.st_ino),
             ):
                 return
-            temporary_name = None
             try:
                 try:
                     details = os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
@@ -454,40 +407,29 @@ def _capture_bootstrap_error(stage: str, error: BaseException) -> None:
                 finally:
                     os.close(descriptor)
                 payload = rotate(existing, current_size)
-                temporary_name = ".%s.%s.tmp" % (path.name, uuid.uuid4().hex)
-                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-                descriptor = os.open(temporary_name, flags, 0o666, dir_fd=parent_descriptor)
+                # Commit the bounded rotation through the already-open log
+                # inode.  A pathname swap after this open cannot redirect
+                # the write into an external file.
+                descriptor = os.open(
+                    path.name,
+                    os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=parent_descriptor,
+                )
                 try:
-                    os.write(descriptor, payload)
+                    opened = os.fstat(descriptor)
+                    if (int(opened.st_dev), int(opened.st_ino)) != (
+                        int(details.st_dev),
+                        int(details.st_ino),
+                    ):
+                        return
+                    os.ftruncate(descriptor, 0)
+                    view = memoryview(payload)
+                    while view:
+                        written = os.write(descriptor, view)
+                        view = view[written:]
                 finally:
                     os.close(descriptor)
-                temporary_identity = os.stat(
-                    temporary_name,
-                    dir_fd=parent_descriptor,
-                    follow_symlinks=False,
-                )
-                # Re-open the temporary entry by its no-follow name and
-                # prove the inode immediately before publication.  The
-                # process-wide writer lock is the bootstrap transaction
-                # protocol shared by every writer in this plug-in.
-                current = os.stat(
-                    temporary_name,
-                    dir_fd=parent_descriptor,
-                    follow_symlinks=False,
-                )
-                if (int(current.st_dev), int(current.st_ino)) != (
-                    int(temporary_identity.st_dev),
-                    int(temporary_identity.st_ino),
-                ):
-                    return
-                posix_rename_at(temporary_name, path.name)
-                temporary_name = None
             finally:
-                if temporary_name is not None:
-                    try:
-                        posix_unlink_at(temporary_name)
-                    except (FileNotFoundError, OSError):
-                        pass
                 os.close(parent_descriptor)
     except (OSError, RuntimeError, ValueError, AttributeError):
         pass
