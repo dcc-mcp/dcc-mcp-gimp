@@ -406,6 +406,11 @@ def _capture_bootstrap_error(stage: str, error: BaseException) -> None:
                     os.write(descriptor, payload)
                 finally:
                     os.close(descriptor)
+                temporary_identity = os.stat(
+                    temporary_name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
                 # Re-open the temporary entry by its no-follow name and
                 # prove the inode immediately before publication.  The
                 # process-wide writer lock is the bootstrap transaction
