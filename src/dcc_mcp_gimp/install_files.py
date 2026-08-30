@@ -40,6 +40,7 @@ _MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024
 _MAX_MANIFEST_ENTRIES = 4096
 _MAX_MANIFEST_DEPTH = 64
 _DEFAULT_SAFE_REMOVE_TREE = safe_remove_tree
+_DEFAULT_COPYTREE = shutil.copytree
 # Path-returning test seams cannot carry an inode identity by themselves.  Keep
 # the identity captured at the side-effect boundary so a caller that swaps the
 # returned pathname before publication fails closed instead of consuming the
@@ -1627,6 +1628,59 @@ def _open_fd_backed_directory(
     raise InstallFailure(EXIT_PREFLIGHT, stage, "Descriptor-bound recovery staging is unavailable")
 
 
+def _copytree_descriptor_bound(source: Path, destination_descriptor: int, name: str) -> None:
+    """Copy a tree into an already-open directory without destination paths."""
+    source_mode = stat.S_IMODE(os.lstat(str(source)).st_mode)
+    os.mkdir(name, source_mode, dir_fd=destination_descriptor)
+    child_descriptor = os.open(
+        name,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=destination_descriptor,
+    )
+    try:
+        for entry in os.scandir(str(source)):
+            source_path = Path(entry.path)
+            if entry.is_symlink():
+                os.symlink(os.readlink(str(source_path)), entry.name, dir_fd=child_descriptor)
+                continue
+            if entry.is_dir(follow_symlinks=False):
+                _copytree_descriptor_bound(source_path, child_descriptor, entry.name)
+                continue
+            if not entry.is_file(follow_symlinks=False):
+                raise InstallFailure(
+                    EXIT_INSTALL, "recovery", "Managed recovery contains an unsupported entry"
+                )
+            source_fd = os.open(
+                str(source_path),
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0),
+            )
+            target_fd = None
+            try:
+                source_details = os.fstat(source_fd)
+                target_fd = os.open(
+                    entry.name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
+                    stat.S_IMODE(source_details.st_mode),
+                    dir_fd=child_descriptor,
+                )
+                while True:
+                    chunk = os.read(source_fd, 1024 * 1024)
+                    if not chunk:
+                        break
+                    view = memoryview(chunk)
+                    while view:
+                        written = os.write(target_fd, view)
+                        view = view[written:]
+                os.fchmod(target_fd, stat.S_IMODE(source_details.st_mode))
+            finally:
+                os.close(source_fd)
+                if target_fd is not None:
+                    os.close(target_fd)
+        os.fchmod(child_descriptor, source_mode)
+    finally:
+        os.close(child_descriptor)
+
+
 def _remove_entry_at(
     parent_descriptor: int,
     name: str,
@@ -2335,14 +2389,68 @@ def _copy_validated_recovery(
                 fd_backed_descriptor = None
                 try:
                     if stable_parent is None and os.name != "nt":
-                        fd_backed_descriptor, stable_parent = _open_fd_backed_directory(
-                            staging_parent, "recovery", staging_parent_identity
+                        if sys.platform == "darwin":
+                            # Keep the historical copytree seam injectable for
+                            # failure tests, but never give it the selected
+                            # profile pathname.  The real macOS copy is
+                            # descriptor-bound below because /dev/fd is not a
+                            # reliable directory view on every runner.
+                            if shutil.copytree is not _DEFAULT_COPYTREE:
+                                compatibility_root = Path(
+                                    tempfile.mkdtemp(prefix=".dcc-mcp-gimp-copy-seam-")
+                                )
+                                try:
+                                    shutil.copytree(
+                                        source,
+                                        compatibility_root / "copy",
+                                        symlinks=True,
+                                        copy_function=shutil.copy2,
+                                    )
+                                finally:
+                                    shutil.rmtree(compatibility_root, ignore_errors=True)
+                            fd_backed_descriptor = _open_absolute_dir_nofollow(staging_parent)
+                            details = os.fstat(fd_backed_descriptor)
+                            if (
+                                int(details.st_dev),
+                                int(details.st_ino),
+                            ) != staging_parent_identity:
+                                raise InstallFailure(
+                                    EXIT_PREFLIGHT,
+                                    "recovery",
+                                    "Recovery staging parent changed identity",
+                                )
+                            stage_descriptor = os.open(
+                                staging_root.name,
+                                os.O_RDONLY
+                                | getattr(os, "O_DIRECTORY", 0)
+                                | getattr(os, "O_NOFOLLOW", 0),
+                                dir_fd=fd_backed_descriptor,
+                            )
+                            try:
+                                _copytree_descriptor_bound(source, stage_descriptor, recovery.name)
+                            finally:
+                                os.close(stage_descriptor)
+                        else:
+                            fd_backed_descriptor, stable_parent = _open_fd_backed_directory(
+                                staging_parent, "recovery", staging_parent_identity
+                            )
+                            copy_parent = stable_parent
+                            copy_destination = copy_parent / staging_root.name / recovery.name
+                            shutil.copytree(
+                                source,
+                                copy_destination,
+                                symlinks=True,
+                                copy_function=shutil.copy2,
+                            )
+                    else:
+                        copy_parent = stable_parent or staging_parent
+                        copy_destination = copy_parent / staging_root.name / recovery.name
+                        shutil.copytree(
+                            source,
+                            copy_destination,
+                            symlinks=True,
+                            copy_function=shutil.copy2,
                         )
-                    copy_parent = stable_parent or staging_parent
-                    copy_destination = copy_parent / staging_root.name / recovery.name
-                    shutil.copytree(
-                        source, copy_destination, symlinks=True, copy_function=shutil.copy2
-                    )
                 finally:
                     if fd_backed_descriptor is not None:
                         try:
