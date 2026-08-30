@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -23,6 +25,7 @@ _MAX_PROBE_OUTPUT = 16 * 1024
 _MAX_METADATA_OUTPUT = 256 * 1024
 _MAX_BOOTSTRAP_RECORD_BYTES = 64 * 1024
 _MAX_BOOTSTRAP_RECORDS = 1024
+_MAX_BOOTSTRAP_LOG_BYTES = 256 * 1024
 
 
 def _path_is_link_or_reparse(path: Path) -> bool:
@@ -53,6 +56,88 @@ def _parent_has_reparse(path: Path) -> bool:
         if next_parent == parent:
             return False
         parent = next_parent
+
+
+def _executable_identity(path: Path) -> tuple[int, int, int, int]:
+    """Capture a physical executable identity for a preflight-to-launch lease."""
+    try:
+        details = os.lstat(str(path))
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise InstallFailure(
+            EXIT_PREFLIGHT, "executable", "Selected executable identity is unavailable"
+        ) from exc
+    if not stat.S_ISREG(details.st_mode) or _path_is_link_or_reparse(path):
+        raise InstallFailure(
+            EXIT_PREFLIGHT, "executable", "Selected executable path is linked or not regular"
+        )
+    return (
+        int(details.st_dev),
+        int(details.st_ino),
+        int(details.st_size),
+        int(getattr(details, "st_mtime_ns", int(details.st_mtime * 1_000_000_000))),
+    )
+
+
+def _assert_executable_identity(
+    path: Path,
+    expected: Optional[tuple[int, int, int, int]],
+    stage: str,
+) -> None:
+    if expected is None:
+        return
+    actual = _executable_identity(path)
+    if actual != tuple(expected):
+        raise InstallFailure(EXIT_PREFLIGHT, stage, "Selected executable changed identity")
+
+
+@contextlib.contextmanager
+def _windows_executable_lease(path: Path, stage: str) -> Any:
+    """Hold the executable parent against a Windows rename/reparse swap."""
+    if os.name != "nt":
+        yield
+        return
+    handle = None
+    try:
+        import ctypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateFileW.argtypes = [
+            ctypes.c_wchar_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+        ]
+        kernel32.CreateFileW.restype = ctypes.c_void_p
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = ctypes.c_int
+        handle = kernel32.CreateFileW(
+            str(path.parent),
+            0x80 | 0x20,
+            0x1 | 0x2,
+            None,
+            3,
+            0x02000000 | 0x00200000,
+            None,
+        )
+        invalid = ctypes.c_void_p(-1).value
+        if handle in (None, invalid):
+            error = ctypes.get_last_error()
+            raise OSError(error, "CreateFileW executable lease failed", str(path.parent))
+    except InstallFailure:
+        raise
+    except (OSError, AttributeError, RuntimeError, ValueError) as exc:
+        raise InstallFailure(EXIT_PREFLIGHT, stage, "Windows executable lease unavailable") from exc
+    try:
+        yield
+    finally:
+        if handle not in (None,):
+            try:
+                kernel32.CloseHandle(handle)
+            except (OSError, AttributeError):
+                pass
 
 
 def default_plugin_dir() -> Path:
@@ -95,15 +180,20 @@ def _bootstrap_error_summary() -> dict[str, Any]:
     if is_file:
         try:
             with path.open("rb") as stream:
-                for _ in range(_MAX_BOOTSTRAP_RECORDS):
-                    raw_line = stream.readline(_MAX_BOOTSTRAP_RECORD_BYTES + 1)
+                stream.seek(0, os.SEEK_END)
+                total_bytes = stream.tell()
+                offset = max(0, total_bytes - _MAX_BOOTSTRAP_LOG_BYTES)
+                stream.seek(offset)
+                bounded = stream.read(_MAX_BOOTSTRAP_LOG_BYTES)
+                lines = bounded.splitlines(keepends=True)
+                if offset and b"\n" in bounded and len(lines) > 1:
+                    lines = lines[1:]
+                for raw_line in lines[-_MAX_BOOTSTRAP_RECORDS:]:
                     if not raw_line:
-                        break
-                    oversized = len(raw_line) > _MAX_BOOTSTRAP_RECORD_BYTES
-                    if oversized and not raw_line.endswith(b"\n"):
-                        # Do not scan an attacker-controlled unterminated line;
-                        # one bounded prefix is enough for the diagnostic.
-                        stream.seek(0, os.SEEK_END)
+                        continue
+                    oversized = len(
+                        raw_line
+                    ) > _MAX_BOOTSTRAP_RECORD_BYTES or not raw_line.endswith(b"\n")
                     line = raw_line[:_MAX_BOOTSTRAP_RECORD_BYTES].decode("utf-8", errors="replace")
                     if oversized:
                         records.append(
@@ -241,19 +331,26 @@ def _resolve_gimp(value: Optional[Path]) -> Path:
     return resolved
 
 
-def _gimp_version(executable: Path) -> str:
+def _gimp_version(
+    executable: Path,
+    *,
+    expected_identity: Optional[tuple[int, int, int, int]] = None,
+) -> str:
+    _assert_executable_identity(executable, expected_identity, "gimp_version")
     command = [str(executable)]
     if executable.name.lower().endswith(".appimage"):
         command.append("--appimage-extract-and-run")
     command.append("--version")
     try:
-        completed = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=15,
-            check=False,
-        )
+        with _windows_executable_lease(executable, "gimp_version"):
+            _assert_executable_identity(executable, expected_identity, "gimp_version")
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise InstallFailure(EXIT_PREFLIGHT, "gimp_version", str(exc)) from exc
     output = "%s\n%s" % (completed.stdout, completed.stderr)
@@ -275,7 +372,12 @@ def _gimp_version(executable: Path) -> str:
     return version
 
 
-def _target_versions(python: Path) -> dict[str, str]:
+def _target_versions(
+    python: Path,
+    *,
+    expected_identity: Optional[tuple[int, int, int, int]] = None,
+) -> dict[str, str]:
+    _assert_executable_identity(python, expected_identity, "python")
     code = r"""
 import importlib.metadata as metadata
 import json
@@ -356,15 +458,17 @@ print(
         }
     )
 )
-""".strip()
+    """.strip()
     try:
-        completed = subprocess.run(
-            [str(python), "-c", code],
-            capture_output=True,
-            text=True,
-            timeout=15,
-            check=False,
-        )
+        with _windows_executable_lease(python, "python"):
+            _assert_executable_identity(python, expected_identity, "python")
+            completed = subprocess.run(
+                [str(python), "-c", code],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise InstallFailure(EXIT_PREFLIGHT, "python", str(exc)) from exc
     if completed.returncode:

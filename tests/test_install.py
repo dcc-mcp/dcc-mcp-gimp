@@ -673,6 +673,24 @@ def test_bootstrap_summary_bounds_oversized_records(tmp_path, monkeypatch):
     assert len(summary["latest"]["message"]) <= 64 * 1024
 
 
+def test_bootstrap_summary_prefers_latest_bounded_records(tmp_path, monkeypatch):
+    from dcc_mcp_gimp.install_host import _bootstrap_error_summary
+
+    path = tmp_path / "bootstrap.jsonl"
+    path.write_text(
+        "".join(
+            json.dumps({"stage": "record-%04d" % index, "message": "bounded"}) + "\n"
+            for index in range(1500)
+        )
+    )
+    monkeypatch.setenv("DCC_MCP_GIMP_BOOTSTRAP_ERRORS", str(path))
+
+    summary = _bootstrap_error_summary()
+
+    assert summary["count"] <= 1024
+    assert summary["latest"]["stage"] == "record-1499"
+
+
 def _install_schema_validator() -> Draft202012Validator:
     schema_bytes = (
         importlib.resources.files("dcc_mcp_gimp.schemas")
@@ -892,6 +910,98 @@ def test_uninstall_cleanup_failure_restores_target_and_receipt(lifecycle_env, mo
     } == prior_files
     assert receipt_path.read_bytes() == prior_receipt
     assert not list(lifecycle_env.plugins.glob(".dcc_mcp_gimp.*"))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Exercises POSIX dirfd receipt writer")
+def test_receipt_temp_collision_does_not_remove_foreign_file(tmp_path, monkeypatch):
+    from dcc_mcp_gimp import install_files
+    from dcc_mcp_gimp.install_contract import InstallFailure
+
+    receipt = tmp_path / "receipts" / "gimp.json"
+    receipt.parent.mkdir()
+    collision = receipt.with_name(".gimp.json.collision.tmp")
+    collision.write_bytes(b"foreign sentinel")
+
+    class CollisionUuid:
+        hex = "collision"
+
+    monkeypatch.setattr(install_files.uuid, "uuid4", lambda: CollisionUuid())
+
+    with pytest.raises(InstallFailure):
+        install_files._write_bytes_atomic(receipt, b"new receipt")
+
+    assert collision.read_bytes() == b"foreign sentinel"
+
+
+def test_launch_preflight_rejects_changed_executable_identity(tmp_path):
+    from dcc_mcp_gimp.install_contract import InstallFailure
+    from dcc_mcp_gimp.install_host import _executable_identity, _gimp_version, _target_versions
+
+    executable = tmp_path / "gimp-3.0.exe"
+    executable.write_bytes(b"gimp")
+    python = tmp_path / "python"
+    python.write_bytes(b"python")
+    gimp_identity = _executable_identity(executable)
+    python_identity = _executable_identity(python)
+    executable.unlink()
+    executable.write_bytes(b"attacker")
+    with pytest.raises(InstallFailure, match="identity"):
+        _gimp_version(executable, expected_identity=gimp_identity)
+    python.unlink()
+    python.write_bytes(b"attacker")
+    with pytest.raises(InstallFailure, match="identity"):
+        _target_versions(python, expected_identity=python_identity)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Exercises POSIX profile-root swap")
+def test_uninstall_root_swap_does_not_write_foreign_recovery(lifecycle_env, monkeypatch):
+    from dcc_mcp_gimp import install_files
+    from dcc_mcp_gimp.install import run
+
+    installed, code, _ = run(["install", "--yes", *lifecycle_env.common])
+    assert code == 0, installed
+    destination = lifecycle_env.plugins
+    parked = lifecycle_env.root / "parked-profile"
+    foreign = lifecycle_env.root / "foreign-profile"
+    foreign.mkdir()
+    (foreign / "sentinel.txt").write_text("keep", encoding="utf-8")
+    original = install_files._copy_validated_recovery
+    swapped = False
+    foreign_receipt = None
+
+    def swap_after_snapshot(source, recovery, *args, **kwargs):
+        nonlocal swapped, foreign_receipt
+        result = original(source, recovery, *args, **kwargs)
+        if not swapped:
+            transaction_name = recovery.parents[1].name
+            destination.rename(parked)
+            foreign.rename(destination)
+            (destination / transaction_name / "snapshot").mkdir(parents=True)
+            (destination / transaction_name / "quarantine").mkdir()
+            foreign_receipt = destination / transaction_name / "snapshot" / "gimp.json"
+            swapped = True
+        return result
+
+    monkeypatch.setattr(install_files, "_copy_validated_recovery", swap_after_snapshot)
+    report, code, _ = run(["uninstall", "--yes", *lifecycle_env.common])
+
+    assert code != 0, report
+    assert (destination / "sentinel.txt").read_text(encoding="utf-8") == "keep"
+    assert foreign_receipt is not None and not foreign_receipt.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Exercises Windows directory lease")
+def test_windows_directory_lease_blocks_profile_root_rename(tmp_path):
+    from dcc_mcp_gimp.install_files import _windows_directory_lease
+
+    root = tmp_path / "profile"
+    root.mkdir()
+    parked = tmp_path / "parked-profile"
+    with _windows_directory_lease(root, "profile"):
+        with pytest.raises(OSError):
+            root.rename(parked)
+    assert root.is_dir()
+    assert not parked.exists()
 
 
 def test_verify_rejects_foreign_gimp_process_identity(lifecycle_env, monkeypatch):
@@ -1246,6 +1356,30 @@ def test_verify_target_swap_after_validation_fails_closed(lifecycle_env, monkeyp
     assert (foreign / "operator.txt").read_text(encoding="utf-8") == "do not touch"
 
 
+def test_verify_owned_entry_point_swap_after_validation_fails_closed(lifecycle_env, monkeypatch):
+    from dcc_mcp_gimp import install_lifecycle
+    from dcc_mcp_gimp.install import run
+
+    installed, code, _ = run(["install", "--yes", *lifecycle_env.common])
+    assert code == 0, installed
+    script = lifecycle_env.plugins / "dcc_mcp_gimp" / "dcc_mcp_gimp.py"
+    original_bytes = script.read_bytes()
+    original_validate = install_lifecycle._validate_owned_install
+
+    def validate_then_swap(*args, **kwargs):
+        original_validate(*args, **kwargs)
+        script.unlink()
+        script.write_bytes(original_bytes)
+
+    monkeypatch.setattr(install_lifecycle, "_validate_owned_install", validate_then_swap)
+    report, code, _ = run(["verify", *lifecycle_env.common])
+
+    assert code == 40
+    assert report["status"] == "failed"
+    assert report["verify"]["directly_usable"] is False
+    assert "identity" in report["verify"]["failure_reason"]
+
+
 def test_upgrade_target_swap_before_replace_preserves_foreign_tree(lifecycle_env, monkeypatch):
     from dcc_mcp_gimp import install_files
     from dcc_mcp_gimp.install import run
@@ -1269,6 +1403,30 @@ def test_upgrade_target_swap_before_replace_preserves_foreign_tree(lifecycle_env
     assert code == 10
     assert report["status"] == "failed"
     assert (target / "operator.txt").read_text(encoding="utf-8") == "foreign"
+
+
+def test_upgrade_owned_child_swap_before_replace_preserves_foreign_file(lifecycle_env, monkeypatch):
+    from dcc_mcp_gimp import install_files
+    from dcc_mcp_gimp.install import run
+
+    installed, code, _ = run(["install", "--yes", *lifecycle_env.common])
+    assert code == 0, installed
+    target = lifecycle_env.plugins / "dcc_mcp_gimp"
+    script = target / "dcc_mcp_gimp.py"
+    original_stage = install_files._stage_plugin
+
+    def stage_then_swap(root):
+        stage = original_stage(root)
+        script.unlink()
+        script.write_text("foreign operator", encoding="utf-8")
+        return stage
+
+    monkeypatch.setattr(install_files, "_stage_plugin", stage_then_swap)
+    report, code, _ = run(["upgrade", "--yes", *lifecycle_env.common])
+
+    assert code == 10
+    assert report["status"] == "failed"
+    assert script.read_text(encoding="utf-8") == "foreign operator"
 
 
 def test_uninstall_child_swap_after_validation_preserves_foreign_file(lifecycle_env, monkeypatch):

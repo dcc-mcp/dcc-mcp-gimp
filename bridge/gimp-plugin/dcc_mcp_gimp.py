@@ -13,17 +13,22 @@ import socketserver
 import sys
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
+_MAX_BOOTSTRAP_RECORD_BYTES = 64 * 1024
+_MAX_BOOTSTRAP_RECORDS = 1024
+_MAX_BOOTSTRAP_LOG_BYTES = 256 * 1024
+
 
 def _bootstrap_error_path() -> Path:
     configured = os.environ.get("DCC_MCP_GIMP_BOOTSTRAP_ERRORS")
     if configured:
-        return Path(configured).expanduser().resolve()
-    return Path.home().joinpath(".dcc-mcp", "gimp-bootstrap-errors.jsonl").resolve()
+        return Path(configured).expanduser().absolute()
+    return Path.home().joinpath(".dcc-mcp", "gimp-bootstrap-errors.jsonl").absolute()
 
 
 def _capture_bootstrap_error(stage: str, error: BaseException) -> None:
@@ -32,12 +37,40 @@ def _capture_bootstrap_error(stage: str, error: BaseException) -> None:
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "stage": stage,
         "error_type": type(error).__name__,
-        "message": str(error),
+        "message": str(error)[:_MAX_BOOTSTRAP_RECORD_BYTES],
     }
     try:
+        if path.is_symlink() or any(parent.is_symlink() for parent in path.parents):
+            return
         path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+        line = (json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n").encode(
+            "utf-8"
+        )
+        current_size = path.stat().st_size if path.is_file() else 0
+        if current_size + len(line) <= _MAX_BOOTSTRAP_LOG_BYTES:
+            with path.open("ab") as stream:
+                stream.write(line)
+            return
+        with path.open("rb") as stream:
+            stream.seek(max(0, current_size - _MAX_BOOTSTRAP_LOG_BYTES))
+            existing = stream.read(_MAX_BOOTSTRAP_LOG_BYTES)
+        lines = existing.splitlines(keepends=True)
+        if current_size > _MAX_BOOTSTRAP_LOG_BYTES and b"\n" in existing:
+            lines = lines[1:]
+        lines = lines[-(_MAX_BOOTSTRAP_RECORDS - 1) :]
+        while lines and sum(len(item) for item in lines) + len(line) > _MAX_BOOTSTRAP_LOG_BYTES:
+            lines.pop(0)
+        payload = b"".join(lines) + line
+        temporary = path.with_name(".%s.%s.tmp" % (path.name, uuid.uuid4().hex))
+        with temporary.open("xb") as stream:
+            stream.write(payload)
+        try:
+            os.replace(temporary, path)
+        finally:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
     except OSError:
         pass
 
