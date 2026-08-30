@@ -1124,24 +1124,31 @@ def test_receipt_atomic_temp_swap_cannot_publish_foreign(tmp_path, monkeypatch):
     receipt = tmp_path / "gimp.json"
     foreign = tmp_path / "foreign.tmp"
     foreign.write_bytes(b"FOREIGN")
-    original_rename = install_files.os.rename
+    original_link = install_files._POSIX_LINK
     swapped = False
 
     def race(source_name, destination_name, *args, **kwargs):
         nonlocal swapped
-        if isinstance(source_name, str) and source_name.startswith(".gimp.json.") and not swapped:
+        if (
+            isinstance(source_name, str)
+            and source_name.startswith(".gimp.json.")
+            and source_name.endswith(".tmp")
+            and not swapped
+        ):
             temporary = tmp_path / source_name
             if temporary.exists():
                 temporary.rename(tmp_path / (temporary.name + ".owned"))
                 foreign.rename(temporary)
                 swapped = True
-        return original_rename(source_name, destination_name, *args, **kwargs)
+        return original_link(source_name, destination_name, *args, **kwargs)
 
-    monkeypatch.setattr(install_files.os, "rename", race)
-    install_files._write_bytes_atomic(receipt, b"OWNED")
-    assert receipt.read_bytes() == b"OWNED"
-    assert foreign.read_bytes() == b"FOREIGN"
-    assert not swapped
+    monkeypatch.setattr(install_files, "_POSIX_LINK", race)
+    with pytest.raises(install_files.InstallFailure, match="identity"):
+        install_files._write_bytes_atomic(receipt, b"OWNED")
+    assert swapped
+    assert not receipt.exists()
+    assert foreign.exists() is False
+    assert any(item.read_bytes() == b"FOREIGN" for item in tmp_path.iterdir() if item.is_file())
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Exercises POSIX receipt atomic-write failure")
@@ -1176,11 +1183,11 @@ def test_receipt_atomic_write_failure_preserves_previous_bytes(tmp_path, monkeyp
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Exercises POSIX bound receipt publication")
-def test_receipt_atomic_bound_temp_swap_preserves_previous_and_foreign(tmp_path, monkeypatch):
+def test_receipt_atomic_final_name_create_preserves_previous_and_foreign(tmp_path, monkeypatch):
     from dcc_mcp_gimp import install_files
 
     receipt = tmp_path / "gimp.json"
-    foreign = tmp_path / "foreign.tmp"
+    foreign = tmp_path / "foreign-source"
     receipt.write_bytes(b"OLD-RECEIPT")
     foreign.write_bytes(b"FOREIGN")
     original_rename = install_files._POSIX_RENAME
@@ -1188,29 +1195,21 @@ def test_receipt_atomic_bound_temp_swap_preserves_previous_and_foreign(tmp_path,
 
     def race(source_name, destination_name, *args, **kwargs):
         nonlocal swapped
-        if (
-            isinstance(source_name, str)
-            and source_name.startswith(".gimp.json.")
-            and source_name.endswith(".tmp")
-            and not swapped
-        ):
-            temporary = tmp_path / source_name
-            if temporary.exists():
-                temporary.rename(tmp_path / (temporary.name + ".owned"))
-                foreign.rename(temporary)
-                swapped = True
-        return original_rename(source_name, destination_name, *args, **kwargs)
+        result = original_rename(source_name, destination_name, *args, **kwargs)
+        if not swapped:
+            foreign.rename(receipt)
+            swapped = True
+        return result
 
     monkeypatch.setattr(install_files, "_POSIX_RENAME", race)
     with pytest.raises(install_files.InstallFailure):
         install_files._write_bytes_atomic(receipt, b"NEW-RECEIPT")
 
     assert swapped
-    assert receipt.read_bytes() == b"OLD-RECEIPT"
+    assert receipt.read_bytes() == b"FOREIGN"
     assert not foreign.exists()
-    assert any(item.name.endswith(".tmp.owned") for item in tmp_path.iterdir())
     assert any(
-        item.name.startswith(".gimp.json.receipt-foreign-") and item.read_bytes() == b"FOREIGN"
+        item.name.startswith(".gimp.json.receipt-backup-") and item.read_bytes() == b"OLD-RECEIPT"
         for item in tmp_path.iterdir()
     )
 
@@ -1233,6 +1232,90 @@ def test_receipt_success_does_not_leave_transaction_tombstones(tmp_path):
         "receipt-moved-" in item.name or "receipt-removed-" in item.name
         for item in tmp_path.iterdir()
     )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Exercises POSIX receipt move rollback")
+def test_receipt_move_failure_restores_source_without_partial_destination(tmp_path, monkeypatch):
+    from dcc_mcp_gimp import install_files
+
+    source = tmp_path / "source.json"
+    destination = tmp_path / "quarantine.json"
+    source.write_bytes(b"OWNED-RECEIPT-CONTENT")
+    original_write = install_files.os.write
+    failed = False
+
+    def fail_copy(fd, data):
+        nonlocal failed
+        if not failed and len(data) > 3:
+            failed = True
+            original_write(fd, data[:3])
+            raise OSError("injected disk-full")
+        return original_write(fd, data)
+
+    monkeypatch.setattr(install_files.os, "write", fail_copy)
+    with pytest.raises(install_files.InstallFailure):
+        install_files._replace_receipt_owned(source, destination, tmp_path, None)
+
+    assert failed
+    assert source.read_bytes() == b"OWNED-RECEIPT-CONTENT"
+    assert not destination.exists()
+    assert not any("receipt-moved-" in item.name for item in tmp_path.iterdir())
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Exercises POSIX receipt destination race")
+def test_receipt_destination_create_race_preserves_source_and_foreign(tmp_path, monkeypatch):
+    from dcc_mcp_gimp import install_files
+
+    source = tmp_path / "source.json"
+    destination = tmp_path / "quarantine.json"
+    source.write_bytes(b"OWNED")
+    original_open = install_files.os.open
+    swapped = False
+
+    def race(name, flags, *args, **kwargs):
+        nonlocal swapped
+        if name == destination.name and flags & install_files.os.O_EXCL and not swapped:
+            destination.write_bytes(b"FOREIGN")
+            swapped = True
+        return original_open(name, flags, *args, **kwargs)
+
+    monkeypatch.setattr(install_files.os, "open", race)
+    with pytest.raises(install_files.InstallFailure):
+        install_files._replace_receipt_owned(source, destination, tmp_path, None)
+
+    assert swapped
+    assert source.read_bytes() == b"OWNED"
+    assert destination.read_bytes() == b"FOREIGN"
+    assert not any("receipt-moved-" in item.name for item in tmp_path.iterdir())
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Exercises POSIX unlink identity race")
+def test_receipt_unlink_identity_race_does_not_delete_foreign(tmp_path, monkeypatch):
+    from dcc_mcp_gimp import install_files
+
+    receipt = tmp_path / "receipt.json"
+    foreign_source = tmp_path / "foreign-source"
+    receipt.write_bytes(b"OWNED")
+    foreign_source.write_bytes(b"FOREIGN")
+    original_rename = install_files._POSIX_RENAME
+    swapped = False
+
+    def race(source_name, destination_name, *args, **kwargs):
+        nonlocal swapped
+        if source_name == receipt.name and not swapped:
+            receipt.rename(tmp_path / "owned-parked")
+            foreign_source.rename(receipt)
+            swapped = True
+        return original_rename(source_name, destination_name, *args, **kwargs)
+
+    monkeypatch.setattr(install_files, "_POSIX_RENAME", race)
+    with pytest.raises(install_files.InstallFailure, match="identity"):
+        install_files._unlink_receipt_owned(receipt)
+
+    assert swapped
+    assert receipt.read_bytes() == b"FOREIGN"
+    assert (tmp_path / "owned-parked").read_bytes() == b"OWNED"
+    assert foreign_source.exists() is False
 
 
 def test_launch_preflight_rejects_changed_executable_identity(tmp_path):
