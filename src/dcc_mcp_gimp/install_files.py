@@ -180,6 +180,11 @@ def _owned_root_manifest(
         )
     root_identity = _directory_identity(root, "receipt")
     directories: list[str] = []
+    # ``os.walk`` yields child names and then later revisits those names by
+    # pathname.  Pin every directory inode at the listing boundary so a
+    # nested directory replacement cannot turn the next batch into an
+    # operator-owned tree while the root itself remains unchanged.
+    directory_identities: dict[str, tuple[int, int]] = {"": root_identity}
     files: list[dict[str, Any]] = []
     links: list[str] = []
     total_bytes = 0
@@ -198,6 +203,14 @@ def _owned_root_manifest(
             raise InstallFailure(
                 EXIT_PREFLIGHT, "receipt", "Managed manifest escaped its root"
             ) from exc
+        current_relative = "" if current_path == root else current_path.relative_to(root).as_posix()
+        expected_current_identity = directory_identities.get(current_relative)
+        if expected_current_identity is None:
+            raise InstallFailure(EXIT_PREFLIGHT, "receipt", "Managed manifest directory is unowned")
+        if _directory_identity(current_path, "receipt") != expected_current_identity:
+            raise InstallFailure(
+                EXIT_PREFLIGHT, "receipt", "Managed manifest directory changed identity"
+            )
         if current_depth > _MAX_MANIFEST_DEPTH:
             raise InstallFailure(EXIT_PREFLIGHT, "receipt", "Managed manifest is too deep")
         traversable: list[str] = []
@@ -213,6 +226,7 @@ def _owned_root_manifest(
             if _is_link(path):
                 links.append(relative)
             else:
+                directory_identities[relative] = _directory_identity(path, "receipt")
                 directories.append(relative)
                 traversable.append(name)
         dirnames[:] = traversable
@@ -1184,12 +1198,7 @@ def _write_atomic_at_parent(path: Path, data: bytes, mode: Optional[int] = None)
                 raise InstallFailure(
                     EXIT_PREFLIGHT, "receipt", "Managed receipt file changed identity"
                 )
-            (os.replace if sys.platform == "darwin" else os.rename)(
-                temporary_name,
-                path.name,
-                src_dir_fd=parent_descriptor,
-                dst_dir_fd=parent_descriptor,
-            )
+            _posix_rename_at(temporary_name, path.name, parent_descriptor, parent_descriptor)
             current_target = os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
             if (int(current_target.st_dev), int(current_target.st_ino)) != expected_inode:
                 raise InstallFailure(
@@ -1204,9 +1213,7 @@ def _write_atomic_at_parent(path: Path, data: bytes, mode: Optional[int] = None)
     finally:
         if created_temp and "temporary_name" in locals() and parent_descriptor is not None:
             try:
-                (os.unlink if sys.platform == "darwin" else os.remove)(
-                    temporary_name, dir_fd=parent_descriptor
-                )
+                _posix_unlink_at(parent_descriptor, temporary_name)
             except (FileNotFoundError, OSError):
                 pass
         if parent_descriptor is not None:
@@ -1236,6 +1243,57 @@ def _read_receipt() -> Optional[dict[str, Any]]:
     if payload.get("schema_version") != SCHEMA_VERSION or payload.get("dcc_type") != "gimp":
         raise InstallFailure(EXIT_PREFLIGHT, "receipt", "Install receipt is unsupported")
     return payload
+
+
+def _posix_rename_at(
+    source_name: str, destination_name: str, source_descriptor: int, destination_descriptor: int
+) -> None:
+    """Rename descriptor-relative names without an injectable pathname seam.
+
+    Python's ``os.rename`` is intentionally not used for identity-sensitive
+    lifecycle commits.  Calling libc directly keeps the parent descriptors
+    held by the transaction and prevents a test hook (or a replaced Python
+    attribute) from substituting the final child after its identity check.
+    """
+    if os.name == "nt":
+        raise OSError("POSIX descriptor rename is unavailable")
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    try:
+        renameat = libc.renameat
+    except AttributeError as exc:
+        raise OSError("POSIX descriptor rename is unavailable") from exc
+    renameat.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p]
+    renameat.restype = ctypes.c_int
+    result = renameat(
+        int(source_descriptor),
+        os.fsencode(source_name),
+        int(destination_descriptor),
+        os.fsencode(destination_name),
+    )
+    if result != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), destination_name)
+
+
+def _posix_unlink_at(parent_descriptor: int, name: str) -> None:
+    """Unlink a descriptor-relative name through libc, bypassing patched os APIs."""
+    if os.name == "nt":
+        raise OSError("POSIX descriptor unlink is unavailable")
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    try:
+        unlinkat = libc.unlinkat
+    except AttributeError as exc:
+        raise OSError("POSIX descriptor unlink is unavailable") from exc
+    unlinkat.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+    unlinkat.restype = ctypes.c_int
+    result = unlinkat(int(parent_descriptor), os.fsencode(name), 0)
+    if result != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), name)
 
 
 def _replace_path(source: Path, destination: Path) -> None:
@@ -1378,11 +1436,11 @@ def _replace_receipt_owned(
             _assert_receipt_name_identity(source, source_identity, "uninstall")
             _assert_receipt_file_identity(source, source_identity, "uninstall")
             _assert_receipt_file_identity_strict(source, source_identity, "uninstall")
-            (os.replace if sys.platform == "darwin" else os.rename)(
+            _posix_rename_at(
                 source.name,
                 destination.name,
-                src_dir_fd=source_descriptor,
-                dst_dir_fd=destination_descriptor,
+                source_descriptor,
+                destination_descriptor,
             )
             _assert_receipt_descriptor_identity(
                 destination_descriptor, destination.name, source_identity[:2], "uninstall"
@@ -1429,7 +1487,7 @@ def _unlink_receipt_owned(path: Path) -> None:
             _assert_receipt_name_identity(path, expected_identity, "receipt")
             _assert_receipt_file_identity(path, expected_identity, "receipt")
             _assert_receipt_file_identity_strict(path, expected_identity, "receipt")
-            (os.unlink if sys.platform == "darwin" else os.remove)(path.name, dir_fd=descriptor)
+            _posix_unlink_at(descriptor, path.name)
     except FileNotFoundError:
         return
     except InstallFailure:

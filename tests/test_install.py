@@ -1012,6 +1012,86 @@ def test_receipt_temp_collision_does_not_remove_foreign_file(tmp_path, monkeypat
     assert collision.read_bytes() == b"foreign sentinel"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Exercises POSIX final receipt operations")
+def test_receipt_final_child_swap_cannot_delete_or_publish_foreign(tmp_path, monkeypatch):
+    from dcc_mcp_gimp import install_files
+
+    unlink_root = tmp_path / "unlink"
+    unlink_root.mkdir()
+    source = unlink_root / "receipt.json"
+    parked = unlink_root / "owned.json"
+    foreign = unlink_root / "foreign.json"
+    source.write_bytes(b"OWNED")
+    foreign.write_bytes(b"FOREIGN")
+    original_remove = install_files.os.remove
+    swapped = False
+
+    def race_remove(name, *args, **kwargs):
+        nonlocal swapped
+        if name == source.name and not swapped:
+            source.rename(parked)
+            foreign.rename(source)
+            swapped = True
+        return original_remove(name, *args, **kwargs)
+
+    monkeypatch.setattr(install_files.os, "remove", race_remove)
+    install_files._unlink_receipt_owned(source)
+    assert not source.exists()
+    assert foreign.read_bytes() == b"FOREIGN"
+    assert not swapped
+
+    replace_root = tmp_path / "replace"
+    replace_root.mkdir()
+    source = replace_root / "source.json"
+    foreign = replace_root / "foreign.json"
+    destination = replace_root / "quarantine.json"
+    source.write_bytes(b"OWNED")
+    foreign.write_bytes(b"FOREIGN")
+    original_rename = install_files.os.rename
+
+    def race_rename(source_name, destination_name, *args, **kwargs):
+        nonlocal swapped
+        if source_name == source.name and not swapped:
+            source.rename(replace_root / "owned.json")
+            foreign.rename(source)
+            swapped = True
+        return original_rename(source_name, destination_name, *args, **kwargs)
+
+    swapped = False
+    monkeypatch.setattr(install_files.os, "rename", race_rename)
+    install_files._replace_receipt_owned(source, destination, replace_root, None)
+    assert destination.read_bytes() == b"OWNED"
+    assert foreign.read_bytes() == b"FOREIGN"
+    assert not swapped
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Exercises POSIX receipt temp publication")
+def test_receipt_atomic_temp_swap_cannot_publish_foreign(tmp_path, monkeypatch):
+    from dcc_mcp_gimp import install_files
+
+    receipt = tmp_path / "gimp.json"
+    foreign = tmp_path / "foreign.tmp"
+    foreign.write_bytes(b"FOREIGN")
+    original_rename = install_files.os.rename
+    swapped = False
+
+    def race(source_name, destination_name, *args, **kwargs):
+        nonlocal swapped
+        if isinstance(source_name, str) and source_name.startswith(".gimp.json.") and not swapped:
+            temporary = tmp_path / source_name
+            if temporary.exists():
+                temporary.rename(tmp_path / (temporary.name + ".owned"))
+                foreign.rename(temporary)
+                swapped = True
+        return original_rename(source_name, destination_name, *args, **kwargs)
+
+    monkeypatch.setattr(install_files.os, "rename", race)
+    install_files._write_bytes_atomic(receipt, b"OWNED")
+    assert receipt.read_bytes() == b"OWNED"
+    assert foreign.read_bytes() == b"FOREIGN"
+    assert not swapped
+
+
 def test_launch_preflight_rejects_changed_executable_identity(tmp_path):
     from dcc_mcp_gimp.install_contract import InstallFailure
     from dcc_mcp_gimp.install_host import _executable_identity, _gimp_version, _target_versions
@@ -1347,6 +1427,37 @@ def test_manifest_root_swap_fails_closed_before_recording_foreign_files(tmp_path
 
     monkeypatch.setattr(install_files.os, "walk", race_walk)
     with pytest.raises(install_files.InstallFailure, match="changed identity"):
+        install_files._owned_root_manifest(root)
+    assert swapped
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Exercises POSIX nested manifest identity")
+def test_manifest_nested_directory_swap_fails_closed(tmp_path, monkeypatch):
+    from dcc_mcp_gimp import install_files
+
+    root = tmp_path / "plugins"
+    nested = root / "nested"
+    foreign = tmp_path / "foreign"
+    nested.mkdir(parents=True)
+    (nested / "owned.txt").write_text("owned", encoding="utf-8")
+    foreign.mkdir()
+    (foreign / "foreign.txt").write_text("FOREIGN", encoding="utf-8")
+    original_walk = install_files.os.walk
+    swapped = False
+
+    def race_walk(path, *args, **kwargs):
+        nonlocal swapped
+        if Path(path) != root:
+            yield from original_walk(path, *args, **kwargs)
+            return
+        yield str(root), ["nested"], []
+        nested.rename(tmp_path / "nested-owned")
+        foreign.rename(nested)
+        swapped = True
+        yield str(nested), [], ["foreign.txt"]
+
+    monkeypatch.setattr(install_files.os, "walk", race_walk)
+    with pytest.raises(install_files.InstallFailure, match="directory changed identity"):
         install_files._owned_root_manifest(root)
     assert swapped
 

@@ -171,6 +171,37 @@ def test_runtime_bootstrap_concurrent_writers_remain_bounded(runtime, tmp_path, 
     assert errors.stat().st_size <= 256 * 1024
 
 
+def test_runtime_bootstrap_rotation_ignores_swapped_python_rename(runtime, tmp_path, monkeypatch):
+    errors = tmp_path / "bootstrap-errors.jsonl"
+    errors.write_bytes((b'{"stage":"old"}\n' * 400))
+    monkeypatch.setenv("DCC_MCP_GIMP_BOOTSTRAP_ERRORS", str(errors))
+    capture = runtime["_capture_bootstrap_error"]
+    original_rename = os.rename
+    swapped = False
+
+    def race(source, destination, *args, **kwargs):
+        nonlocal swapped
+        source_path = Path(source)
+        if not source_path.is_absolute() and source_path.name.startswith(
+            ".bootstrap-errors.jsonl."
+        ):
+            temporary = errors.parent / source_path.name
+            if temporary.exists() and not swapped:
+                temporary.rename(temporary.with_name(temporary.name + ".owned"))
+                foreign = errors.parent / "foreign-bootstrap.log"
+                foreign.write_bytes(b"FOREIGN\n")
+                foreign.rename(temporary)
+                swapped = True
+        return original_rename(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(os, "rename", race)
+    monkeypatch.setattr(os, "replace", race)
+    capture("rotation", RuntimeError("probe"))
+
+    assert not swapped
+    assert b"FOREIGN\n" not in errors.read_bytes()
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Exercises Windows bootstrap temp identity lease")
 def test_runtime_windows_bootstrap_rotation_rejects_temp_swap(runtime, tmp_path, monkeypatch):
     errors = tmp_path / "bootstrap-errors.jsonl"
