@@ -4378,7 +4378,13 @@ def _begin_replace_plugin(root: Path, report: Mapping[str, Any]) -> InstallTrans
         )
         return transaction
     except BaseException as exc:
-        transaction.rollback()
+        # Unwind on a best-effort basis: a rollback failure must not replace the
+        # verdict chosen below, or a PermissionError would surface as a generic
+        # install failure (exit 30) instead of the exit 50 restart boundary.
+        try:
+            transaction.rollback()
+        except InstallFailure:
+            pass
         _cleanup_bound_stage(root, root_identity, stage, stage_manifest)
         if isinstance(exc, InstallFailure):
             raise
