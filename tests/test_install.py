@@ -3373,3 +3373,33 @@ def test_bootstrap_read_does_not_leak_parent_descriptor(tmp_path, monkeypatch):
     # The borrowed parent descriptor was released even though the open failed.
     assert opened == [parent_fd], "expected the parent descriptor to be opened"
     assert parent_fd in closed, "parent descriptor leaked when the relative open failed"
+
+
+def test_pre_verify_rollback_failure_keeps_the_original_verdict(lifecycle_env, monkeypatch):
+    """A rollback failure must not replace the failure that aborted the install."""
+    from dcc_mcp_gimp import install as install_module
+    from dcc_mcp_gimp import install_files, install_lifecycle
+    from dcc_mcp_gimp.install import run
+
+    original_rollback = install_files.InstallTransaction.rollback
+
+    def fail_rollback(self):
+        original_rollback(self)
+        raise install_files.InstallFailure(30, "recovery", "injected rollback failure")
+
+    def fail_verify(*args, **kwargs):
+        raise install_lifecycle.InstallFailure(
+            install_lifecycle.EXIT_PREFLIGHT, "receipt", "injected verify failure"
+        )
+
+    monkeypatch.setattr(install_files.InstallTransaction, "rollback", fail_rollback)
+    monkeypatch.setattr(install_lifecycle, "verify_install", fail_verify)
+    monkeypatch.setattr(install_module, "verify_install", fail_verify)
+
+    report, code, _ = run(["install", "--yes", *lifecycle_env.common])
+
+    assert code == 10, report
+    assert report["status"] == "failed", report
+    assert report["verify"]["failure_stage"] == "receipt", report
+    assert "injected verify failure" in report["verify"]["failure_reason"], report
+    assert "rollback also failed" in report["verify"]["failure_reason"], report

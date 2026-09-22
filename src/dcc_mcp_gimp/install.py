@@ -153,9 +153,22 @@ def run(argv: Sequence[str]) -> tuple[dict[str, Any], int, bool]:
                 try:
                     transaction.rollback()
                 except InstallFailure as rollback_failure:
-                    report["status"] = "failed"
-                    report["verify"] = _failure_verification(rollback_failure)
-                    return report, rollback_failure.exit_code, args.as_json
+                    # A failed rollback is a secondary complication, not the
+                    # verdict.  Keep the stage and exit code of the failure that
+                    # aborted the install and append the recovery detail, so a
+                    # restart-bound verdict is never downgraded to exit 30.
+                    merged = InstallFailure(
+                        failure.exit_code,
+                        failure.stage,
+                        "%s; rollback also failed: %s" % (failure.reason, rollback_failure.reason),
+                    )
+                    report["status"] = (
+                        "requires_restart"
+                        if merged.exit_code == EXIT_REQUIRES_RESTART
+                        else "failed"
+                    )
+                    report["verify"] = _failure_verification(merged)
+                    return report, merged.exit_code, args.as_json
             report["status"] = (
                 "requires_restart" if failure.exit_code == EXIT_REQUIRES_RESTART else "failed"
             )
