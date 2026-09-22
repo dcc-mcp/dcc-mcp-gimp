@@ -319,7 +319,13 @@ def _read_bootstrap_bytes(path: Path) -> tuple[bytes, int]:
                     str(path.parent),
                     os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
                 )
-                descriptor = os.open(path.name, flags, dir_fd=parent_descriptor)
+                try:
+                    descriptor = os.open(path.name, flags, dir_fd=parent_descriptor)
+                finally:
+                    # The descriptor is only borrowed for the relative open above.
+                    # Closing it here keeps a failure in that open from leaking it.
+                    os.close(parent_descriptor)
+                    parent_descriptor = None
         try:
             opened = os.fstat(descriptor)
             if (int(opened.st_dev), int(opened.st_ino)) != (

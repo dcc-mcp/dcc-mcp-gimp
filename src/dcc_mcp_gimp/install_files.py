@@ -18,7 +18,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import Any, Mapping, NoReturn, Optional
 
 from dcc_mcp_core.install_lifecycle import inspect_install_root, safe_remove_tree
 
@@ -3804,7 +3804,12 @@ def _assert_physical_root(
         raise
     except (OSError, RuntimeError, ValueError) as exc:
         raise InstallFailure(EXIT_PREFLIGHT, "profile", "GIMP profile path is unavailable") from exc
-    if os.path.normcase(str(resolved)) != os.path.normcase(str(root)):
+    # ``root`` is produced with ``Path.absolute()``, which keeps lexical ``..``
+    # segments, while ``resolve()`` collapses them. Compare like for like so a
+    # legitimate path such as ``<profile>/real/../real`` is not reported as a
+    # symlink escape; a real symlinked ancestor still resolves elsewhere and is
+    # still rejected.
+    if os.path.normcase(str(resolved)) != os.path.normcase(os.path.normpath(str(root))):
         raise InstallFailure(
             EXIT_PREFLIGHT,
             "profile",
@@ -4038,6 +4043,21 @@ class InstallTransaction:
             )
         self.receipt_committed_identity = None
 
+    def _rollback_preserving(self, primary: InstallFailure) -> NoReturn:
+        """Roll back on a best-effort basis without masking *primary*.
+
+        ``rollback()`` reports recovery problems with ``EXIT_INSTALL``. Letting that
+        exception escape ``commit()`` would downgrade a caller-visible
+        ``EXIT_REQUIRES_RESTART`` verdict (exit 50) to a generic install failure
+        (exit 30), which drops the restart guidance and the ``next_steps`` contract
+        this package documents for exit 50.
+        """
+        try:
+            self.rollback()
+        except InstallFailure as rollback_failure:
+            raise primary from rollback_failure
+        raise primary
+
     def rollback(self) -> bool:
         if self.closed:
             return self.previous_moved
@@ -4088,6 +4108,10 @@ class InstallTransaction:
                             "recovery",
                             "Prior GIMP install changed identity; recovery was preserved",
                         )
+                    # No recovery source survived, so a second rollback attempt
+                    # cannot do better than this one; it would only strand another
+                    # ``.failed`` tree next to the install target.
+                    self.closed = True
                     raise InstallFailure(
                         EXIT_INSTALL, "recovery", "No validated prior GIMP recovery remains"
                     )
@@ -4138,6 +4162,10 @@ class InstallTransaction:
                 ) from receipt_error
             if self.previous_moved and self.previous_manifest is not None:
                 if _recovery_manifest(self.target) != self.previous_manifest:
+                    # The prior install is back in place but the replacement is
+                    # still parked in ``failed``; re-running rollback would move
+                    # the restored tree aside and strand a second ``.failed`` tree.
+                    self.closed = True
                     raise InstallFailure(
                         EXIT_INSTALL, "recovery", "Restored GIMP recovery validation failed"
                     )
@@ -4183,9 +4211,8 @@ class InstallTransaction:
                 )
                 self.recovery_manifest = dict(recovery_evidence.manifest)
                 self.recovery_tree_identities = dict(recovery_evidence.tree_identities)
-            except InstallFailure:
-                self.rollback()
-                raise
+            except InstallFailure as primary:
+                self._rollback_preserving(primary)
         _assert_physical_root(self.root, self.root_identity)
         _assert_target_identity(self.target, self.target_identity, "install")
         _assert_owned_file_identities(self.target, self.file_identities, "install")
@@ -4196,13 +4223,13 @@ class InstallTransaction:
                 self.backup,
                 expected_identities=self.previous_tree_identities,
             )
-        except InstallFailure:
-            self.rollback()
-            raise
+        except InstallFailure as primary:
+            self._rollback_preserving(primary)
         if not cleanup.get("success"):
-            self.rollback()
             code = EXIT_REQUIRES_RESTART if cleanup.get("requires_restart") else EXIT_INSTALL
-            raise InstallFailure(code, "cleanup", "Verified install backup cleanup failed")
+            self._rollback_preserving(
+                InstallFailure(code, "cleanup", "Verified install backup cleanup failed")
+            )
         self.closed = True
         if self.recovery is not None:
             _assert_physical_root(self.root, self.root_identity)
