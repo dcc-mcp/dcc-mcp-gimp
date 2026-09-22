@@ -3246,3 +3246,130 @@ def test_failed_uninstall_rollback_preserves_posix_modes(lifecycle_env, monkeypa
     assert stat.S_IMODE(target.stat().st_mode) == 0o711
     assert stat.S_IMODE(script.stat().st_mode) == 0o751
     assert stat.S_IMODE(receipt_path.stat().st_mode) == 0o640
+
+
+# --- Regressions from the PR #9 review (PIP-3399 pilot 3/3 NACK) ---------------
+
+
+def test_assert_physical_root_accepts_lexical_dot_dot_segments(tmp_path):
+    """``--destination`` may legitimately contain ``..`` segments.
+
+    ``Path.absolute()`` keeps them while ``resolve()`` collapses them, so the
+    identity comparison has to normalise the planned root before comparing.
+    """
+    from dcc_mcp_gimp.install_files import _assert_physical_root
+
+    real = tmp_path / "real"
+    real.mkdir()
+
+    assert _assert_physical_root(real) is None or True
+    _assert_physical_root(tmp_path / "real" / ".." / "real")
+    _assert_physical_root(Path(str(tmp_path) + "/real/../real"))
+
+
+def test_assert_physical_root_still_rejects_symlinked_ancestor(tmp_path):
+    """Normalising for ``..`` must not weaken the symlink rejection."""
+    from dcc_mcp_gimp.install_files import _assert_physical_root
+
+    real_dir = tmp_path / "real-root"
+    link = tmp_path / "linked-root"
+    try:
+        link.symlink_to(real_dir, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlink creation is unavailable on this host")
+    real_dir.mkdir()
+
+    with pytest.raises(InstallFailure) as caught:
+        _assert_physical_root(link / "plug-ins")
+
+    assert "link" in caught.value.reason or "identity" in caught.value.reason
+
+
+def test_commit_preserves_requires_restart_when_rollback_also_fails():
+    """A failing rollback must not downgrade exit 50 to exit 30."""
+    from dcc_mcp_gimp.install_contract import EXIT_INSTALL, EXIT_REQUIRES_RESTART
+    from dcc_mcp_gimp.install_files import InstallTransaction
+
+    transaction = InstallTransaction.__new__(InstallTransaction)
+    transaction.closed = False
+
+    def failing_rollback():
+        raise InstallFailure(EXIT_INSTALL, "recovery", "No validated prior GIMP recovery remains")
+
+    transaction.rollback = failing_rollback
+    primary = InstallFailure(
+        EXIT_REQUIRES_RESTART, "cleanup", "Verified install backup cleanup failed"
+    )
+
+    with pytest.raises(InstallFailure) as caught:
+        transaction._rollback_preserving(primary)
+
+    assert caught.value.exit_code == EXIT_REQUIRES_RESTART
+    assert caught.value.stage == "cleanup"
+    assert isinstance(caught.value.__cause__, InstallFailure)
+
+
+def test_commit_preserves_primary_failure_when_rollback_succeeds():
+    """A successful rollback still re-raises the original verdict, not a new one."""
+    from dcc_mcp_gimp.install_contract import EXIT_REQUIRES_RESTART
+    from dcc_mcp_gimp.install_files import InstallTransaction
+
+    transaction = InstallTransaction.__new__(InstallTransaction)
+    transaction.closed = False
+    transaction.rollback = lambda: True
+
+    with pytest.raises(InstallFailure) as caught:
+        transaction._rollback_preserving(
+            InstallFailure(
+                EXIT_REQUIRES_RESTART, "cleanup", "Verified install backup cleanup failed"
+            )
+        )
+
+    assert caught.value.exit_code == EXIT_REQUIRES_RESTART
+
+
+def test_bootstrap_read_does_not_leak_parent_descriptor(tmp_path, monkeypatch):
+    """A failing relative open must not strand the borrowed parent descriptor."""
+    import errno
+
+    from dcc_mcp_gimp import install_host
+
+    log_path = tmp_path / "bootstrap-errors.jsonl"
+    log_path.write_bytes(b'{"stage": "import"}\n')
+
+    # The leak lives in the POSIX ``dir_fd`` branch, so force that branch even
+    # when the suite runs on Windows.
+    monkeypatch.setattr(install_host.os, "name", "posix")
+
+    real_open = os.open
+    real_close = os.close
+    opened = []
+    closed = []
+
+    # ``os.open`` on a directory is not portable (Windows rejects it once
+    # ``O_DIRECTORY`` is unavailable), so hand the reader a stand-in descriptor
+    # for the parent and fail only the relative open that used to leak it.
+    parent_fd = real_open(str(log_path), os.O_RDONLY)
+    real_close(parent_fd)
+
+    def failing_relative_open(path, flags, *args, **kwargs):
+        if kwargs.get("dir_fd") is not None:
+            raise OSError(errno.ELOOP, "too many symbolic links")
+        opened.append(parent_fd)
+        return parent_fd
+
+    def tracking_close(fd):
+        closed.append(fd)
+
+    monkeypatch.setattr(install_host.os, "open", failing_relative_open)
+    monkeypatch.setattr(install_host.os, "close", tracking_close)
+
+    # The reader funnels the OSError into an InstallFailure; the descriptor
+    # accounting below is what actually matters here.
+    with pytest.raises(InstallFailure) as caught:
+        install_host._read_bootstrap_bytes(log_path)
+    assert caught.value.stage == "bootstrap"
+
+    # The borrowed parent descriptor was released even though the open failed.
+    assert opened == [parent_fd], "expected the parent descriptor to be opened"
+    assert parent_fd in closed, "parent descriptor leaked when the relative open failed"
