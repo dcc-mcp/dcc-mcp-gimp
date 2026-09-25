@@ -759,7 +759,7 @@ with capture_bootstrap_errors("gi-import"):
     from gi.repository import Gegl, Gimp, Gio, GLib  # noqa: E402
 
 
-VERSION = "0.4.1"  # x-release-please-version
+VERSION = "0.4.2"  # x-release-please-version
 BRIDGE_HOST = "127.0.0.1"
 BRIDGE_PORT = int(os.environ.get("DCC_MCP_GIMP_BRIDGE_PORT", "3848"))
 MAX_CONNECTIONS = 16
