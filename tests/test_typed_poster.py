@@ -4,8 +4,7 @@ import math
 import types
 
 import pytest
-
-pytest_plugins = ("test_plugin_runtime",)
+from test_plugin_runtime import runtime as runtime
 
 
 def setup_shape(runtime, monkeypatch):
