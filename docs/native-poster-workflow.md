@@ -101,11 +101,19 @@ the handed-off v3 module is
 `c39d68f4861f7bb96bc969a7105da55235e57d3ed4cad78791bf58fd3fbaf262`.
 These hashes identify the historical modules before publication review fixes.
 
-Publication review added three safeguards: dual selection/context cleanup errors
+Publication review added five safeguards: dual selection/context cleanup errors
 retain the recovery-channel information and original painting error; native text
 dimensions exceeding the existing 100-million-pixel limit are rejected before
 image insertion, after native text construction; and masked layer export is
-rejected before allocation. This is not a preconstruction text-memory limit. Seven
-new inert regression cases exercise these guards. The final publication module
+rejected before allocation. Failed group insertion releases the newly allocated
+detached group. Failed text initialization releases the new detached text item,
+or removes that new layer if insertion succeeded before offsets or color failed.
+Cleanup failures report both the setup and cleanup errors. These commands only
+clean up their own newly allocated item; they do not promise to restore selection
+or undo state. This is not a preconstruction text-memory limit. Twenty-seven
+new inert regression cases exercise these guards and successful call ordering.
+The final publication module SHA-256 is
+`0886cf8a5cef5ccee583c6e8438ea80d2dcc779430139c49ee55721c4660ef44`.
+This module
 differs from the v3 source module above and has no fresh native qualification.
 The historical native proof does not establish these new failure branches.

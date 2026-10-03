@@ -405,7 +405,7 @@ def test_oversized_native_text_is_deleted_before_image_insertion(runtime, monkey
     layer = types.SimpleNamespace(
         get_width=lambda: 500000,
         get_height=lambda: 1024,
-        delete=lambda: events.append("delete"),
+        delete=lambda: events.append("delete") or True,
         set_name=lambda _: events.append("name") or True,
         set_offsets=lambda *_: events.append("offsets") or True,
         set_color=lambda _: events.append("color") or True,
@@ -439,3 +439,212 @@ def test_masked_export_is_rejected_before_path_or_native_allocation(runtime, mon
     glob["Gimp"].Image = types.SimpleNamespace(new_with_precision=unexpected)
     with pytest.raises(runtime["HostCommandError"], match="masked"):
         execute("gimp.export_layer", {"image_id": 1, "layer_id": 7, "path": "layer.png"})
+
+
+def setup_owned_layer(runtime, monkeypatch, failure=None, outcome="false", cleanup="true"):
+    """Model one new native item alongside a user-owned layer that must survive."""
+    events = []
+    user = types.SimpleNamespace(
+        name="Existing user layer", pixels=b"existing pixels", visible=False, offset=(9, 13)
+    )
+    state = {"layers": [user], "attached": False, "deleted": False}
+    layer = types.SimpleNamespace(get_width=lambda: 48, get_height=lambda: 24)
+
+    def operation(name):
+        events.append(name)
+        if name != failure:
+            return True
+        if outcome == "raise":
+            raise RuntimeError(name + " original sentinel")
+        return False
+
+    def insert(item, _parent, _position):
+        assert item is layer
+        if not operation("insert"):
+            return False
+        state["layers"].append(item)
+        state["attached"] = True
+        return True
+
+    def clean(name, item):
+        assert item is layer
+        events.append(name)
+        assert not state["deleted"]
+        if name == "delete":
+            assert not state["attached"], "Never delete an item owned by its image"
+        else:
+            assert state["attached"], "Only remove the new item after insertion succeeded"
+        if cleanup == "raise":
+            raise OSError(name + " cleanup sentinel")
+        if cleanup == "false":
+            return False
+        if name == "remove":
+            state["layers"].remove(item)
+            state["attached"] = False
+        else:
+            state["deleted"] = True
+        return True
+
+    layer.delete = lambda: clean("delete", layer)
+    layer.set_name = lambda _: operation("name")
+    layer.set_offsets = lambda *_: operation("offsets")
+    layer.set_color = lambda _: operation("color")
+    image = types.SimpleNamespace(
+        insert_layer=insert, remove_layer=lambda item: clean("remove", item)
+    )
+    execute = runtime["_execute_command"]
+    glob = execute.__globals__
+    monkeypatch.setitem(glob, "_resolve_image", lambda _: image)
+    monkeypatch.setitem(glob, "_color", lambda _: object())
+    monkeypatch.setitem(
+        glob, "_layer_info", lambda *_: events.append("readback") or {"layer_id": 7}
+    )
+
+    def allocate(*_args):
+        events.append("allocate")
+        return None if failure == "allocate" else layer
+
+    gimp = glob["Gimp"]
+    gimp.GroupLayer = types.SimpleNamespace(new=allocate)
+    gimp.TextLayer = types.SimpleNamespace(new=allocate)
+    gimp.Font = types.SimpleNamespace(get_by_name=lambda _: object())
+    gimp.Unit = types.SimpleNamespace(pixel=lambda: object())
+    gimp.displays_flush = lambda: events.append("flush")
+    return execute, events, state, user, layer
+
+
+def assert_user_layer_preserved(state, user):
+    assert state["layers"][0] is user
+    assert vars(user) == {
+        "name": "Existing user layer",
+        "pixels": b"existing pixels",
+        "visible": False,
+        "offset": (9, 13),
+    }
+
+
+def assert_owned_cleanup_error(runtime, caught, failure, outcome, cleanup):
+    error = caught.value
+    if cleanup == "true":
+        if outcome == "raise":
+            assert isinstance(error, RuntimeError)
+            assert str(error) == failure + " original sentinel"
+        else:
+            assert isinstance(error, runtime["HostCommandError"])
+        return
+    assert isinstance(error, runtime["HostCommandError"])
+    assert error.__cause__ is not None
+    message = str(error).lower()
+    assert "cleanup" in message
+    if outcome == "raise":
+        assert isinstance(error.__cause__, RuntimeError)
+        assert failure + " original sentinel" in str(error.__cause__)
+        assert failure + " original sentinel" in str(error)
+    else:
+        assert isinstance(error.__cause__, runtime["HostCommandError"])
+        assert str(error.__cause__) in str(error)
+    if cleanup == "raise":
+        assert "cleanup sentinel" in str(error)
+    else:
+        assert "false" in message
+
+
+@pytest.mark.parametrize("outcome", ["false", "raise"])
+@pytest.mark.parametrize("cleanup", ["true", "false", "raise"])
+def test_failed_group_insertion_cleans_only_new_detached_group(
+    runtime, monkeypatch, outcome, cleanup
+):
+    execute, events, state, user, _layer = setup_owned_layer(
+        runtime, monkeypatch, "insert", outcome, cleanup
+    )
+    with pytest.raises((runtime["HostCommandError"], RuntimeError)) as caught:
+        execute("gimp.create_group", {"image_id": 1, "name": "New group"})
+    assert events == ["allocate", "insert", "delete"]
+    assert state["layers"] == [user]
+    assert state["attached"] is False
+    assert state["deleted"] is (cleanup == "true")
+    assert_user_layer_preserved(state, user)
+    assert_owned_cleanup_error(runtime, caught, "insert", outcome, cleanup)
+
+
+@pytest.mark.parametrize(
+    ("failure", "outcome", "cleanup"),
+    [
+        ("offsets", "false", "true"),
+        ("offsets", "raise", "true"),
+        ("color", "false", "true"),
+        ("color", "raise", "true"),
+        ("offsets", "false", "false"),
+        ("offsets", "raise", "raise"),
+        ("color", "false", "raise"),
+        ("color", "raise", "false"),
+    ],
+)
+def test_failed_text_setup_removes_only_new_inserted_text(
+    runtime, monkeypatch, failure, outcome, cleanup
+):
+    execute, events, state, user, layer = setup_owned_layer(
+        runtime, monkeypatch, failure, outcome, cleanup
+    )
+    with pytest.raises((runtime["HostCommandError"], RuntimeError)) as caught:
+        execute("gimp.create_text", {"image_id": 1, "name": "Text", "text": "Bounded"})
+    expected = ["allocate", "name", "insert", "offsets"]
+    if failure == "color":
+        expected.append("color")
+    assert events == expected + ["remove"]
+    assert state["deleted"] is False
+    assert state["attached"] is (cleanup != "true")
+    assert state["layers"] == ([user] if cleanup == "true" else [user, layer])
+    assert_user_layer_preserved(state, user)
+    assert_owned_cleanup_error(runtime, caught, failure, outcome, cleanup)
+
+
+@pytest.mark.parametrize("outcome", ["false", "raise"])
+def test_failed_text_insertion_deletes_detached_text_without_removing_user_layer(
+    runtime, monkeypatch, outcome
+):
+    execute, events, state, user, _layer = setup_owned_layer(
+        runtime, monkeypatch, "insert", outcome
+    )
+    with pytest.raises((runtime["HostCommandError"], RuntimeError)) as caught:
+        execute("gimp.create_text", {"image_id": 1, "name": "Text", "text": "Bounded"})
+    assert events == ["allocate", "name", "insert", "delete"]
+    assert state["layers"] == [user]
+    assert state["attached"] is False and state["deleted"] is True
+    assert_user_layer_preserved(state, user)
+    assert_owned_cleanup_error(runtime, caught, "insert", outcome, "true")
+
+
+@pytest.mark.parametrize("kind", ["group", "text"])
+def test_missing_native_allocation_never_inserts_or_cleans_another_layer(
+    runtime, monkeypatch, kind
+):
+    execute, events, state, user, _layer = setup_owned_layer(runtime, monkeypatch, "allocate")
+    params = {"image_id": 1, "name": "New"}
+    if kind == "text":
+        params["text"] = "Bounded"
+    with pytest.raises(runtime["HostCommandError"]):
+        execute("gimp.create_" + kind, params)
+    assert events == ["allocate"]
+    assert state["layers"] == [user]
+    assert state["attached"] is False and state["deleted"] is False
+    assert_user_layer_preserved(state, user)
+
+
+@pytest.mark.parametrize("kind", ["group", "text"])
+def test_successful_new_layer_stays_owned_and_text_color_follows_insertion(
+    runtime, monkeypatch, kind
+):
+    execute, events, state, user, layer = setup_owned_layer(runtime, monkeypatch)
+    params = {"image_id": 1, "name": "New"}
+    if kind == "text":
+        params["text"] = "Bounded"
+    result = execute("gimp.create_" + kind, params)
+    expected = ["allocate", "insert", "flush", "readback"]
+    if kind == "text":
+        expected = ["allocate", "name", "insert", "offsets", "color", "flush", "readback"]
+    assert events == expected
+    assert result["layer_id"] == 7
+    assert state["layers"] == [user, layer]
+    assert state["attached"] is True and state["deleted"] is False
+    assert_user_layer_preserved(state, user)

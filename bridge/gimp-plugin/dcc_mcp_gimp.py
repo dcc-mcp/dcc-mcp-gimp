@@ -1201,6 +1201,25 @@ def _parent_layer(image: Any, value: Any) -> Any:
 def _layer_position(value: Any) -> int:
     return _bounded_int(value, "position", 0, MAX_LAYER_NODES)
 
+def _cleanup_new_layer(image: Any, layer: Any, inserted: bool, original: BaseException) -> None:
+    """Release only the item allocated by a failed group or text command."""
+    try:
+        if inserted:
+            cleaned = image.remove_layer(layer)
+            operation = "remove_layer"
+        else:
+            cleaned = layer.delete()
+            operation = "delete"
+        if not cleaned:
+            raise HostCommandError("%s returned false" % operation)
+    except BaseException as cleanup:
+        raise HostCommandError(
+            "New layer setup failed (%s: %s); cleanup also failed (%s: %s); "
+            "inspect the image before retrying"
+            % (type(original).__name__, original, type(cleanup).__name__, cleanup)
+        ) from original
+
+
 def _push_shape_context(image: Any, saved_selection: Any) -> bool:
     """Release an unused mask if context setup fails before any painting."""
     try:
@@ -1487,8 +1506,14 @@ def _execute_command(method: str, params: Mapping[str, Any]) -> Any:
         parent = _parent_layer(image, params.get("parent_id"))
         position = _layer_position(params.get("position", 0))
         group = Gimp.GroupLayer.new(image, name)
-        if group is None or not image.insert_layer(group, parent, position):
+        if group is None:
             raise HostCommandError("GIMP failed to create the layer group")
+        try:
+            if not image.insert_layer(group, parent, position):
+                raise HostCommandError("GIMP failed to create the layer group")
+        except BaseException as original:
+            _cleanup_new_layer(image, group, False, original)
+            raise
         Gimp.displays_flush()
         return _layer_info(image, group)
     if method == "gimp.import_layer":
@@ -1557,16 +1582,22 @@ def _execute_command(method: str, params: Mapping[str, Any]) -> Any:
         layer = Gimp.TextLayer.new(image, text, font, size, Gimp.Unit.pixel())
         if layer is None:
             raise HostCommandError("GIMP failed to create editable text")
-        if layer.get_width() * layer.get_height() > MAX_IMAGE_PIXELS:
-            layer.delete()
-            raise HostCommandError("Native text layer exceeds the pixel limit")
-        if not layer.set_name(name):
-            layer.delete()
-            raise HostCommandError("GIMP failed to initialize editable text")
-        if not image.insert_layer(layer, parent, 0) or not layer.set_offsets(x, y):
-            raise HostCommandError("GIMP failed to place editable text")
-        if not layer.set_color(color):
-            raise HostCommandError("GIMP failed to set editable text color")
+        inserted = False
+        try:
+            if layer.get_width() * layer.get_height() > MAX_IMAGE_PIXELS:
+                raise HostCommandError("Native text layer exceeds the pixel limit")
+            if not layer.set_name(name):
+                raise HostCommandError("GIMP failed to initialize editable text")
+            if not image.insert_layer(layer, parent, 0):
+                raise HostCommandError("GIMP failed to place editable text")
+            inserted = True
+            if not layer.set_offsets(x, y):
+                raise HostCommandError("GIMP failed to place editable text")
+            if not layer.set_color(color):
+                raise HostCommandError("GIMP failed to set editable text color")
+        except BaseException as original:
+            _cleanup_new_layer(image, layer, inserted, original)
+            raise
         Gimp.displays_flush()
         return {**_layer_info(image, layer), "text": text, "font": font_name, "font_size": size}
     if method == "gimp.save_image":
