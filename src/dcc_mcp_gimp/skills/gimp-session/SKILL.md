@@ -41,3 +41,13 @@ GIMP process. Save layered work as XCF before exporting a delivery format.
 Flattening, overwriting, deleting, and closing require the explicit typed
 contracts in `tools.yaml`; `close_image` refuses displays not opened by this
 bridge.
+
+
+The additional typed tools support group creation, imported image layers,
+placement, bounded shape painting, blend modes, editable text, bounded font
+discovery and isolated native PNG layer export. Tool colors are encoded sRGB
+integers with straight alpha. Inspect native hierarchy, offsets, text and color
+readback after mutation; save/reopen XCF and inspect actual exported PNG pixels.
+Queued requests retain the bridge's existing before-start timeout cancellation.
+An after-start timeout remains an unknown host outcome and must be inspected
+before retrying a mutation.

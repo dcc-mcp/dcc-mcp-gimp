@@ -35,6 +35,14 @@ def test_plugin_contract_is_bounded_and_main_thread_marshalled():
 def test_plugin_exposes_exact_typed_command_catalog():
     source = PLUGIN.read_text(encoding="utf-8")
     commands = {
+        "create_group",
+        "import_layer",
+        "place_layer",
+        "set_layer_mode",
+        "paint_shape",
+        "create_text",
+        "list_fonts",
+        "export_layer",
         "get_status",
         "list_images",
         "get_active_image",
@@ -53,4 +61,4 @@ def test_plugin_exposes_exact_typed_command_catalog():
         "close_image",
     }
     assert all(('"gimp.%s"' % command) in source for command in commands)
-    assert '"command_count": 16' in source
+    assert '"command_count": 24' in source

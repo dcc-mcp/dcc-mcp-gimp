@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import math
 import os
 import secrets
 import socket
@@ -943,7 +944,7 @@ def _bounded_float(value: Any, label: str, minimum: float, maximum: float) -> fl
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise HostCommandError("%s must be a number" % label)
     number = float(value)
-    if number < minimum or number > maximum:
+    if not math.isfinite(number) or number < minimum or number > maximum:
         raise HostCommandError("%s must be between %s and %s" % (label, minimum, maximum))
     return number
 
@@ -1057,6 +1058,8 @@ def _image_info(image: Any) -> dict[str, Any]:
         "base_type": _enum_name(image.get_base_type()),
         "precision": _enum_name(image.get_precision()),
         "dirty": bool(image.is_dirty()),
+        "color_profile": image.get_effective_color_profile().get_label(),
+        "typed_color_encoding": "sRGB IEC 61966-2-1 / straight alpha",
         "file_name": path,
         "file_path_allowed": path_allowed,
         "selected_layer_ids": [int(layer.get_id()) for layer in selected],
@@ -1093,7 +1096,17 @@ def _walk_layers(image: Any) -> list[dict[str, Any]]:
                 "locked": bool(layer.get_lock_content()),
                 "opacity": float(layer.get_opacity()),
                 "is_group": bool(layer.is_group_layer()),
+                "is_text": bool(layer.is_text_layer()),
+                "text": str(layer.get_text()) if layer.is_text_layer() else None,
+                "text_font": layer.get_font().get_name() if layer.is_text_layer() else None,
+                "text_color_linear_rgba": (
+                    list(layer.get_color().get_rgba()) if layer.is_text_layer() else None
+                ),
                 "child_count": len(children),
+                "mode": _enum_name(layer.get_mode()),
+                "width": int(layer.get_width()),
+                "height": int(layer.get_height()),
+                "offsets": list(layer.get_offsets())[1:],
             }
         )
         stack.extend((child, layer_id, depth + 1) for child in reversed(children))
@@ -1122,10 +1135,211 @@ def _color(value: Any) -> Any:
     channels = [_bounded_int(channel, "color channel", 0, 255) for channel in value]
     if len(channels) == 3:
         channels.append(255)
-    red, green, blue, alpha = (channel / 255.0 for channel in channels)
-    color = Gegl.Color.new("rgba(0,0,0,0)")
-    color.set_rgba(red, green, blue, alpha)
-    return color
+    # The typed channel contract is encoded sRGB, not linear-light RGBA.
+    # GEGL's hex parser converts sRGB RGB channels while preserving straight alpha.
+    return Gegl.Color.new("#" + "".join("%02x" % channel for channel in channels))
+
+
+def _fill_color(layer: Any, color_value: Any) -> None:
+    # Foreground fills discard foreground alpha in GIMP. The native GEGL drawable
+    # buffer preserves the requested straight alpha without changing layer opacity.
+    color = _color(color_value)
+    width, height = int(layer.get_width()), int(layer.get_height())
+    buffer = layer.get_buffer()
+    if buffer is None:
+        raise HostCommandError("GIMP failed to expose the paintable layer buffer")
+    buffer.set_color(Gegl.Rectangle.new(0, 0, width, height), color)
+    buffer.flush()
+    if not layer.update(0, 0, width, height):
+        raise HostCommandError("GIMP failed to update the filled layer")
+
+def _parasite_report(item: Any) -> list[dict[str, Any]]:
+    result = []
+    for name in list(item.get_parasite_list())[:256]:
+        parasite = item.get_parasite(name)
+        data = bytes(parasite.get_data())
+        result.append(
+            {
+                "name": name,
+                "flags": parasite.get_flags(),
+                "bytes": len(data),
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "text": data[:16384].decode("utf-8", errors="replace"),
+                "truncated": len(data) > 16384,
+            }
+        )
+    return result
+
+def _metadata_report(image: Any) -> dict[str, Any]:
+    metadata = image.get_metadata()
+    serialized = metadata.serialize() if metadata is not None else ""
+    layers = _walk_layers(image)
+    return {
+        "image_parasites": _parasite_report(image),
+        "layer_parasites": [
+            {
+                "name": layer["name"],
+                "parasites": _parasite_report(_resolve_layer(image, layer["layer_id"])),
+            }
+            for layer in layers
+        ],
+        "metadata_xml": serialized[:65536],
+        "metadata_xml_truncated": len(serialized) > 65536,
+    }
+
+def _layer_info(image: Any, layer: Any) -> dict[str, Any]:
+    return next(item for item in _walk_layers(image) if item["layer_id"] == layer.get_id())
+
+def _parent_layer(image: Any, value: Any) -> Any:
+    if value is None:
+        return None
+    parent = _resolve_layer(image, value)
+    if not parent.is_group_layer():
+        raise HostCommandError("parent_id must identify a layer group in this image")
+    return parent
+
+def _layer_position(value: Any) -> int:
+    return _bounded_int(value, "position", 0, MAX_LAYER_NODES)
+
+def _push_shape_context(image: Any, saved_selection: Any) -> bool:
+    """Release an unused mask if context setup fails before any painting."""
+    try:
+        if not Gimp.context_push():
+            raise HostCommandError("GIMP failed to save the user context; shape was not painted")
+    except BaseException as original:
+        try:
+            removed = image.remove_channel(saved_selection)
+            if not removed:
+                raise HostCommandError("remove_channel returned false")
+        except BaseException as cleanup:
+            raise HostCommandError(
+                "Context setup failed (%s: %s); cleanup of unused saved selection channel %d "
+                "also failed (%s: %s); shape was not painted"
+                % (
+                    type(original).__name__, original, int(saved_selection.get_id()),
+                    type(cleanup).__name__, cleanup,
+                )
+            ) from original
+        raise
+    return True
+
+
+def _paint_shape(image: Any, params: Mapping[str, Any]) -> dict[str, Any]:
+    layer = _resolve_layer(image, params.get("layer_id"))
+    if layer.is_group_layer() or layer.get_lock_content():
+        raise HostCommandError("paint_shape requires an unlocked paintable layer")
+    shape = params.get("shape")
+    if shape not in {"polygon", "ellipse", "rectangle"}:
+        raise HostCommandError("shape must be polygon, ellipse, or rectangle")
+    color = _color(params.get("color"))
+    feather = _bounded_float(params.get("feather", 0), "feather", 0, 256)
+    if shape == "polygon":
+        points = params.get("points")
+        if not isinstance(points, list) or not 3 <= len(points) <= 256:
+            raise HostCommandError("polygon requires 3 to 256 points")
+        coordinates = []
+        for point in points:
+            if not isinstance(point, list) or len(point) != 2:
+                raise HostCommandError("each point must be [x, y]")
+            coordinates.extend(_bounded_float(v, "coordinate", -32768, 32768) for v in point)
+    else:
+        bounds = params.get("bounds")
+        if not isinstance(bounds, list) or len(bounds) != 4:
+            raise HostCommandError("bounds must be [x, y, width, height]")
+        coordinates = [
+            _bounded_float(bounds[0], "x", -32768, 32768),
+            _bounded_float(bounds[1], "y", -32768, 32768),
+            _bounded_float(bounds[2], "width", 0.01, 32768),
+            _bounded_float(bounds[3], "height", 0.01, 32768),
+        ]
+    saved_selection = Gimp.Selection.save(image)
+    if saved_selection is None:
+        raise HostCommandError("GIMP failed to save the selection; shape was not painted")
+    pushed = False
+    painting_error = None
+    try:
+        if not _push_shape_context(image, saved_selection):
+            raise HostCommandError("GIMP failed to save the user context; shape was not painted")
+        pushed = True
+        channels = params["color"]
+        alpha = channels[3] if len(channels) == 4 else 255
+        if not all(
+            (
+                Gimp.context_set_opacity(alpha / 255.0 * 100.0),
+                Gimp.context_set_antialias(True),
+                Gimp.context_set_feather(feather > 0),
+                Gimp.context_set_feather_radius(feather, feather),
+            )
+        ):
+            raise HostCommandError("GIMP failed to configure shape painting")
+        if shape == "polygon":
+            ok = image.select_polygon(Gimp.ChannelOps.REPLACE, coordinates)
+        elif shape == "ellipse":
+            ok = image.select_ellipse(Gimp.ChannelOps.REPLACE, *coordinates)
+        else:
+            ok = image.select_rectangle(Gimp.ChannelOps.REPLACE, *coordinates)
+        if not ok or not Gimp.context_set_foreground(color):
+            raise HostCommandError("GIMP failed to select the shape or set its color")
+        if not layer.edit_fill(Gimp.FillType.FOREGROUND):
+            raise HostCommandError("GIMP failed to paint the shape")
+    except BaseException as exc:
+        painting_error = exc
+        raise
+    finally:
+        cleanup_errors = []
+        try:
+            if pushed:
+                # select_item applies the active selection context. Reusing the
+                # shape's feathering would irreversibly blur the saved mask.
+                recovery_id = int(saved_selection.get_id())
+                message = (
+                    "GIMP could not restore the original selection; saved channel %d "
+                    "is retained for recovery; painting may have occurred" % recovery_id
+                )
+                try:
+                    exact_context = (
+                        Gimp.context_set_feather(False),
+                        Gimp.context_set_antialias(False),
+                    )
+                    if not all(exact_context):
+                        raise HostCommandError(message)
+                    if not image.select_item(Gimp.ChannelOps.REPLACE, saved_selection):
+                        raise HostCommandError(message)
+                except BaseException as exc:
+                    if isinstance(exc, HostCommandError):
+                        raise
+                    raise HostCommandError(message) from exc
+                # Never remove the only recovery mask before confirmed restore.
+                if not image.remove_channel(saved_selection):
+                    raise HostCommandError(
+                        "Selection restored, but GIMP could not remove saved recovery channel %d"
+                        % recovery_id
+                    )
+        except BaseException as exc:
+            cleanup_errors.append(("Selection cleanup", exc))
+        try:
+            if pushed and not Gimp.context_pop():
+                raise HostCommandError("GIMP failed to restore the original user context")
+        except BaseException as exc:
+            cleanup_errors.append(("Context cleanup", exc))
+        if cleanup_errors:
+            if painting_error is None and len(cleanup_errors) == 1:
+                raise cleanup_errors[0][1]
+            errors = []
+            if painting_error is not None:
+                errors.append(
+                    "Shape operation failed (%s: %s)"
+                    % (type(painting_error).__name__, painting_error)
+                )
+            errors.extend(
+                "%s failed (%s: %s)" % (stage, type(error).__name__, error)
+                for stage, error in cleanup_errors
+            )
+            raise HostCommandError("; ".join(errors)) from (
+                painting_error if painting_error is not None else cleanup_errors[0][1]
+            )
+    Gimp.displays_flush()
+    return {"layer_id": int(layer.get_id()), "shape": shape, "painted": True}
 
 
 def _new_layer(image: Any, name: str, color_value: Any) -> Any:
@@ -1144,14 +1358,7 @@ def _new_layer(image: Any, name: str, color_value: Any) -> Any:
         if not layer.fill(Gimp.FillType.TRANSPARENT):
             raise HostCommandError("GIMP failed to initialize the layer")
     else:
-        Gimp.context_push()
-        try:
-            if not Gimp.context_set_foreground(_color(color_value)):
-                raise HostCommandError("GIMP rejected the layer fill color")
-            if not layer.fill(Gimp.FillType.FOREGROUND):
-                raise HostCommandError("GIMP failed to fill the layer")
-        finally:
-            Gimp.context_pop()
+        _fill_color(layer, color_value)
     if not image.insert_layer(layer, None, 0):
         layer.delete()
         raise HostCommandError("GIMP failed to insert the layer")
@@ -1175,8 +1382,20 @@ def _execute_command(method: str, params: Mapping[str, Any]) -> Any:
             "plugin_module_path": str(Path(__file__).resolve()),
             "main_thread_id": threading.get_ident(),
             "allowed_roots": [str(root) for root in _allowed_roots()],
-            "command_count": 16,
+            "command_count": 24,
             "arbitrary_script_input": False,
+        }
+    if method == "gimp.list_fonts":
+        limit = _bounded_int(params.get("limit", 64), "limit", 1, 256)
+        query = params.get("query", "")
+        if not isinstance(query, str) or len(query) > 128:
+            raise HostCommandError("font query must be a string of at most 128 characters")
+        names = sorted(str(font.get_name()) for font in Gimp.fonts_get_list(None))
+        matches = [name for name in names if query.casefold() in name.casefold()]
+        return {
+            "fonts": matches[:limit],
+            "match_count": len(matches),
+            "truncated": len(matches) > limit,
         }
     if method == "gimp.list_images":
         return [_image_info(image) for image in Gimp.get_images()]
@@ -1218,7 +1437,138 @@ def _execute_command(method: str, params: Mapping[str, Any]) -> Any:
         layers = _walk_layers(image)
         if method == "gimp.list_layers":
             return layers
-        return {**_image_info(image), "layer_count": len(layers), "layers": layers}
+        result = {**_image_info(image), "layer_count": len(layers), "layers": layers}
+        if params.get("include_metadata", False):
+            result["metadata"] = _metadata_report(image)
+        return result
+    if method == "gimp.export_layer":
+        layer = _resolve_layer(image, params.get("layer_id"))
+        if layer.is_group_layer():
+            raise HostCommandError("export_layer requires one non-group drawable")
+        if layer.get_mask() is not None:
+            raise HostCommandError("export_layer does not support masked layers")
+        path = _output_path(
+            params.get("path"), frozenset({".png"}), bool(params.get("overwrite", False))
+        )
+        source_info = _layer_info(image, layer)
+        width, height = int(image.get_width()), int(image.get_height())
+        isolated = Gimp.Image.new_with_precision(
+            width, height, image.get_base_type(), image.get_precision()
+        )
+        if isolated is None:
+            raise HostCommandError("GIMP failed to create the temporary layer export image")
+        try:
+            if not isolated.set_color_profile(image.get_effective_color_profile()):
+                raise HostCommandError("GIMP failed to copy the export color profile")
+            copied = Gimp.Layer.new_from_drawable(layer, isolated)
+            if copied is None or not isolated.insert_layer(copied, None, 0):
+                raise HostCommandError("GIMP failed to copy the selected layer for export")
+            offsets = list(layer.get_offsets())[1:]
+            if not copied.set_offsets(*offsets) or not copied.set_visible(True):
+                raise HostCommandError("GIMP failed to preserve export placement")
+            if not Gimp.file_save(
+                Gimp.RunMode.NONINTERACTIVE, isolated, Gio.File.new_for_path(str(path)), None
+            ):
+                raise HostCommandError("GIMP failed to export the isolated layer PNG")
+            if not path.is_file() or path.stat().st_size <= 0:
+                raise HostCommandError("GIMP produced no layer PNG")
+            return {
+                **_file_digest(path),
+                "source_layer": source_info,
+                "export_canvas": [width, height],
+                "precision": _enum_name(isolated.get_precision()),
+                "color_profile": isolated.get_effective_color_profile().get_label(),
+                "source_image_mutated": False,
+            }
+        finally:
+            isolated.delete()
+    if method == "gimp.create_group":
+        name = _safe_text(params.get("name"), "name", 256)
+        parent = _parent_layer(image, params.get("parent_id"))
+        position = _layer_position(params.get("position", 0))
+        group = Gimp.GroupLayer.new(image, name)
+        if group is None or not image.insert_layer(group, parent, position):
+            raise HostCommandError("GIMP failed to create the layer group")
+        Gimp.displays_flush()
+        return _layer_info(image, group)
+    if method == "gimp.import_layer":
+        path = _input_path(params.get("path"))
+        parent = _parent_layer(image, params.get("parent_id"))
+        position = _layer_position(params.get("position", 0))
+        name = _safe_text(params.get("name", path.stem), "name", 256)
+        layer = Gimp.file_load_layer(
+            Gimp.RunMode.NONINTERACTIVE, image, Gio.File.new_for_path(str(path))
+        )
+        if layer is None:
+            raise HostCommandError("GIMP failed to import the image as a layer")
+        if layer.get_width() * layer.get_height() > MAX_IMAGE_PIXELS:
+            layer.delete()
+            raise HostCommandError("Imported layer exceeds the pixel limit")
+        if not layer.set_name(name) or not image.insert_layer(layer, parent, position):
+            layer.delete()
+            raise HostCommandError("GIMP failed to insert the imported layer")
+        Gimp.displays_flush()
+        return {**_layer_info(image, layer), "source": _file_digest(path)}
+    if method == "gimp.place_layer":
+        layer = _resolve_layer(image, params.get("layer_id"))
+        parent = _parent_layer(image, params.get("parent_id"))
+        position = _layer_position(params.get("position", 0))
+        if parent is not None and parent.get_id() == layer.get_id():
+            raise HostCommandError("A group cannot parent itself")
+        x = _bounded_int(params.get("x", 0), "x", -32768, 32768)
+        y = _bounded_int(params.get("y", 0), "y", -32768, 32768)
+        if not image.reorder_item(layer, parent, position):
+            raise HostCommandError("GIMP rejected the layer hierarchy placement")
+        if not layer.set_offsets(x, y):
+            raise HostCommandError("GIMP failed to set layer offsets")
+        Gimp.displays_flush()
+        return _layer_info(image, layer)
+    if method == "gimp.set_layer_mode":
+        layer = _resolve_layer(image, params.get("layer_id"))
+        modes = {
+            "normal": Gimp.LayerMode.NORMAL,
+            "multiply": Gimp.LayerMode.MULTIPLY,
+            "screen": Gimp.LayerMode.SCREEN,
+            "overlay": Gimp.LayerMode.OVERLAY,
+            "soft-light": Gimp.LayerMode.SOFTLIGHT,
+            "pass-through": Gimp.LayerMode.PASS_THROUGH,
+        }
+        mode = params.get("mode")
+        if mode not in modes or (mode == "pass-through" and not layer.is_group_layer()):
+            raise HostCommandError("Unsupported layer mode or pass-through on a non-group")
+        if not layer.set_mode(modes[mode]):
+            raise HostCommandError("GIMP failed to set layer mode")
+        Gimp.displays_flush()
+        return _layer_info(image, layer)
+    if method == "gimp.paint_shape":
+        return _paint_shape(image, params)
+    if method == "gimp.create_text":
+        text = _safe_text(params.get("text"), "text", 4096)
+        name = _safe_text(params.get("name"), "name", 256)
+        font_name = _safe_text(params.get("font", "DejaVu Sans"), "font", 256)
+        size = _bounded_float(params.get("size", 48), "size", 1, 2048)
+        x = _bounded_int(params.get("x", 0), "x", -32768, 32768)
+        y = _bounded_int(params.get("y", 0), "y", -32768, 32768)
+        parent = _parent_layer(image, params.get("parent_id"))
+        color = _color(params.get("color", [0, 0, 0]))
+        font = Gimp.Font.get_by_name(font_name)
+        if font is None:
+            raise HostCommandError("The requested font is unavailable in GIMP")
+        layer = Gimp.TextLayer.new(image, text, font, size, Gimp.Unit.pixel())
+        if layer is None:
+            raise HostCommandError("GIMP failed to create editable text")
+        if layer.get_width() * layer.get_height() > MAX_IMAGE_PIXELS:
+            layer.delete()
+            raise HostCommandError("Native text layer exceeds the pixel limit")
+        if not layer.set_name(name):
+            layer.delete()
+            raise HostCommandError("GIMP failed to initialize editable text")
+        if not image.insert_layer(layer, parent, 0) or not layer.set_offsets(x, y):
+            raise HostCommandError("GIMP failed to place editable text")
+        if not layer.set_color(color):
+            raise HostCommandError("GIMP failed to set editable text color")
+        Gimp.displays_flush()
+        return {**_layer_info(image, layer), "text": text, "font": font_name, "font_size": size}
     if method == "gimp.save_image":
         path = _output_path(
             params.get("path"), frozenset({".xcf"}), bool(params.get("overwrite", False))
@@ -1254,14 +1604,7 @@ def _execute_command(method: str, params: Mapping[str, Any]) -> Any:
         layer = _resolve_layer(image, params.get("layer_id"))
         if layer.is_group_layer():
             raise HostCommandError("fill_layer requires a paintable layer")
-        Gimp.context_push()
-        try:
-            if not Gimp.context_set_foreground(_color(params.get("color"))):
-                raise HostCommandError("GIMP rejected the fill color")
-            if not layer.fill(Gimp.FillType.FOREGROUND):
-                raise HostCommandError("GIMP failed to fill the layer")
-        finally:
-            Gimp.context_pop()
+        _fill_color(layer, params.get("color"))
         Gimp.displays_flush()
         return {"layer_id": int(layer.get_id()), "filled": True}
     if method == "gimp.set_layer_properties":
@@ -1474,7 +1817,7 @@ class DccMcpGimp(Gimp.PlugIn):
 
     def do_create_procedure(self, name: str) -> Any:
         procedure = Gimp.Procedure.new(
-            self, name, Gimp.PDBProcType.PERSISTENT, self._run, self, None
+            self, name, Gimp.PDBProcType.PERSISTENT, self._run, self
         )
         procedure.set_documentation(
             "Start the DCC-MCP GIMP bridge",
@@ -1485,13 +1828,13 @@ class DccMcpGimp(Gimp.PlugIn):
         return procedure
 
     @staticmethod
-    def _run(procedure: Any, run_mode: Any, config: Any, plugin: Any) -> Any:
+    def _run(procedure: Any, config: Any, plugin: Any) -> Any:
         with capture_bootstrap_errors("bridge-startup"):
-            return DccMcpGimp._run_bridge(procedure, run_mode, config, plugin)
+            return DccMcpGimp._run_bridge(procedure, config, plugin)
 
     @staticmethod
-    def _run_bridge(procedure: Any, run_mode: Any, config: Any, plugin: Any) -> Any:
-        del run_mode, config
+    def _run_bridge(procedure: Any, config: Any, plugin: Any) -> Any:
+        del config
         global _bridge_token
         _bridge_token = _load_or_create_token()
         server = _Server((BRIDGE_HOST, BRIDGE_PORT), _Handler)
