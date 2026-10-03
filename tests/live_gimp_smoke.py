@@ -1,4 +1,4 @@
-"""Exercise every bundled typed tool against a real GIMP 3 host."""
+"""Exercise the retained base image/layer workflow against a real GIMP 3 host."""
 
 from __future__ import annotations
 
@@ -114,8 +114,12 @@ def main() -> None:
     evidence = Path(tempfile.mkdtemp(prefix="dcc-mcp-gimp-live-", dir=str(smoke_root)))
     registry = evidence / "registry"
     os.environ["DCC_MCP_DISABLE_DEFAULT_SKILL_PATHS"] = "1"
-    server = GimpMcpServer(port=0, registry_dir=str(registry))
+    server = GimpMcpServer(
+        port=0, registry_dir=str(registry), gateway_port=0, enable_gateway_failover=False
+    )
     try:
+        assert server._options.gateway.port == 0
+        assert server._options.gateway.enable_failover is False
         server.register_builtin_actions()
         server.start(install_atexit_hook=False)
         call(server.mcp_url, "load_skill", {"skill_name": "gimp-session"})
@@ -220,7 +224,7 @@ def main() -> None:
 
     assert status["success"] is True
     assert status["context"]["authenticated"] is True
-    assert status["context"]["command_count"] == 16
+    assert status["context"]["command_count"] == 24
     assert inspected["context"]["layer_count"] == 3
     assert {base_layer_id, accent_id, foreground_id}.issubset(
         {item["layer_id"] for item in listed_layers["context"]["layers"]}

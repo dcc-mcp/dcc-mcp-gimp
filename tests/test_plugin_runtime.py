@@ -55,7 +55,7 @@ def test_runtime_authenticated_server_round_trip(runtime):
         result = bridge.call("gimp.ping")
         assert result["ready"] is True
         assert result["gimp_version"] == "3.0-test"
-        assert result["command_count"] == 16
+        assert result["command_count"] == 24
         assert result["authenticated"] is True
         assert result["gimp_pid"] > 0
         assert isinstance(result["gimp_start_identity"], str)
@@ -117,7 +117,7 @@ def test_runtime_captures_bridge_bootstrap_failure(runtime, tmp_path, monkeypatc
     monkeypatch.setitem(run.__globals__, "_load_or_create_token", fail_token_load)
 
     with pytest.raises(RuntimeError, match="token bootstrap failed"):
-        run(None, None, None, None)
+        run(None, None, None)
 
     record = json.loads(errors.read_text(encoding="utf-8").splitlines()[-1])
     assert record["stage"] == "bridge-startup"

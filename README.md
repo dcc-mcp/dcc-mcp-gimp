@@ -87,10 +87,31 @@ python -m twine check dist/*
 ```
 
 The real-host acceptance script is `tests/live_gimp_smoke.py`. It creates a
-bounded layered image, exercises all typed commands, saves XCF, exports PNG,
+bounded layered image through the retained base image/layer workflow, saves XCF, exports PNG,
 verifies both artifacts, reopens the XCF, and cleans up only bridge-owned
 displays.
 
 Official references: [GIMP 3 Python plug-ins](https://developer.gimp.org/resource/writing-a-plug-in/tutorial-python/),
 [GIMP Image API](https://developer.gimp.org/api/3.0/libgimp/class.Image.html), and
 [GIMP file save/export API](https://developer.gimp.org/api/3.0/libgimp/func.file_save.html).
+
+See [the typed layered workflow](docs/native-poster-workflow.md) for the eight
+additional bounded tools and their native readback/color contracts. The retained
+base smoke does not cover all eight additions. The separate v2 current-main
+native acceptance gate covered these additions on Linux GIMP 3.0.4 with the pinned
+0.20.41 runtime; historical release-based evidence remains separate.
+
+Shape painting restores selection masks with feather and antialias disabled,
+preserves a recovery channel when restoration fails, and restores the user
+context on cleanup. See the separate installed-wheel and fixed-fixture native
+gate records for the exact code/version acceptance boundary.
+
+The context-push failure path also removes the unused saved selection channel.
+If that cleanup fails, both errors remain explicit. This failure-only revision
+reuses the labeled v2 successful native evidence after a structural equivalence
+check; it does not claim a new v3 native run.
+
+Publication review also preserves combined selection/context cleanup errors,
+checks the actual native text-layer pixel limit before insertion, and rejects
+masked layer exports before allocation. These additions have inert regression
+coverage; they do not claim a fresh native run of the final publication module.
