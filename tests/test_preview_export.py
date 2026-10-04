@@ -525,6 +525,7 @@ def test_postpublication_cleanup_failure_reports_committed_output(runtime, monke
         return original(path, *args, **kwargs)
 
     monkeypatch.setattr(execute.__globals__["os"], "rmdir", fail_stage)
+    monkeypatch.setattr(Path, "rmdir", fail_stage)
     with pytest.raises(runtime["HostCommandError"], match="output was published") as caught:
         execute("gimp.export_preview", args)
     assert "private filesystem details" not in str(caught.value)
