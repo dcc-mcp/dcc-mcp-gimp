@@ -13,10 +13,11 @@ import socket
 import socketserver
 import stat
 import sys
+import tempfile
 import threading
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Optional
@@ -768,6 +769,9 @@ MAX_PENDING_COMMANDS = 32
 MAX_REQUEST_BYTES = 1024 * 1024
 MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_IMAGE_PIXELS = 100_000_000
+MAX_PREVIEW_SOURCE_PIXELS = 16_777_216
+MAX_PREVIEW_LAYER_PIXELS = 134_217_728
+MAX_PREVIEW_LAYER_NODES = 256
 MAX_LAYER_NODES = 20_000
 MAX_FILE_BYTES = 2 * 1024 * 1024 * 1024
 MAX_COMMAND_TIMEOUT_SECS = 1_800.0
@@ -1017,6 +1021,361 @@ def _output_path(value: Any, suffixes: frozenset[str], overwrite: bool) -> Path:
     if path.exists() and not path.is_file():
         raise HostCommandError("Output path is not a regular file")
     return path
+
+
+def _preview_directory_identity(path: Path) -> tuple[int, int]:
+    details = path.lstat()
+    if not stat.S_ISDIR(details.st_mode) or _path_is_link_or_reparse(path):
+        raise HostCommandError("Preview directory must be a regular directory")
+    return int(details.st_dev), int(details.st_ino)
+
+
+def _preview_dimensions(width: int, height: int, max_width: int, max_height: int):
+    """Fit within an integer box, flooring the other axis and never upscaling."""
+    if width <= max_width and height <= max_height:
+        return width, height
+    if max_width * height <= max_height * width:
+        return max_width, max(1, height * max_width // width)
+    return max(1, width * max_height // height), max_height
+
+
+def _preview_admit_source(image: Any) -> tuple[int, int]:
+    width = _bounded_int(image.get_width(), "source width", 1, 8192)
+    height = _bounded_int(image.get_height(), "source height", 1, 8192)
+    if width * height > MAX_PREVIEW_SOURCE_PIXELS:
+        raise HostCommandError("Preview source exceeds 16777216 pixels")
+    if (
+        image.get_base_type() != Gimp.ImageBaseType.RGB
+        or image.get_precision() != Gimp.Precision.U8_NON_LINEAR
+    ):
+        raise HostCommandError("Preview requires RGB/RGBA 8-bit non-linear precision")
+    if image.get_channels() or image.get_paths() or image.get_floating_sel() is not None:
+        raise HostCommandError(
+            "Preview does not support saved channels, paths or floating selections"
+        )
+    _preview_parasite_admission(image)
+    selection = image.get_selection()
+    _preview_parasite_admission(selection)
+    if selection.get_filters():
+        raise HostCommandError("Preview does not support nonempty selection filters")
+    stack = list(image.get_layers())
+    nodes, pixels = 0, 0
+    while stack:
+        layer = stack.pop()
+        nodes += 1
+        if nodes > MAX_PREVIEW_LAYER_NODES:
+            raise HostCommandError("Preview source exceeds 256 layer nodes")
+        w = _bounded_int(layer.get_width(), "layer width", 1, 8192)
+        h = _bounded_int(layer.get_height(), "layer height", 1, 8192)
+        _preview_parasite_admission(layer)
+        if layer.get_filters():
+            raise HostCommandError("Preview does not support nonempty drawable filters")
+        pixels += w * h
+        mask = layer.get_mask()
+        if mask is not None:
+            _preview_parasite_admission(mask)
+            if mask.get_filters():
+                raise HostCommandError("Preview does not support nonempty mask filters")
+            mask_width = _bounded_int(mask.get_width(), "mask width", 1, 8192)
+            mask_height = _bounded_int(mask.get_height(), "mask height", 1, 8192)
+            pixels += mask_width * mask_height
+        if pixels > MAX_PREVIEW_LAYER_PIXELS:
+            raise HostCommandError("Preview source exceeds aggregate layer pixel limit")
+        if layer.is_group_layer():
+            stack.extend(layer.get_children())
+    return width, height
+
+
+def _preview_parasite_admission(item: Any) -> None:
+    if len(item.get_parasite_list()) > 256:
+        raise HostCommandError("Preview does not support more than 256 parasites per native item")
+
+
+def _preview_buffer_hash(drawable: Any, pixel_format: str, channels: int) -> str:
+    """Hash native pixels in <=1 MiB strips; this never rescales or writes pixels."""
+    width, height = int(drawable.get_width()), int(drawable.get_height())
+    buffer = drawable.get_buffer()
+    if buffer is None:
+        raise HostCommandError("GIMP did not expose native pixels for source verification")
+    digest = hashlib.sha256()
+    rows_per_strip = max(1, min(64, 1024 * 1024 // (width * channels)))
+    for y in range(0, height, rows_per_strip):
+        rows = min(rows_per_strip, height - y)
+        data = bytes(buffer.get(
+            Gegl.Rectangle.new(0, y, width, rows), 1.0, pixel_format, Gegl.AbyssPolicy.NONE
+        ))
+        if len(data) != width * rows * channels:
+            raise HostCommandError("GIMP source pixel readback has an unexpected byte length")
+        digest.update(data)
+    return digest.hexdigest()
+
+
+def _preview_text_state(layer: Any) -> dict[str, Any]:
+    size, unit = layer.get_font_size()
+    return {
+        "markup": layer.get_markup(), "font_size": size, "font_unit": unit.get_id(),
+        "antialias": layer.get_antialias(), "hint_style": _enum_name(layer.get_hint_style()),
+        "kerning": layer.get_kerning(), "language": layer.get_language(),
+        "base_direction": _enum_name(layer.get_base_direction()),
+        "justification": _enum_name(layer.get_justification()), "indent": layer.get_indent(),
+        "line_spacing": layer.get_line_spacing(), "letter_spacing": layer.get_letter_spacing(),
+    }
+
+
+def _preview_state(image: Any) -> str:
+    """Source fingerprint including hidden layer/mask bytes and editable text attributes."""
+    metadata = image.get_metadata()
+    serialized = metadata.serialize() if metadata is not None else ""
+    report = _metadata_report(image)
+    report["metadata_xml"] = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+    layers = _walk_layers(image)
+    pixels = []
+    for row in layers:
+        layer = _resolve_layer(image, row["layer_id"])
+        mask = layer.get_mask()
+        pixels.append({
+            "layer_id": row["layer_id"],
+            "rgba_sha256": _preview_buffer_hash(layer, "R'G'B'A u8", 4),
+            "mask_sha256": _preview_buffer_hash(mask, "Y u8", 1) if mask is not None else None,
+            "mask_parasites": _parasite_report(mask) if mask is not None else [],
+            "mask_present": mask is not None,
+            "mask_geometry": {
+                "mask_id": int(mask.get_id()), "width": int(mask.get_width()),
+                "height": int(mask.get_height()), "offsets": list(mask.get_offsets())[1:],
+            } if mask is not None else None,
+            "mask_apply": layer.get_apply_mask() if mask is not None else None,
+            "mask_show": layer.get_show_mask() if mask is not None else None,
+            "mask_edit": layer.get_edit_mask() if mask is not None else None,
+            "blend_space": _enum_name(layer.get_blend_space()),
+            "composite_space": _enum_name(layer.get_composite_space()),
+            "composite_mode": _enum_name(layer.get_composite_mode()),
+            "text_attributes": _preview_text_state(layer) if layer.is_text_layer() else None,
+        })
+    selection = image.get_selection()
+    state = {
+        "image": _image_info(image), "layers": layers, "metadata": report, "pixels": pixels,
+        "selection_sha256": _preview_buffer_hash(selection, "Y u8", 1),
+        "selection_parasites": _parasite_report(selection),
+        "selected_channels": [item.get_id() for item in image.get_selected_channels()],
+        "selected_paths": [item.get_id() for item in image.get_selected_paths()],
+        "image_order": [item.get_id() for item in Gimp.get_images()],
+        "components": [{
+            "channel": _enum_name(channel),
+            "visible": image.get_component_visible(channel),
+            "active": image.get_component_active(channel),
+        } for channel in (Gimp.ChannelType.RED, Gimp.ChannelType.GREEN,
+                          Gimp.ChannelType.BLUE, Gimp.ChannelType.ALPHA)],
+        "effective_icc_sha256": hashlib.sha256(
+            bytes(image.get_effective_color_profile().get_icc_profile())
+        ).hexdigest(),
+    }
+    return hashlib.sha256(json.dumps(state, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _export_preview(image: Any, params: Mapping[str, Any]) -> dict[str, Any]:
+    try:
+        return _export_preview_checked(image, params)
+    except HostCommandError:
+        raise
+    except BaseException:
+        raise HostCommandError("Preview export failed; inspect source and destination") from None
+
+
+def _export_preview_checked(image: Any, params: Mapping[str, Any]) -> dict[str, Any]:
+    """Export only a native duplicate; publish after native cleanup and state checks."""
+    if set(params) - {"image_id", "path", "max_width", "max_height", "overwrite"}:
+        raise HostCommandError("Unknown export_preview argument")
+    max_width = _bounded_int(params.get("max_width"), "max_width", 1, 2048)
+    max_height = _bounded_int(params.get("max_height"), "max_height", 1, 2048)
+    overwrite = params.get("overwrite", False)
+    if type(overwrite) is not bool:
+        raise HostCommandError("overwrite must be a boolean")
+    requested = Path(_safe_text(params.get("path"), "path", 2048)).expanduser().absolute()
+    if not _bootstrap_path_safe(requested):
+        raise HostCommandError("Preview output path must not contain links or reparse points")
+    path = _output_path(str(requested), frozenset({".png"}), overwrite)
+    width, height = _preview_admit_source(image)
+    output_width, output_height = _preview_dimensions(width, height, max_width, max_height)
+    # Exporters write to a private sibling, never the destination. The atomic
+    # no-replace hard link below also refuses a target created during export.
+    temporary = None
+    pushed = False
+    native_error = False
+    cleanup_error = False
+    staging = None
+    published = False
+    parent_fd = stage_fd = None
+    leases = ExitStack()
+    try:
+        before = _preview_state(image)
+        interpolation = Gimp.context_get_interpolation()
+        parent_identity = _preview_directory_identity(path.parent)
+        leases.enter_context(_windows_directory_lease(path.parent))
+        if os.name == "posix":
+            parent_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            opened = os.fstat(parent_fd)
+            if (opened.st_dev, opened.st_ino) != parent_identity:
+                raise HostCommandError("Preview parent changed before staging")
+        staging = Path(tempfile.mkdtemp(prefix=".dcc-preview-", dir=str(path.parent)))
+        staging_identity = _preview_directory_identity(staging)
+        leases.enter_context(_windows_directory_lease(staging))
+        if parent_fd is not None:
+            stage_fd = os.open(
+                staging.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd
+            )
+            opened = os.fstat(stage_fd)
+            if (opened.st_dev, opened.st_ino) != staging_identity:
+                raise HostCommandError("Preview staging changed identity")
+        stage_path = staging / "preview.png"
+        try:
+            if not Gimp.context_push():
+                raise HostCommandError("GIMP could not preserve the preview context")
+            pushed = True
+            if not Gimp.context_set_interpolation(Gimp.InterpolationType.NOHALO):
+                raise HostCommandError("GIMP could not select NoHalo interpolation")
+            if Gimp.context_get_interpolation() != Gimp.InterpolationType.NOHALO:
+                raise HostCommandError("GIMP did not activate NoHalo interpolation")
+            temporary = image.duplicate()
+            if temporary is None or temporary.get_id() == image.get_id():
+                temporary = None
+                raise HostCommandError("GIMP did not create an isolated preview image")
+            if (output_width, output_height) != (width, height) and not temporary.scale(
+                output_width, output_height
+            ):
+                raise HostCommandError("GIMP could not scale the preview image")
+            if (temporary.get_width(), temporary.get_height()) != (output_width, output_height):
+                raise HostCommandError("GIMP preview dimensions differ from the bounded request")
+            if not Gimp.file_save(
+                Gimp.RunMode.NONINTERACTIVE, temporary, Gio.File.new_for_path(str(stage_path)), None
+            ):
+                raise HostCommandError("GIMP could not export the preview PNG")
+            if (
+                not _bootstrap_path_safe(stage_path)
+                or not stage_path.is_file()
+                or not 0 < stage_path.stat().st_size <= 32 * 1024 * 1024
+            ):
+                raise HostCommandError("GIMP did not produce a bounded regular preview PNG")
+            with stage_path.open("rb") as stream:
+                header = stream.read(33)
+            if (
+                len(header) != 33
+                or header[:16] != b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR"
+                or int.from_bytes(header[16:20], "big") != output_width
+                or int.from_bytes(header[20:24], "big") != output_height
+            ):
+                raise HostCommandError("GIMP preview PNG header did not match the request")
+            digest = _file_digest(stage_path)
+        except BaseException:
+            native_error = True
+        finally:
+            if temporary is not None:
+                try:
+                    if not temporary.delete():
+                        cleanup_error = True
+                except BaseException:
+                    cleanup_error = True
+            if pushed:
+                try:
+                    if not Gimp.context_pop():
+                        cleanup_error = True
+                except BaseException:
+                    cleanup_error = True
+            try:
+                if Gimp.context_get_interpolation() != interpolation:
+                    # Best effort restoration after a failed context pop. Still fail
+                    # the request because the rest of the context is not attested.
+                    Gimp.context_set_interpolation(interpolation)
+                    cleanup_error = True
+            except BaseException:
+                cleanup_error = True
+        if cleanup_error:
+            raise HostCommandError("Preview cleanup failed; no output was published")
+        if native_error:
+            raise HostCommandError("Native preview export failed; no output was published")
+        _preview_admit_source(image)
+        if _preview_state(image) != before:
+            raise HostCommandError("Preview source state changed; no output was published")
+        if (
+            not _bootstrap_path_safe(path)
+            or _preview_directory_identity(path.parent) != parent_identity
+        ):
+            raise HostCommandError("Preview output parent changed; no output was published")
+        # Revalidate the destination type/allowlist after the native exporter.
+        _output_path(str(path), frozenset({".png"}), overwrite)
+        if (not _bootstrap_path_safe(staging)
+                or _preview_directory_identity(staging) != staging_identity):
+            raise HostCommandError("Preview staging changed before publication")
+        if parent_fd is not None:
+            # Anchor publication to admitted directories; a concurrent parent-path
+            # replacement cannot redirect the atomic operation to another directory.
+            if overwrite:
+                os.replace("preview.png", path.name, src_dir_fd=stage_fd, dst_dir_fd=parent_fd)
+            else:
+                os.link("preview.png", path.name, src_dir_fd=stage_fd,
+                        dst_dir_fd=parent_fd, follow_symlinks=False)
+        elif overwrite:
+            os.replace(stage_path, path)
+        else:
+            os.link(stage_path, path)
+        published = True
+        return {
+            **digest,
+            "path": str(path),
+            "source_image_id": image.get_id(),
+            "source_dimensions": [width, height],
+            "output_dimensions": [output_width, output_height],
+            "interpolation": "nohalo",
+            "upscaled": False,
+            "source_state_sha256": before,
+            "source_image_mutated": False,
+            "temporary_image_deleted": True,
+            "context_restored": True,
+            "published": True,
+        }
+    except HostCommandError:
+        raise
+    except BaseException:
+        # Native/GI/filesystem exceptions can include paths or metadata. They are
+        # deliberately not copied into the remote error envelope.
+        raise HostCommandError(
+            "Preview export failed; inspect the destination before retrying"
+        ) from None
+    finally:
+        try:
+            if staging is not None:
+                if stage_fd is not None:
+                    try:
+                        os.unlink("preview.png", dir_fd=stage_fd)
+                    except FileNotFoundError:
+                        pass
+                    os.close(stage_fd)
+                    stage_fd = None
+                    # Only remove our unchanged directory; never follow a swap.
+                    if _preview_directory_identity(staging) != staging_identity:
+                        raise OSError("Staging identity changed")
+                    os.rmdir(staging.name, dir_fd=parent_fd)
+                else:
+                    stage_path = staging / "preview.png"
+                    if stage_path.exists() or stage_path.is_symlink():
+                        stage_path.unlink()
+                    # Windows directory lease must close before rmdir.
+                    leases.close()
+                    staging.rmdir()
+        except OSError:
+            if published:
+                raise HostCommandError(
+                    "Preview output was published, but staging cleanup failed; "
+                    "inspect the destination before any retry"
+                ) from None
+            raise HostCommandError(
+                "Preview staging cleanup failed before publication; destination was not changed"
+            ) from None
+        finally:
+            if stage_fd is not None:
+                os.close(stage_fd)
+            if parent_fd is not None:
+                os.close(parent_fd)
+            leases.close()
 
 
 def _file_digest(path: Path) -> dict[str, Any]:
@@ -1408,7 +1767,7 @@ def _execute_command(method: str, params: Mapping[str, Any]) -> Any:
             "plugin_module_path": str(Path(__file__).resolve()),
             "main_thread_id": threading.get_ident(),
             "allowed_roots": [str(root) for root in _allowed_roots()],
-            "command_count": 24,
+            "command_count": 25,
             "arbitrary_script_input": False,
         }
     if method == "gimp.list_fonts":
@@ -1467,6 +1826,8 @@ def _execute_command(method: str, params: Mapping[str, Any]) -> Any:
         if params.get("include_metadata", False):
             result["metadata"] = _metadata_report(image)
         return result
+    if method == "gimp.export_preview":
+        return _export_preview(image, params)
     if method == "gimp.export_layer":
         layer = _resolve_layer(image, params.get("layer_id"))
         if layer.is_group_layer():

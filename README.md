@@ -62,6 +62,8 @@ and verify the exact host instance. The MCP endpoint defaults to
   parameters.
 - Preserve layered work as XCF and export PNG, JPEG, WebP, or TIFF with byte
   counts and SHA-256 digests.
+- Export bounded PNG previews from a native duplicate with `export_preview`;
+  `max_width` and `max_height` are 1–2048, preserve aspect ratio and never upscale.
 - Flatten only with `confirm=true`; overwrite only with `overwrite=true`.
 - Close only bridge-opened displays, and require `discard_changes=true` for
   dirty images.
@@ -115,3 +117,44 @@ Publication review also preserves combined selection/context cleanup errors,
 checks the actual native text-layer pixel limit before insertion, and rejects
 masked layer exports before allocation. These additions have inert regression
 coverage; they do not claim a fresh native run of the final publication module.
+
+## Native PNG previews
+
+`export_preview(image_id, path, max_width, max_height, overwrite=false)` fits the
+image within an integer bounding box, with each side at most 2048 pixels. The
+limiting side is exact; the other side is floored to the nearest integer, with a
+minimum of one pixel. For example, 2560 × 1600 becomes 1600 × 1000 in a 1600 × 1600
+box. Smaller inputs keep their dimensions. PNG is the only output format.
+
+The source must be RGB/RGBA in GIMP's `U8_NON_LINEAR` precision, at most 8192
+pixels per side and 16,777,216 pixels total. At most 256 layer nodes and
+134,217,728 aggregate layer pixels are admitted; groups count and masks add their
+layer's area. Saved channels, paths, floating selections, and nonempty drawable filters are
+unsupported.
+These are admission limits, not a memory quota or an HDR/indexed conversion.
+
+The host duplicates the native image, scales that copy with GIMP's NoHalo
+interpolation, and exports through GIMP. It hashes every admitted native layer (including hidden layers), mask and
+selection in bounded strips, and checks hierarchy, editable text attributes,
+metadata, selected items, dirty state, and image-list order before publishing.
+Mask flags, blend/composite spaces and modes, image component visibility/activity,
+and effective ICC profile bytes are included in the read-only state fingerprint.
+GIMP exposes no direct image projection buffer in this API; complete composited
+RGBA equality is verified separately in the native fixture.
+Native items with more than 256 parasites are rejected before duplication. The temporary image is deleted and the pushed global
+context is restored before publication. A native image/context cleanup or source-state failure
+prevents publication. Symlink/reparse paths are rejected. An unpredictable sibling
+staging directory protects an existing destination on native export failure;
+atomic no-replace publication rejects a late collision when overwrite is false.
+The result includes output dimensions, byte count, SHA-256, and the measured source-state
+fingerprint. A later filesystem staging-cleanup error explicitly reports when
+the output was already published; it is not a rollback or retry-safe failure.
+Path protections assume a trusted isolated host and caller-controlled allowed
+roots; they do not claim resistance to hostile same-user filesystem mutation or
+a cross-user Windows ACL. Windows native behavior is not qualified by the Linux
+fixture. Raw native exception text is not returned. As with any after-start
+bridge timeout, inspect the destination and host before retrying.
+
+The new preview contract does not change the older `export_image` or
+`export_layer` export behavior. In particular, preview source-state verification
+and staging are specific to `export_preview`.

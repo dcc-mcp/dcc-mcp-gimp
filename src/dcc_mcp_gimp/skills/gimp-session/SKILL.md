@@ -51,3 +51,14 @@ readback after mutation; save/reopen XCF and inspect actual exported PNG pixels.
 Queued requests retain the bridge's existing before-start timeout cancellation.
 An after-start timeout remains an unknown host outcome and must be inspected
 before retrying a mutation.
+
+
+For web and asset-library sizes, use `export_preview` with a PNG path and explicit
+`max_width`/`max_height` (1–2048). It duplicates the native image, uses NoHalo to
+fit inside the box, floors the non-limiting dimension to an integer, and never
+upscales. It supports RGB/RGBA U8_NON_LINEAR sources within its image/layer
+admission bounds; saved channels, paths and floating selections are rejected.
+The source state and context are checked and the temporary image is deleted
+before atomic publication. The default refuses overwrites, including a target
+created while GIMP is exporting. Inspect dimensions and PNG alpha/pixels after
+export. Do not substitute a generic Python or PDB execution request.
