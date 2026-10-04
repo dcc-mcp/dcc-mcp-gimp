@@ -1157,7 +1157,14 @@ def _parasite_report(item: Any) -> list[dict[str, Any]]:
     result = []
     for name in list(item.get_parasite_list())[:256]:
         parasite = item.get_parasite(name)
-        data = bytes(parasite.get_data())
+        # GIMP's gchar array is exposed as signed integers by PyGObject.
+        # Preserve valid byte values without coercing invalid types or domains.
+        octets = bytearray()
+        for value in parasite.get_data():
+            if type(value) is not int or not -128 <= value <= 255:
+                raise HostCommandError("GIMP returned parasite data outside the byte domain")
+            octets.append(value & 0xff)
+        data = bytes(octets)
         result.append(
             {
                 "name": name,
