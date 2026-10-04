@@ -55,7 +55,7 @@ def test_runtime_authenticated_server_round_trip(runtime):
         result = bridge.call("gimp.ping")
         assert result["ready"] is True
         assert result["gimp_version"] == "3.0-test"
-        assert result["command_count"] == 24
+        assert result["command_count"] == 25
         assert result["authenticated"] is True
         assert result["gimp_pid"] > 0
         assert isinstance(result["gimp_start_identity"], str)

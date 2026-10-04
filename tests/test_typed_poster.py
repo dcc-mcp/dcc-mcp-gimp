@@ -95,6 +95,7 @@ def test_srgb_color_contract_uses_encoded_hex(runtime):
         "create_text",
         "list_fonts",
         "export_layer",
+        "export_preview",
     ],
 )
 def test_tool_entrypoints_use_core_argument_and_result_protocol(monkeypatch, tool):

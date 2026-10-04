@@ -43,6 +43,7 @@ def test_plugin_exposes_exact_typed_command_catalog():
         "create_text",
         "list_fonts",
         "export_layer",
+        "export_preview",
         "get_status",
         "list_images",
         "get_active_image",
@@ -61,4 +62,4 @@ def test_plugin_exposes_exact_typed_command_catalog():
         "close_image",
     }
     assert all(('"gimp.%s"' % command) in source for command in commands)
-    assert '"command_count": 24' in source
+    assert '"command_count": 25' in source
