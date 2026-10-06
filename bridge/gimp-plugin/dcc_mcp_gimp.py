@@ -775,6 +775,7 @@ MAX_PREVIEW_LAYER_NODES = 256
 MAX_LAYER_NODES = 20_000
 MAX_FILE_BYTES = 2 * 1024 * 1024 * 1024
 MAX_COMMAND_TIMEOUT_SECS = 1_800.0
+MAX_PARASITE_BYTES = 16 * 1024 * 1024
 OPEN_SUFFIXES = frozenset(
     {".xcf", ".ora", ".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff", ".psd", ".exr"}
 )
@@ -941,6 +942,12 @@ def _bounded_int(value: Any, label: str, minimum: int, maximum: int) -> int:
         raise HostCommandError("%s must be an integer" % label)
     if value < minimum or value > maximum:
         raise HostCommandError("%s must be between %d and %d" % (label, minimum, maximum))
+    return value
+
+
+def _typed_bool(value: Any, label: str) -> bool:
+    if type(value) is not bool:
+        raise HostCommandError("%s must be a boolean" % label)
     return value
 
 
@@ -1165,11 +1172,80 @@ def _preview_state(image: Any) -> str:
             "active": image.get_component_active(channel),
         } for channel in (Gimp.ChannelType.RED, Gimp.ChannelType.GREEN,
                           Gimp.ChannelType.BLUE, Gimp.ChannelType.ALPHA)],
-        "effective_icc_sha256": hashlib.sha256(
-            bytes(image.get_effective_color_profile().get_icc_profile())
-        ).hexdigest(),
+        "effective_icc_sha256": _effective_icc_identity(image)["sha256"],
     }
     return hashlib.sha256(json.dumps(state, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+MAX_ICC_PROFILE_BYTES = 16 * 1024 * 1024
+
+
+def _read_gchar_bytes(raw: Any, label: str, limit: int) -> bytes:
+    """Convert a PyGObject gchar array to bytes, checking the size limit first.
+
+    GIMP exposes gchar arrays as signed integers. Reject the payload on length
+    before materializing it, so an oversized native read never gets copied.
+    """
+    try:
+        length = len(raw)
+    except BaseException:
+        raise HostCommandError("GIMP returned unusable %s" % label) from None
+    if length > limit:
+        raise HostCommandError("%s exceeds the %d byte inspection limit" % (label, limit))
+    octets = bytearray()
+    try:
+        for value in raw:
+            # GIMP's gchar array is exposed as signed integers by PyGObject.
+            # Preserve valid byte values without coercing invalid types or domains.
+            if type(value) is not int or not -128 <= value <= 255:
+                raise HostCommandError("GIMP returned %s data outside the byte domain" % label)
+            octets.append(value & 0xff)
+    except HostCommandError:
+        raise
+    except BaseException:
+        raise HostCommandError("GIMP returned unusable %s" % label) from None
+    return bytes(octets)
+
+
+def _read_icc_bytes(profile: Any, label: str) -> bytes:
+    """Read one GIMP color profile's ICC payload as bytes, or raise a typed error."""
+    if profile is None:
+        raise HostCommandError("GIMP returned no %s for this image" % label)
+    try:
+        raw = profile.get_icc_profile()
+    except BaseException:
+        raise HostCommandError("GIMP failed to read the %s" % label) from None
+    if raw is None:
+        raise HostCommandError("GIMP returned no bytes for the %s" % label)
+    data = _read_gchar_bytes(raw, label, MAX_ICC_PROFILE_BYTES)
+    if not data:
+        raise HostCommandError("GIMP returned an empty %s" % label)
+    return data
+
+
+def _effective_icc_identity(image: Any) -> dict[str, Any]:
+    """Identify the native effective ICC payload by bytes and digest, never by label.
+
+    GIMP falls back to a built-in profile when the image stores none, so an absent
+    ICC parasite is not an invalid image and `get_effective_color_profile()` is the
+    only getter that always answers.
+    """
+    try:
+        profile = image.get_effective_color_profile()
+    except BaseException:
+        raise HostCommandError("GIMP failed to read the effective color profile") from None
+    data = _read_icc_bytes(profile, "effective color profile")
+    stored = None
+    try:
+        stored = image.get_color_profile()
+    except BaseException:
+        raise HostCommandError("GIMP failed to read the stored color profile") from None
+    return {
+        "bytes": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "explicitly_stored": stored is not None,
+        "label": str(profile.get_label()),
+    }
 
 
 def _export_preview(image: Any, params: Mapping[str, Any]) -> dict[str, Any]:
@@ -1516,14 +1592,9 @@ def _parasite_report(item: Any) -> list[dict[str, Any]]:
     result = []
     for name in list(item.get_parasite_list())[:256]:
         parasite = item.get_parasite(name)
-        # GIMP's gchar array is exposed as signed integers by PyGObject.
-        # Preserve valid byte values without coercing invalid types or domains.
-        octets = bytearray()
-        for value in parasite.get_data():
-            if type(value) is not int or not -128 <= value <= 255:
-                raise HostCommandError("GIMP returned parasite data outside the byte domain")
-            octets.append(value & 0xff)
-        data = bytes(octets)
+        data = _read_gchar_bytes(
+            parasite.get_data(), "parasite data", MAX_PARASITE_BYTES
+        )
         result.append(
             {
                 "name": name,
@@ -1825,6 +1896,8 @@ def _execute_command(method: str, params: Mapping[str, Any]) -> Any:
         result = {**_image_info(image), "layer_count": len(layers), "layers": layers}
         if params.get("include_metadata", False):
             result["metadata"] = _metadata_report(image)
+        if _typed_bool(params.get("include_icc_identity", False), "include_icc_identity"):
+            result["effective_icc"] = _effective_icc_identity(image)
         return result
     if method == "gimp.export_preview":
         return _export_preview(image, params)

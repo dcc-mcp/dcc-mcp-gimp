@@ -53,6 +53,20 @@ An after-start timeout remains an unknown host outcome and must be inspected
 before retrying a mutation.
 
 
+`inspect_image` accepts two opt-in flags. `include_metadata` adds the bounded image
+and layer parasite report. `include_icc_identity` reads the native effective ICC
+profile and returns `effective_icc` with `bytes`, `sha256`, and `explicitly_stored`.
+`explicitly_stored` distinguishes a profile the image itself carries from GIMP's
+built-in fallback, which is why an image with no ICC parasite is still valid.
+Compare `effective_icc.sha256` against the ICC payload embedded in an exported asset
+to prove the export carried the same profile. A PNG stores that payload in its
+`iCCP` chunk **zlib-compressed**, so decompress it before hashing — hashing the raw
+chunk bytes yields a false mismatch. Profiles larger than 16 MiB, and any missing,
+empty, malformed or unreadable native profile, raise a typed error instead of
+returning a partial result. Both flags default to `false` and are read-only; the
+profile payload bytes are never returned, and inspection preserves pixels, layers,
+selections, metadata, and dirty state.
+
 For web and asset-library sizes, use `export_preview` with a PNG path and explicit
 `max_width`/`max_height` (1–2048). It duplicates the native image, uses NoHalo to
 fit inside the box, floors the non-limiting dimension to an integer, and never

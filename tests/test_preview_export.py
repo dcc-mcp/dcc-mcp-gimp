@@ -423,8 +423,10 @@ def test_source_state_fingerprint_covers_nonvisual_text_hidden_pixels_masks_and_
         get_component_visible=lambda _: state["component_visible"],
         get_component_active=lambda _: state["component_active"],
         get_effective_color_profile=lambda: types.SimpleNamespace(
-            get_icc_profile=lambda: state["icc"]
+            get_icc_profile=lambda: state["icc"],
+            get_label=lambda: "Fixture ICC",
         ),
+        get_color_profile=lambda: None,
     )
     glob["Gegl"].Rectangle = types.SimpleNamespace(new=lambda *args: args)
     glob["Gegl"].AbyssPolicy = types.SimpleNamespace(NONE=0)
