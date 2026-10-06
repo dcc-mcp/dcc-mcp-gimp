@@ -114,6 +114,65 @@ def test_effective_icc_identity_rejects_missing_native_profile(runtime, missing)
         runtime["_effective_icc_identity"](icc_image(missing))
 
 
+def test_effective_icc_identity_rejects_oversize_before_materializing(runtime, monkeypatch):
+    """The size bound must reject the payload before it is copied into bytes.
+
+    A lazy source proves this: it can report a length and fail loudly if any
+    element is consumed, so an implementation that materializes before checking
+    the limit cannot pass. The mutant that checks the limit only after building
+    the bytearray fails here.
+    """
+    class LazyOversize:
+        def __init__(self, length):
+            self._length = length
+
+        def __len__(self):
+            return self._length
+
+        def __iter__(self):
+            raise AssertionError("Oversized payload must be rejected before iteration")
+
+    monkeypatch.setitem(
+        runtime["_effective_icc_identity"].__globals__, "MAX_ICC_PROFILE_BYTES", 64
+    )
+    image = icc_image(types.SimpleNamespace(
+        get_icc_profile=lambda: LazyOversize(65),
+        get_label=lambda: "Oversize",
+    ))
+    with pytest.raises(runtime["HostCommandError"], match="exceeds the 64 byte"):
+        runtime["_effective_icc_identity"](image)
+
+
+def test_read_gchar_bytes_rejects_oversized_payload_without_iterating(runtime, monkeypatch):
+    class LazyOversize:
+        def __len__(self):
+            return 1_000_000
+
+        def __iter__(self):
+            raise AssertionError("Oversized payload must be rejected before iteration")
+
+    with pytest.raises(runtime["HostCommandError"], match="exceeds the 64 byte"):
+        runtime["_read_gchar_bytes"](LazyOversize(), "fixture data", 64)
+
+
+@pytest.mark.parametrize("unusable", [42, None, object()])
+def test_read_gchar_bytes_wraps_unusable_native_data(runtime, unusable):
+    with pytest.raises(runtime["HostCommandError"], match="unusable fixture data"):
+        runtime["_read_gchar_bytes"](unusable, "fixture data", 64)
+
+
+def test_read_gchar_bytes_wraps_iteration_failure(runtime):
+    class BrokenIteration:
+        def __len__(self):
+            return 2
+
+        def __iter__(self):
+            raise RuntimeError("native iteration failed")
+
+    with pytest.raises(runtime["HostCommandError"], match="unusable fixture data"):
+        runtime["_read_gchar_bytes"](BrokenIteration(), "fixture data", 64)
+
+
 def test_effective_icc_identity_rejects_empty_payload(runtime):
     with pytest.raises(runtime["HostCommandError"], match="empty effective color profile"):
         runtime["_effective_icc_identity"](icc_image(icc_profile(b"")))

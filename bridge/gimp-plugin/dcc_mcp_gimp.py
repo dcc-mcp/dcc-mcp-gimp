@@ -775,6 +775,7 @@ MAX_PREVIEW_LAYER_NODES = 256
 MAX_LAYER_NODES = 20_000
 MAX_FILE_BYTES = 2 * 1024 * 1024 * 1024
 MAX_COMMAND_TIMEOUT_SECS = 1_800.0
+MAX_PARASITE_BYTES = 16 * 1024 * 1024
 OPEN_SUFFIXES = frozenset(
     {".xcf", ".ora", ".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff", ".psd", ".exr"}
 )
@@ -1179,7 +1180,35 @@ def _preview_state(image: Any) -> str:
 MAX_ICC_PROFILE_BYTES = 16 * 1024 * 1024
 
 
+def _read_gchar_bytes(raw: Any, label: str, limit: int) -> bytes:
+    """Convert a PyGObject gchar array to bytes, checking the size limit first.
+
+    GIMP exposes gchar arrays as signed integers. Reject the payload on length
+    before materializing it, so an oversized native read never gets copied.
+    """
+    try:
+        length = len(raw)
+    except BaseException:
+        raise HostCommandError("GIMP returned unusable %s" % label) from None
+    if length > limit:
+        raise HostCommandError("%s exceeds the %d byte inspection limit" % (label, limit))
+    octets = bytearray()
+    try:
+        for value in raw:
+            # GIMP's gchar array is exposed as signed integers by PyGObject.
+            # Preserve valid byte values without coercing invalid types or domains.
+            if type(value) is not int or not -128 <= value <= 255:
+                raise HostCommandError("GIMP returned %s data outside the byte domain" % label)
+            octets.append(value & 0xff)
+    except HostCommandError:
+        raise
+    except BaseException:
+        raise HostCommandError("GIMP returned unusable %s" % label) from None
+    return bytes(octets)
+
+
 def _read_icc_bytes(profile: Any, label: str) -> bytes:
+    """Read one GIMP color profile's ICC payload as bytes, or raise a typed error."""
     if profile is None:
         raise HostCommandError("GIMP returned no %s for this image" % label)
     try:
@@ -1188,19 +1217,9 @@ def _read_icc_bytes(profile: Any, label: str) -> bytes:
         raise HostCommandError("GIMP failed to read the %s" % label) from None
     if raw is None:
         raise HostCommandError("GIMP returned no bytes for the %s" % label)
-    octets = bytearray()
-    for value in raw:
-        # GIMP's gchar array is exposed as signed integers by PyGObject.
-        if type(value) is not int or not -128 <= value <= 255:
-            raise HostCommandError("GIMP returned %s data outside the byte domain" % label)
-        octets.append(value & 0xff)
-    data = bytes(octets)
+    data = _read_gchar_bytes(raw, label, MAX_ICC_PROFILE_BYTES)
     if not data:
         raise HostCommandError("GIMP returned an empty %s" % label)
-    if len(data) > MAX_ICC_PROFILE_BYTES:
-        raise HostCommandError("%s exceeds the %d byte inspection limit" % (
-            label, MAX_ICC_PROFILE_BYTES
-        ))
     return data
 
 
@@ -1573,14 +1592,9 @@ def _parasite_report(item: Any) -> list[dict[str, Any]]:
     result = []
     for name in list(item.get_parasite_list())[:256]:
         parasite = item.get_parasite(name)
-        # GIMP's gchar array is exposed as signed integers by PyGObject.
-        # Preserve valid byte values without coercing invalid types or domains.
-        octets = bytearray()
-        for value in parasite.get_data():
-            if type(value) is not int or not -128 <= value <= 255:
-                raise HostCommandError("GIMP returned parasite data outside the byte domain")
-            octets.append(value & 0xff)
-        data = bytes(octets)
+        data = _read_gchar_bytes(
+            parasite.get_data(), "parasite data", MAX_PARASITE_BYTES
+        )
         result.append(
             {
                 "name": name,

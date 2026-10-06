@@ -59,9 +59,13 @@ profile and returns `effective_icc` with `bytes`, `sha256`, and `explicitly_stor
 `explicitly_stored` distinguishes a profile the image itself carries from GIMP's
 built-in fallback, which is why an image with no ICC parasite is still valid.
 Compare `effective_icc.sha256` against the ICC payload embedded in an exported asset
-to prove the export carried the same profile. Both flags default to `false` and are
-read-only; the profile payload bytes are never returned, and inspection preserves
-pixels, layers, selections, metadata, and dirty state.
+to prove the export carried the same profile. A PNG stores that payload in its
+`iCCP` chunk **zlib-compressed**, so decompress it before hashing — hashing the raw
+chunk bytes yields a false mismatch. Profiles larger than 16 MiB, and any missing,
+empty, malformed or unreadable native profile, raise a typed error instead of
+returning a partial result. Both flags default to `false` and are read-only; the
+profile payload bytes are never returned, and inspection preserves pixels, layers,
+selections, metadata, and dirty state.
 
 For web and asset-library sizes, use `export_preview` with a PNG path and explicit
 `max_width`/`max_height` (1–2048). It duplicates the native image, uses NoHalo to

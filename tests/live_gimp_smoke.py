@@ -256,7 +256,7 @@ def main() -> None:
 
     assert status["success"] is True
     assert status["context"]["authenticated"] is True
-    assert status["context"]["command_count"] == 24
+    assert status["context"]["command_count"] == 25
     assert inspected["context"]["layer_count"] == 3
     assert {base_layer_id, accent_id, foreground_id}.issubset(
         {item["layer_id"] for item in listed_layers["context"]["layers"]}
