@@ -37,11 +37,22 @@ tools:
     source_file: scripts/get_active_image.py
 
   - name: inspect_image
-    description: Inspect one GIMP image and its bounded recursive layer tree.
+    description: >-
+      Inspect one GIMP image and its bounded recursive layer tree. Optionally
+      report image parasite metadata and the effective ICC profile byte identity.
     input_schema:
       type: object
       required: [image_id]
-      properties: {image_id: {type: integer, minimum: 1}, include_metadata: {type: boolean, default: false}}
+      properties:
+        image_id: {type: integer, minimum: 1}
+        include_metadata: {type: boolean, default: false}
+        include_icc_identity:
+          type: boolean
+          default: false
+          description: >-
+            Also read the native effective ICC profile and report its byte count
+            and SHA-256, plus whether the image explicitly stores a profile.
+            Read-only; the profile payload itself is never returned.
       additionalProperties: false
     output_schema: {type: object}
     execution: async

@@ -944,6 +944,12 @@ def _bounded_int(value: Any, label: str, minimum: int, maximum: int) -> int:
     return value
 
 
+def _typed_bool(value: Any, label: str) -> bool:
+    if type(value) is not bool:
+        raise HostCommandError("%s must be a boolean" % label)
+    return value
+
+
 def _bounded_float(value: Any, label: str, minimum: float, maximum: float) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise HostCommandError("%s must be a number" % label)
@@ -1165,11 +1171,62 @@ def _preview_state(image: Any) -> str:
             "active": image.get_component_active(channel),
         } for channel in (Gimp.ChannelType.RED, Gimp.ChannelType.GREEN,
                           Gimp.ChannelType.BLUE, Gimp.ChannelType.ALPHA)],
-        "effective_icc_sha256": hashlib.sha256(
-            bytes(image.get_effective_color_profile().get_icc_profile())
-        ).hexdigest(),
+        "effective_icc_sha256": _effective_icc_identity(image)["sha256"],
     }
     return hashlib.sha256(json.dumps(state, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+MAX_ICC_PROFILE_BYTES = 16 * 1024 * 1024
+
+
+def _read_icc_bytes(profile: Any, label: str) -> bytes:
+    if profile is None:
+        raise HostCommandError("GIMP returned no %s for this image" % label)
+    try:
+        raw = profile.get_icc_profile()
+    except BaseException:
+        raise HostCommandError("GIMP failed to read the %s" % label) from None
+    if raw is None:
+        raise HostCommandError("GIMP returned no bytes for the %s" % label)
+    octets = bytearray()
+    for value in raw:
+        # GIMP's gchar array is exposed as signed integers by PyGObject.
+        if type(value) is not int or not -128 <= value <= 255:
+            raise HostCommandError("GIMP returned %s data outside the byte domain" % label)
+        octets.append(value & 0xff)
+    data = bytes(octets)
+    if not data:
+        raise HostCommandError("GIMP returned an empty %s" % label)
+    if len(data) > MAX_ICC_PROFILE_BYTES:
+        raise HostCommandError("%s exceeds the %d byte inspection limit" % (
+            label, MAX_ICC_PROFILE_BYTES
+        ))
+    return data
+
+
+def _effective_icc_identity(image: Any) -> dict[str, Any]:
+    """Identify the native effective ICC payload by bytes and digest, never by label.
+
+    GIMP falls back to a built-in profile when the image stores none, so an absent
+    ICC parasite is not an invalid image and `get_effective_color_profile()` is the
+    only getter that always answers.
+    """
+    try:
+        profile = image.get_effective_color_profile()
+    except BaseException:
+        raise HostCommandError("GIMP failed to read the effective color profile") from None
+    data = _read_icc_bytes(profile, "effective color profile")
+    stored = None
+    try:
+        stored = image.get_color_profile()
+    except BaseException:
+        raise HostCommandError("GIMP failed to read the stored color profile") from None
+    return {
+        "bytes": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "explicitly_stored": stored is not None,
+        "label": str(profile.get_label()),
+    }
 
 
 def _export_preview(image: Any, params: Mapping[str, Any]) -> dict[str, Any]:
@@ -1825,6 +1882,8 @@ def _execute_command(method: str, params: Mapping[str, Any]) -> Any:
         result = {**_image_info(image), "layer_count": len(layers), "layers": layers}
         if params.get("include_metadata", False):
             result["metadata"] = _metadata_report(image)
+        if _typed_bool(params.get("include_icc_identity", False), "include_icc_identity"):
+            result["effective_icc"] = _effective_icc_identity(image)
         return result
     if method == "gimp.export_preview":
         return _export_preview(image, params)

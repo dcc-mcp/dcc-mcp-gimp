@@ -86,6 +86,33 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def png_icc_payload(path: Path) -> Optional[bytes]:
+    """Return the embedded ICC profile from a PNG's iCCP chunk, or None.
+
+    The iCCP chunk holds a null-terminated profile name, a compression method,
+    then the zlib-compressed profile, so the payload is decompressed rather than
+    compared as raw chunk bytes.
+    """
+    import struct
+    import zlib
+
+    with path.open("rb") as stream:
+        assert stream.read(8) == b"\x89PNG\r\n\x1a\n", "not a PNG"
+        while True:
+            header = stream.read(8)
+            if len(header) < 8:
+                return None
+            length, kind = struct.unpack(">I4s", header)
+            body = stream.read(length)
+            stream.read(4)
+            if kind != b"iCCP":
+                continue
+            name, rest = body.split(b"\x00", 1)
+            assert name and rest, "malformed iCCP chunk"
+            assert rest[:1] == b"\x00", "unsupported iCCP compression method"
+            return zlib.decompress(rest[1:])
+
+
 def inside(path: Path, roots: list[Path]) -> bool:
     for root in roots:
         try:
@@ -180,6 +207,11 @@ def main() -> None:
             {"image_id": image_id, "layer_id": foreground_id},
         )
         inspected = call(server.mcp_url, tools["inspect_image"], {"image_id": image_id})
+        before_icc = call(
+            server.mcp_url,
+            tools["inspect_image"],
+            {"image_id": image_id, "include_icc_identity": True},
+        )
         listed_layers = call(server.mcp_url, tools["list_layers"], {"image_id": image_id})
         listed_images = call(server.mcp_url, tools["list_images"])
         active = call(server.mcp_url, tools["get_active_image"])
@@ -236,6 +268,23 @@ def main() -> None:
     assert xcf.read_bytes().startswith(b"gimp xcf ")
     assert png.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
     assert closed["context"]["closed"] is True
+    effective_icc = before_icc["context"]["effective_icc"]
+    assert effective_icc["bytes"] > 0
+    assert len(effective_icc["sha256"]) == 64
+    assert effective_icc["label"] == inspected["context"]["color_profile"]
+    embedded_icc = png_icc_payload(png)
+    assert embedded_icc is not None, "exported PNG carries no embedded ICC payload"
+    assert hashlib.sha256(embedded_icc).hexdigest() == effective_icc["sha256"], (
+        "exported PNG ICC payload differs from the native effective profile"
+    )
+    # The opt-in read must be observationally inert: the image we inspected is
+    # the same image the rest of the smoke flow saved, exported, and closed.
+    assert before_icc["context"]["image_id"] == image_id
+    assert before_icc["context"]["width"] == inspected["context"]["width"]
+    assert before_icc["context"]["height"] == inspected["context"]["height"]
+    assert before_icc["context"]["dirty"] == inspected["context"]["dirty"]
+    assert before_icc["context"]["layer_count"] == inspected["context"]["layer_count"]
+    assert before_icc["context"]["layers"] == inspected["context"]["layers"]
     print(
         json.dumps(
             {
