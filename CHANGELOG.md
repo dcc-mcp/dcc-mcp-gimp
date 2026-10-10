@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.6.0](https://github.com/dcc-mcp/dcc-mcp-gimp/compare/v0.5.0...v0.6.0) (2026-10-10)
+
+
+### Features
+
+* **gimp:** add opt-in effective ICC profile byte identity to inspect_image ([b94a64a](https://github.com/dcc-mcp/dcc-mcp-gimp/commit/b94a64a1a8e0a08f602b3ac677e714765cef8e93)), closes [#17](https://github.com/dcc-mcp/dcc-mcp-gimp/issues/17)
+
+
+### Documentation
+
+* refresh the generated DCC-MCP host matrix pointer ([#20](https://github.com/dcc-mcp/dcc-mcp-gimp/issues/20)) ([fa19b03](https://github.com/dcc-mcp/dcc-mcp-gimp/commit/fa19b03f76df95968b1183d2ad95851cbe6001ec))
+
 ## [0.5.0](https://github.com/dcc-mcp/dcc-mcp-gimp/compare/v0.4.1...v0.5.0) (2026-10-04)
 
 
