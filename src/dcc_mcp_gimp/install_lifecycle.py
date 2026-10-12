@@ -44,6 +44,7 @@ from .install_host import (
     _target_versions,
     default_plugin_dir,
 )
+from .install_readiness import probe_gui_readiness
 
 _READINESS_TOOL = "gimp_session__get_status"
 
@@ -295,14 +296,25 @@ def verify_install(
         )
         return result
     try:
-        readiness = wait_for_sidecar_ready(
-            os.environ.get("DCC_MCP_REGISTRY_DIR"),
-            dcc_type="gimp",
-            instance_id=selected_instance,
-            timeout_secs=max(0.05, timeout),
-            poll_interval_secs=min(max(0.05, timeout), 0.1),
-            probe_tool=_READINESS_TOOL,
-            probe_timeout_secs=max(0.05, timeout),
+        selected_entry = entries[0]
+        metadata = selected_entry.get("metadata")
+        is_gui = (
+            isinstance(metadata, dict)
+            and metadata.get("dcc_mcp_instance_type") == "gui"
+            and selected_entry.get("role") != "per-dcc-sidecar"
+        )
+        readiness = (
+            probe_gui_readiness(selected_entry, timeout=timeout)
+            if is_gui
+            else wait_for_sidecar_ready(
+                os.environ.get("DCC_MCP_REGISTRY_DIR"),
+                dcc_type="gimp",
+                instance_id=selected_instance,
+                timeout_secs=max(0.05, timeout),
+                poll_interval_secs=min(max(0.05, timeout), 0.1),
+                probe_tool=_READINESS_TOOL,
+                probe_timeout_secs=max(0.05, timeout),
+            )
         )
     except Exception:
         readiness = {
