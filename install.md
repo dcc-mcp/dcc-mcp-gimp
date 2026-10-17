@@ -117,6 +117,12 @@ issue reports.
 
 ## Verify
 
+Standalone GIMP GUI adapters register as `gui`, not `per-dcc-sidecar`.
+Verification loads the bundled `gimp-session` skill, calls its typed status
+tool, and waits for that call's own Core job when execution is asynchronous.
+Pending job acceptance is not readiness. Per-DCC sidecars still use Core's
+dispatch-readiness helper; both paths retain the same host identity checks.
+
 With GIMP, its automatically started persistent bridge, and the adapter
 running:
 
