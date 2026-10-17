@@ -198,7 +198,7 @@ def test_transport_accepts_both_mcp_media_types_and_matches_response(monkeypatch
         (b"Not Acceptable: media types required", 406),
         (b"not json", 200),
         (b'data: {"id":"foreign"}\n\n', 200),
-        (b"x" * 1048577, 200),
+        pytest.param(b"x" * 1048577, 200, id="response-over-1mib"),
     ],
 )
 def test_transport_preserves_bounded_errors_and_rejects_mismatch(monkeypatch, raw, status):
