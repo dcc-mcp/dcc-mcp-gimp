@@ -50,13 +50,14 @@ def _probe_tool(
         with response:
             raw = response.read(1048577)
             diagnostic["http_status"] = response.status
+            media_type = response.headers.get("Content-Type", "").partition(";")[0].strip().lower()
         if len(raw) > 1048576:
             raise ValueError("GIMP readiness MCP response exceeded the 1 MiB limit")
         text = raw.decode("utf-8")
         diagnostic["response"] = text
         if diagnostic["http_status"] != 200:
             raise ValueError("GIMP readiness MCP endpoint returned an HTTP error")
-        if text.lstrip().startswith(("event:", "data:", ":")):
+        if media_type == "text/event-stream":
             candidates = [
                 json.loads(
                     "\n".join(
@@ -74,8 +75,10 @@ def _probe_tool(
             if len(matches) != 1:
                 raise ValueError("GIMP readiness stream omitted one matching response")
             payload = matches[0]
-        else:
+        elif media_type == "application/json":
             payload = json.loads(text)
+        else:
+            raise ValueError("GIMP readiness MCP endpoint returned an unsupported media type")
         diagnostic["response"] = payload
         if not isinstance(payload, dict) or payload.get("id") != request_id or payload.get("error"):
             raise ValueError("GIMP readiness returned a mismatched or failed JSON-RPC response")

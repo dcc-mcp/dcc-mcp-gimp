@@ -181,6 +181,7 @@ def test_transport_accepts_both_mcp_media_types_and_matches_response(monkeypatch
             text = "event: message\r\ndata: " + text + "\r\n\r\n"
         response = io.BytesIO(text.encode())
         response.status = 200
+        response.headers = {"Content-Type": "text/event-stream" if sse else "application/json"}
         return response
 
     monkeypatch.setattr(readiness.urllib.request, "urlopen", urlopen)
@@ -207,6 +208,7 @@ def test_transport_preserves_bounded_errors_and_rejects_mismatch(monkeypatch, ra
     def urlopen(*args, **kwargs):
         response = io.BytesIO(raw)
         response.status = status
+        response.headers = {"Content-Type": "application/json"}
         return response
 
     monkeypatch.setattr(readiness.urllib.request, "urlopen", urlopen)
@@ -236,3 +238,75 @@ def test_gui_probe_requires_tool_identity_after_queue_receipt(monkeypatch):
     del completed["tool"]
     fixture_calls(monkeypatch, [wire({"loaded": True}), wire(job()), wire(completed)])
     assert readiness.probe_gui_readiness(ENTRY, timeout=2)["success"] is False
+
+
+@pytest.mark.parametrize("prefix", ["retry: 100\n\n", "id: stream-event\n"])
+def test_transport_uses_event_stream_content_type_before_optional_sse_fields(monkeypatch, prefix):
+    import io
+
+    def urlopen(request, timeout):
+        request_id = json.loads(request.data)["id"]
+        notification = {"jsonrpc": "2.0", "method": "notifications/message", "params": {}}
+        payload = {"jsonrpc": "2.0", "id": request_id, "result": wire({"loaded": True})["result"]}
+        response = io.BytesIO(
+            (
+                prefix
+                + "data: "
+                + json.dumps(notification)
+                + "\n\n"
+                + "data: "
+                + json.dumps(payload)
+                + "\n\n"
+            ).encode()
+        )
+        response.status = 200
+        response.headers = {"Content-Type": "Text/Event-Stream; charset=utf-8"}
+        return response
+
+    monkeypatch.setattr(readiness.urllib.request, "urlopen", urlopen)
+    result = readiness._probe_tool(ENTRY["mcp_url"], "load_skill", {}, timeout_secs=2)
+    assert result["success"] is True
+    assert readiness._payload(result) == {"loaded": True}
+
+
+@pytest.mark.parametrize(
+    "content_type,sse",
+    [("application/json", True), ("text/event-stream", False), ("text/html", False), ("", False)],
+)
+def test_transport_rejects_body_media_type_disagreement_and_unknown_types(
+    monkeypatch, content_type, sse
+):
+    import io
+
+    def urlopen(request, timeout):
+        payload = {"id": json.loads(request.data)["id"], "result": {}}
+        text = json.dumps(payload)
+        response = io.BytesIO(("data: " + text + "\n\n" if sse else text).encode())
+        response.status = 200
+        response.headers = {"Content-Type": content_type}
+        return response
+
+    monkeypatch.setattr(readiness.urllib.request, "urlopen", urlopen)
+    result = readiness._probe_tool(ENTRY["mcp_url"], "load_skill", {}, timeout_secs=2)
+    assert result["success"] is False
+    assert result["error"]
+
+
+@pytest.mark.parametrize("matching_count", [0, 2])
+def test_transport_event_stream_requires_exactly_one_matching_response(monkeypatch, matching_count):
+    import io
+
+    def urlopen(request, timeout):
+        request_id = json.loads(request.data)["id"]
+        payload = {"id": request_id, "result": {}}
+        text = "data: " + json.dumps({"id": "foreign", "result": {}}) + "\n\n"
+        text += ("data: " + json.dumps(payload) + "\n\n") * matching_count
+        response = io.BytesIO(text.encode())
+        response.status = 200
+        response.headers = {"Content-Type": "text/event-stream"}
+        return response
+
+    monkeypatch.setattr(readiness.urllib.request, "urlopen", urlopen)
+    result = readiness._probe_tool(ENTRY["mcp_url"], "load_skill", {}, timeout_secs=2)
+    assert result["success"] is False
+    assert "one matching response" in result["error"]
