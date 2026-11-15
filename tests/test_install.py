@@ -3403,3 +3403,45 @@ def test_pre_verify_rollback_failure_keeps_the_original_verdict(lifecycle_env, m
     assert report["verify"]["failure_stage"] == "receipt", report
     assert "injected verify failure" in report["verify"]["failure_reason"], report
     assert "rollback also failed" in report["verify"]["failure_reason"], report
+
+
+@pytest.mark.parametrize("role", ["runtime", "per-dcc-sidecar"])
+@pytest.mark.parametrize("foreign_host", [False, True])
+def test_verify_selects_gui_probe_without_weakening_host_identity(
+    lifecycle_env, monkeypatch, role, foreign_host
+):
+    from dcc_mcp_gimp import install_lifecycle
+    from dcc_mcp_gimp.install import run
+
+    installed, code, _ = run(["install", "--yes", *lifecycle_env.common])
+    assert code == 0, installed
+    original_query = install_lifecycle.query_runtime_state
+    original_probe = install_lifecycle.wait_for_sidecar_ready
+    calls = []
+
+    def query(*args, **kwargs):
+        state = original_query(*args, **kwargs)
+        state["entries"][0].update(role=role, metadata={"dcc_mcp_instance_type": "gui"})
+        return state
+
+    def probe(kind):
+        def invoke(*args, **kwargs):
+            calls.append(kind)
+            result = original_probe()
+            if foreign_host:
+                result["probe"]["result"]["structuredContent"]["context"]["gimp_pid"] = 9999
+            return result
+
+        return invoke
+
+    monkeypatch.setattr(install_lifecycle, "query_runtime_state", query)
+    monkeypatch.setattr(install_lifecycle, "probe_gui_readiness", probe("gui"))
+    monkeypatch.setattr(install_lifecycle, "wait_for_sidecar_ready", probe("sidecar"))
+    report, code, _ = run(["verify", "--host-pid", "4242", *lifecycle_env.common])
+    assert calls == ["sidecar" if role == "per-dcc-sidecar" else "gui"]
+    assert report["verify"]["directly_usable"] is (not foreign_host)
+    if foreign_host:
+        assert code == 40
+        assert report["verify"]["failure_stage"] == "readiness_identity"
+    else:
+        assert code == 0
