@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.6.1](https://github.com/dcc-mcp/dcc-mcp-gimp/compare/v0.6.0...v0.6.1) (2026-11-24)
+
+
+### Documentation
+
+* refresh the generated DCC-MCP host matrix pointer ([99f6d1e](https://github.com/dcc-mcp/dcc-mcp-gimp/commit/99f6d1e22067ae4ef1f37b5c080075fa802a6e57))
+* refresh the generated DCC-MCP host matrix pointer ([9e2aa10](https://github.com/dcc-mcp/dcc-mcp-gimp/commit/9e2aa100dcc8320f242c0b0c6a91a609ed207d0e))
+
 ## [0.6.0](https://github.com/dcc-mcp/dcc-mcp-gimp/compare/v0.5.0...v0.6.0) (2026-10-17)
 
 
